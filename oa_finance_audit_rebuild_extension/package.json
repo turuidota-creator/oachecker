@@ -1,0 +1,25 @@
+{
+  "name": "oa-finance-audit-rebuild-extension",
+  "version": "0.1.0",
+  "description": "Rebuild workspace for the OA finance audit extension.",
+  "main": "background.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "chrome-extension",
+    "oa",
+    "finance"
+  ],
+  "author": "",
+  "license": "UNLICENSED",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@kenjiuno/msgreader": "^1.28.0",
+    "fflate": "^0.8.2",
+    "pdfjs-dist": "^5.6.205",
+    "tesseract.js": "^7.0.0",
+    "xlsx": "^0.18.5"
+  }
+}

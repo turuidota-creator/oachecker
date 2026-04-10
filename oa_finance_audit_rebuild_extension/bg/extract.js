@@ -1,0 +1,692 @@
+import { strFromU8, unzipSync } from "../node_modules/fflate/esm/browser.js";
+import * as XLSX from "../node_modules/xlsx/xlsx.mjs";
+import { cleanText, supportsAttachmentTextExtraction } from "./common.js";
+import { getCurrentPageTabId, uint8ArrayToBase64 } from "./io.js";
+
+const OCR_LANG_PATH = chrome.runtime.getURL("assets/tessdata");
+
+export async function extractReferenceTextsFromAttachment(attachment, bytes, contentType = "") {
+  const kind = detectAttachmentKind(attachment, bytes, contentType);
+  if (!kind) return [];
+  if (kind === "zip") return extractZipReferenceTexts(bytes);
+  const text = await extractAttachmentReferenceText(attachment, bytes, kind);
+  return text ? [{ name: attachment?.name || "attachment", text }] : [];
+}
+
+export async function extractMailEvidenceFromAttachment(attachment, bytes, contentType = "") {
+  const kind = detectAttachmentKind(attachment, bytes, contentType);
+  if (kind === "eml") {
+    return extractEmlEvidence(bytes);
+  }
+  if (kind === "msg") {
+    return extractMsgEvidenceHeuristically(bytes, attachment?.name || "mail.msg");
+  }
+  return null;
+}
+
+function detectAttachmentKind(attachment, bytes, contentType = "") {
+  const type = String(contentType || "").toLowerCase();
+  const marker = `${attachment?.name || ""} ${attachment?.url || ""}`;
+  if (/\.pdf(?:$|\?)/i.test(marker) || type.includes("pdf") || hasBinaryPrefix(bytes, [0x25, 0x50, 0x44, 0x46])) return "pdf";
+  if (/\.docx(?:$|\?)/i.test(marker) || type.includes("wordprocessingml")) return "docx";
+  if (/\.(xlsx?|csv)(?:$|\?)/i.test(marker) || type.includes("spreadsheetml") || type.includes("text/csv")) return "spreadsheet";
+  if (/\.ofd(?:$|\?)/i.test(marker) || type.includes("ofd")) return "ofd";
+  if (/\.(png|jpg|jpeg)(?:$|\?)/i.test(marker) || type.startsWith("image/")) return "image";
+  if (/\.eml(?:$|\?)/i.test(marker) || type.includes("message/rfc822")) return "eml";
+  if (/\.msg(?:$|\?)/i.test(marker) || type.includes("vnd.ms-outlook")) return "msg";
+  if (/\.zip(?:$|\?)/i.test(marker) || type.includes("zip") || hasBinaryPrefix(bytes, [0x50, 0x4b, 0x03, 0x04])) return sniffZipContainerKind(bytes);
+  if (/\.xml(?:$|\?)/i.test(marker) || type.includes("xml")) return "xml";
+  if (/\.txt(?:$|\?)/i.test(marker) || type.startsWith("text/plain")) return "plain";
+  if (/\.rtf(?:$|\?)/i.test(marker) || type.includes("rtf")) return "rtf";
+  return "";
+}
+
+async function extractAttachmentReferenceText(attachment, bytes, kind) {
+  if (kind === "pdf") return extractPdfText(bytes);
+  if (kind === "docx") return extractDocxText(bytes);
+  if (kind === "spreadsheet") return extractSpreadsheetText(bytes);
+  if (kind === "ofd") return extractOfdText(bytes);
+  if (kind === "plain") return decodeBytesSmart(bytes);
+  if (kind === "xml") return extractXmlText(decodeBytesSmart(bytes));
+  if (kind === "rtf") return extractRtfText(bytes);
+  if (kind === "image") return extractImageTextSafe(bytes, attachment?.name || "image");
+  if (kind === "eml") return (await extractEmlEvidence(bytes))?.text || "";
+  if (kind === "msg") return (await extractMsgEvidenceHeuristically(bytes, attachment?.name || "mail.msg"))?.text || "";
+  return "";
+}
+
+async function extractPdfText(data) {
+  const tabId = getCurrentPageTabId();
+  if (!Number.isInteger(tabId)) {
+    throw new Error("未找到当前标签页，无法解析 PDF 附件");
+  }
+  return extractPdfTextInTab(tabId, data);
+}
+
+async function extractPdfTextInTab(tabId, data) {
+  const base64 = uint8ArrayToBase64(data);
+  const moduleUrl = chrome.runtime.getURL("node_modules/pdfjs-dist/legacy/build/pdf.mjs");
+  const workerUrl = chrome.runtime.getURL("node_modules/pdfjs-dist/legacy/build/pdf.worker.mjs");
+  const cMapUrl = chrome.runtime.getURL("node_modules/pdfjs-dist/cmaps/");
+  const standardFontDataUrl = chrome.runtime.getURL("node_modules/pdfjs-dist/standard_fonts/");
+  const tesseractModuleUrl = chrome.runtime.getURL("node_modules/tesseract.js/dist/tesseract.esm.min.js");
+  const tesseractWorkerUrl = chrome.runtime.getURL("node_modules/tesseract.js/dist/worker.min.js");
+  const tesseractCoreUrl = chrome.runtime.getURL("node_modules/tesseract.js-core");
+  return new Promise((resolve, reject) => {
+    chrome.scripting.executeScript(
+      {
+        target: { tabId },
+        world: "ISOLATED",
+        func: async (
+          inputBase64,
+          pdfModuleUrl,
+          pdfWorkerUrl,
+          injectedCMapUrl,
+          injectedStandardFontDataUrl,
+          injectedTesseractModuleUrl,
+          injectedTesseractWorkerUrl,
+          injectedTesseractCoreUrl,
+          langPath
+        ) => {
+          try {
+            const flattenItems = (items) => {
+              const parts = [];
+              for (const item of items || []) {
+                if (!item || typeof item.str !== "string") continue;
+                parts.push(item.str);
+                parts.push(item.hasEOL ? "\n" : " ");
+              }
+              return parts.join("");
+            };
+            const renderPageToDataUrl = async (page) => {
+              const viewport = page.getViewport({ scale: 2 });
+              const canvas = document.createElement("canvas");
+              canvas.width = Math.max(1, Math.floor(viewport.width));
+              canvas.height = Math.max(1, Math.floor(viewport.height));
+              const context = canvas.getContext("2d", { alpha: false });
+              await page.render({ canvasContext: context, viewport }).promise;
+              return canvas.toDataURL("image/png");
+            };
+            const runOcr = async (dataUrl) => {
+              const moduleNs = await import(injectedTesseractModuleUrl);
+              const tesseractApi = moduleNs?.createWorker
+                ? moduleNs
+                : moduleNs?.default?.createWorker
+                  ? moduleNs.default
+                  : moduleNs?.default || moduleNs;
+              const createWorker = tesseractApi?.createWorker;
+              if (typeof createWorker !== "function") {
+                throw new Error("Tesseract createWorker unavailable");
+              }
+              const worker = await createWorker("chi_sim+eng", 1, {
+                workerPath: injectedTesseractWorkerUrl,
+                corePath: injectedTesseractCoreUrl,
+                langPath
+              });
+              try {
+                await worker.setParameters({ preserve_interword_spaces: "1" });
+                const result = await worker.recognize(dataUrl);
+                return result?.data?.text || "";
+              } finally {
+                await worker.terminate();
+              }
+            };
+            const buildOcrPageNumbers = (numPages) => {
+              if (!Number.isFinite(numPages) || numPages <= 0) return [];
+              if (numPages <= 8) {
+                return Array.from({ length: numPages }, (_, index) => index + 1);
+              }
+              const picks = new Set([1, 2, 3, numPages - 2, numPages - 1, numPages]);
+              return Array.from(picks)
+                .filter((pageNo) => pageNo >= 1 && pageNo <= numPages)
+                .sort((left, right) => left - right);
+            };
+            const binary = atob(inputBase64 || "");
+            const bytes = new Uint8Array(binary.length);
+            for (let index = 0; index < binary.length; index += 1) {
+              bytes[index] = binary.charCodeAt(index);
+            }
+
+            const pdfjs = await import(pdfModuleUrl);
+            if (pdfjs?.GlobalWorkerOptions) {
+              pdfjs.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
+            }
+            if (typeof pdfjs?.setVerbosityLevel === "function" && pdfjs?.VerbosityLevel) {
+              pdfjs.setVerbosityLevel(pdfjs.VerbosityLevel.ERRORS);
+            }
+            const loadingTask = pdfjs.getDocument({
+              data: bytes,
+              cMapUrl: injectedCMapUrl,
+              cMapPacked: true,
+              standardFontDataUrl: injectedStandardFontDataUrl,
+              verbosity: pdfjs?.VerbosityLevel?.ERRORS ?? 0,
+              useSystemFonts: true,
+              isEvalSupported: false
+            });
+            const pdf = await loadingTask.promise;
+            const parts = [];
+            for (let page = 1; page <= Math.min(pdf.numPages, 4); page += 1) {
+              const current = await pdf.getPage(page);
+              const content = await current.getTextContent();
+              parts.push(flattenItems(content.items || []));
+            }
+            let text = parts.join("\\n");
+            if ((text || "").replace(/\s+/g, "").length < 80) {
+              const ocrParts = [];
+              for (const page of buildOcrPageNumbers(pdf.numPages)) {
+                const current = await pdf.getPage(page);
+                const dataUrl = await renderPageToDataUrl(current);
+                const ocrText = await runOcr(dataUrl);
+                if (ocrText) ocrParts.push(ocrText);
+              }
+              if (ocrParts.length) {
+                text = [text, ...ocrParts].filter(Boolean).join("\\n");
+              }
+            }
+            return { ok: true, text };
+          } catch (error) {
+            return {
+              ok: false,
+              error: error?.stack || error?.message || String(error)
+            };
+          }
+        },
+        args: [
+          base64,
+          moduleUrl,
+          workerUrl,
+          cMapUrl,
+          standardFontDataUrl,
+          tesseractModuleUrl,
+          tesseractWorkerUrl,
+          tesseractCoreUrl,
+          OCR_LANG_PATH
+        ]
+      },
+      (results) => {
+        const runtimeError = chrome.runtime.lastError;
+        if (runtimeError) {
+          reject(new Error(runtimeError.message || "标签页 PDF 解析失败"));
+          return;
+        }
+        const payload = results?.[0]?.result;
+        if (!payload?.ok) {
+          reject(new Error(payload?.error || "标签页 PDF 解析失败"));
+          return;
+        }
+        if (typeof payload.text !== "string") {
+          reject(new Error("标签页 PDF 解析没有返回文本"));
+          return;
+        }
+        resolve(payload.text);
+      }
+    );
+  });
+}
+
+function extractDocxText(data) {
+  try {
+    const files = unzipSync(data);
+    return Object.entries(files || {})
+      .filter(([name]) => /^word\/(?:document|header\d+|footer\d+)\.xml$/i.test(name))
+      .map(([, content]) => extractXmlText(strFromU8(content)))
+      .filter(Boolean)
+      .join("\n");
+  } catch (_error) {
+    return "";
+  }
+}
+
+function extractSpreadsheetText(data) {
+  try {
+    const workbook = XLSX.read(data, { type: "array", dense: false });
+    return (workbook.SheetNames || [])
+      .slice(0, 4)
+      .map((name) => {
+        const sheet = workbook.Sheets?.[name];
+        return sheet ? `${name}\n${cleanText(XLSX.utils.sheet_to_csv(sheet, { blankrows: false }))}` : "";
+      })
+      .filter(Boolean)
+      .join("\n");
+  } catch (_error) {
+    return "";
+  }
+}
+
+function extractOfdText(data) {
+  try {
+    const files = unzipSync(data);
+    return Object.entries(files || {})
+      .filter(([name]) => /\.xml$/i.test(name))
+      .slice(0, 8)
+      .map(([, content]) => extractXmlText(decodeBytesSmart(content)))
+      .filter(Boolean)
+      .join("\n");
+  } catch (_error) {
+    return "";
+  }
+}
+
+async function extractZipReferenceTexts(data) {
+  try {
+    const files = unzipSync(data);
+    const results = [];
+    for (const [name, content] of Object.entries(files || {})) {
+      if (!supportsAttachmentTextExtraction(name, name) || !content || content.byteLength < 128) continue;
+      const child = await extractReferenceTextsFromAttachment({ name, url: name }, content);
+      results.push(...child);
+      if (results.length >= 8) break;
+    }
+    return results;
+  } catch (_error) {
+    return [];
+  }
+}
+
+async function extractImageTextSafe(data, name = "image") {
+  if (!data || data.byteLength < 128) return "";
+  const tabId = getCurrentPageTabId();
+  if (!Number.isInteger(tabId)) {
+    throw new Error("未找到当前标签页，无法执行图片 OCR");
+  }
+  const mimeType = /\.png(?:$|\?)/i.test(String(name || "")) ? "image/png" : "image/jpeg";
+  const base64 = uint8ArrayToBase64(data);
+  const moduleUrl = chrome.runtime.getURL("node_modules/tesseract.js/dist/tesseract.esm.min.js");
+  const workerUrl = chrome.runtime.getURL("node_modules/tesseract.js/dist/worker.min.js");
+  const coreUrl = chrome.runtime.getURL("node_modules/tesseract.js-core");
+
+  return new Promise((resolve, reject) => {
+    chrome.scripting.executeScript(
+      {
+        target: { tabId },
+        world: "ISOLATED",
+        func: async (inputBase64, inputMimeType, tesseractModuleUrl, tesseractWorkerUrl, tesseractCoreUrl, langPath) => {
+          let generalWorker = null;
+          let numericWorker = null;
+          try {
+            const loadImageFromBlob = (blob) =>
+              new Promise((resolve, reject) => {
+                const objectUrl = URL.createObjectURL(blob);
+                const image = new Image();
+                image.onload = () => {
+                  URL.revokeObjectURL(objectUrl);
+                  resolve(image);
+                };
+                image.onerror = () => {
+                  URL.revokeObjectURL(objectUrl);
+                  reject(new Error("Image decode failed"));
+                };
+                image.src = objectUrl;
+              });
+            const mergeTexts = (parts) => {
+              const unique = [];
+              for (const value of parts) {
+                const text = String(value || "").trim();
+                if (!text || unique.includes(text)) continue;
+                unique.push(text);
+              }
+              return unique.join("\n");
+            };
+            const createTesseractWorker = async (langs) => {
+              const moduleNs = await import(tesseractModuleUrl);
+              const tesseractApi = moduleNs?.createWorker
+                ? moduleNs
+                : moduleNs?.default?.createWorker
+                  ? moduleNs.default
+                  : moduleNs?.default || moduleNs;
+              const createWorker = tesseractApi?.createWorker;
+              if (typeof createWorker !== "function") {
+                throw new Error("Tesseract createWorker unavailable");
+              }
+              return createWorker(langs, 1, {
+                workerPath: tesseractWorkerUrl,
+                corePath: tesseractCoreUrl,
+                langPath
+              });
+            };
+            const buildVariants = async (blob) => {
+              const image = await loadImageFromBlob(blob);
+              const sourceWidth = Math.max(1, image.naturalWidth || image.width || 1);
+              const sourceHeight = Math.max(1, image.naturalHeight || image.height || 1);
+              const scale = Math.min(2.2, Math.max(1.6, 1800 / Math.max(sourceWidth, sourceHeight)));
+              const width = Math.max(1, Math.floor(sourceWidth * scale));
+              const height = Math.max(1, Math.floor(sourceHeight * scale));
+              const variants = [];
+              const makeCanvas = () => {
+                const canvas = document.createElement("canvas");
+                canvas.width = width;
+                canvas.height = height;
+                const context = canvas.getContext("2d", { willReadFrequently: true });
+                context.drawImage(image, 0, 0, width, height);
+                return { canvas, context };
+              };
+              const pushCanvas = (label, canvas, mode = "general") => {
+                variants.push({ label, mode, dataUrl: canvas.toDataURL("image/png") });
+              };
+              const makeCropCanvas = (leftRatio, topRatio, widthRatio, heightRatio) => {
+                const canvas = document.createElement("canvas");
+                const cropX = Math.max(0, Math.floor(sourceWidth * leftRatio));
+                const cropY = Math.max(0, Math.floor(sourceHeight * topRatio));
+                const cropWidth = Math.max(1, Math.floor(sourceWidth * widthRatio));
+                const cropHeight = Math.max(1, Math.floor(sourceHeight * heightRatio));
+                canvas.width = Math.max(1, Math.floor(cropWidth * Math.max(2, scale)));
+                canvas.height = Math.max(1, Math.floor(cropHeight * Math.max(2, scale)));
+                const context = canvas.getContext("2d", { willReadFrequently: true });
+                context.drawImage(image, cropX, cropY, cropWidth, cropHeight, 0, 0, canvas.width, canvas.height);
+                return { canvas, context };
+              };
+
+              {
+                const { canvas } = makeCanvas();
+                pushCanvas("original", canvas);
+              }
+
+              {
+                const { canvas, context } = makeCanvas();
+                const imageData = context.getImageData(0, 0, width, height);
+                const pixels = imageData.data;
+                for (let index = 0; index < pixels.length; index += 4) {
+                  const gray = Math.round(pixels[index] * 0.299 + pixels[index + 1] * 0.587 + pixels[index + 2] * 0.114);
+                  const boosted = Math.min(255, Math.max(0, Math.round((gray - 128) * 1.55 + 128)));
+                  pixels[index] = boosted;
+                  pixels[index + 1] = boosted;
+                  pixels[index + 2] = boosted;
+                }
+                context.putImageData(imageData, 0, 0);
+                pushCanvas("grayscale-boost", canvas);
+              }
+
+              {
+                const { canvas, context } = makeCanvas();
+                const imageData = context.getImageData(0, 0, width, height);
+                const pixels = imageData.data;
+                for (let index = 0; index < pixels.length; index += 4) {
+                  const gray = Math.round(pixels[index] * 0.299 + pixels[index + 1] * 0.587 + pixels[index + 2] * 0.114);
+                  const threshold = gray > 182 ? 255 : 0;
+                  pixels[index] = threshold;
+                  pixels[index + 1] = threshold;
+                  pixels[index + 2] = threshold;
+                }
+                context.putImageData(imageData, 0, 0);
+                pushCanvas("threshold", canvas);
+              }
+
+              {
+                const { canvas } = makeCropCanvas(0.46, 0.55, 0.52, 0.25);
+                pushCanvas("bottom-right", canvas, "numeric");
+              }
+
+              {
+                const { canvas, context } = makeCropCanvas(0.40, 0.48, 0.58, 0.32);
+                const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
+                const pixels = imageData.data;
+                for (let index = 0; index < pixels.length; index += 4) {
+                  const gray = Math.round(pixels[index] * 0.299 + pixels[index + 1] * 0.587 + pixels[index + 2] * 0.114);
+                  const threshold = gray > 176 ? 255 : 0;
+                  pixels[index] = threshold;
+                  pixels[index + 1] = threshold;
+                  pixels[index + 2] = threshold;
+                }
+                context.putImageData(imageData, 0, 0);
+                pushCanvas("bottom-right-threshold", canvas, "numeric");
+              }
+
+              return variants;
+            };
+            const binary = atob(inputBase64 || "");
+            const bytes = new Uint8Array(binary.length);
+            for (let index = 0; index < binary.length; index += 1) {
+              bytes[index] = binary.charCodeAt(index);
+            }
+
+            generalWorker = await createTesseractWorker("chi_sim+eng");
+            await generalWorker.setParameters({ preserve_interword_spaces: "1" });
+
+            numericWorker = await createTesseractWorker("eng");
+            await numericWorker.setParameters({
+              preserve_interword_spaces: "1",
+              tessedit_char_whitelist: "0123456789.,¥￥()（）小写合计",
+              tessedit_pageseg_mode: "6"
+            });
+
+            const variants = await buildVariants(new Blob([bytes], { type: inputMimeType }));
+            const texts = [];
+            for (const variant of variants) {
+              const activeWorker = variant.mode === "numeric" ? numericWorker : generalWorker;
+              const result = await activeWorker.recognize(variant.dataUrl);
+              if (result?.data?.text) {
+                texts.push(result.data.text);
+              }
+            }
+            return { ok: true, text: mergeTexts(texts) };
+          } catch (error) {
+            return {
+              ok: false,
+              error: error?.stack || error?.message || String(error)
+            };
+          } finally {
+            if (generalWorker) {
+              try {
+                await generalWorker.terminate();
+              } catch (_error) {}
+            }
+            if (numericWorker) {
+              try {
+                await numericWorker.terminate();
+              } catch (_error) {}
+            }
+          }
+        },
+        args: [base64, mimeType, moduleUrl, workerUrl, coreUrl, OCR_LANG_PATH]
+      },
+      (results) => {
+        const runtimeError = chrome.runtime.lastError;
+        if (runtimeError) {
+          reject(new Error(runtimeError.message || "标签页 OCR 解析失败"));
+          return;
+        }
+        const payload = results?.[0]?.result;
+        if (!payload?.ok) {
+          reject(new Error(payload?.error || "标签页 OCR 解析失败"));
+          return;
+        }
+        resolve(cleanText(payload.text || ""));
+      }
+    );
+  });
+}
+
+function extractXmlText(xmlText) {
+  return cleanText(String(xmlText || "").replace(/<[^>]+>/g, " "));
+}
+
+function extractRtfText(data) {
+  return cleanText(
+    String(decodeBytesSmart(data) || "")
+      .replace(/\\par[d]?/gi, "\n")
+      .replace(/\\tab/gi, "\t")
+      .replace(/\\'[0-9a-fA-F]{2}/g, " ")
+      .replace(/\\[a-z]+\d*\s?/gi, " ")
+      .replace(/[{}]/g, " ")
+  );
+}
+
+function decodeBytesSmart(bytes) {
+  for (const encoding of ["utf-8", "gb18030", "utf-16le"]) {
+    try {
+      const text = new TextDecoder(encoding, { fatal: false }).decode(bytes);
+      if (cleanText(text)) return text;
+    } catch (_error) {}
+  }
+  return "";
+}
+
+async function extractEmlEvidence(bytes) {
+  const raw = decodeBytesSmart(bytes);
+  if (!raw) {
+    return { subject: "", sentAt: "", bodySummary: "", attachmentNames: [], text: "" };
+  }
+
+  const normalized = raw.replace(/\r\n/g, "\n");
+  const headerEnd = normalized.indexOf("\n\n");
+  const headerText = headerEnd >= 0 ? normalized.slice(0, headerEnd) : normalized;
+  const bodyText = headerEnd >= 0 ? normalized.slice(headerEnd + 2) : "";
+  const unfoldedHeaders = headerText.replace(/\n[ \t]+/g, " ");
+  const subject = decodeMimeHeader(findHeaderValue(unfoldedHeaders, "Subject"));
+  const sentAt = decodeMimeHeader(findHeaderValue(unfoldedHeaders, "Date"));
+  const attachmentNames = Array.from(
+    new Set(
+      Array.from(normalized.matchAll(/(?:filename|name)\*?=(?:"([^"]+)"|([^;\n]+))/gi))
+        .map((match) => decodeMimeHeader(cleanText(match[1] || match[2] || "").replace(/;$/, "")))
+        .filter(Boolean)
+    )
+  );
+  const plainBody = summarizeMailBody(bodyText);
+  const text = cleanText([subject, sentAt, plainBody, attachmentNames.join(" ")].filter(Boolean).join("\n"));
+
+  return {
+    subject,
+    sentAt,
+    bodySummary: summarizeText(plainBody, 180),
+    attachmentNames,
+    text
+  };
+}
+
+async function extractMsgEvidenceHeuristically(bytes, fallbackName) {
+  const decodedCandidates = [
+    decodeBytesAs(bytes, "utf-16le"),
+    decodeBytesAs(bytes, "utf-8"),
+    decodeBytesAs(bytes, "gb18030")
+  ];
+  const extractedText = cleanText(
+    decodedCandidates
+      .map((item) => extractReadableText(item))
+      .filter(Boolean)
+      .join("\n")
+  );
+
+  const subject =
+    findHeaderLike(extractedText, /(?:^|\n)Subject[:：]\s*(.+)/i) ||
+    findHeaderLike(extractedText, /(?:^|\n)主题[:：]\s*(.+)/i) ||
+    "";
+  const sentAt =
+    findHeaderLike(extractedText, /(?:^|\n)(?:Date|Sent)[:：]\s*(.+)/i) ||
+    findHeaderLike(extractedText, /(?:^|\n)(?:日期|发送时间|发件时间)[:：]\s*(.+)/i) ||
+    "";
+  const attachmentNames = Array.from(
+    new Set(
+      (extractedText.match(/[\w\u4e00-\u9fa5][^\r\n]{0,80}\.(?:pdf|docx?|xlsx?|png|jpe?g|zip|eml|msg|txt)/gi) || [])
+        .map((item) => cleanText(item))
+        .filter(Boolean)
+        .slice(0, 8)
+    )
+  );
+  const bodySummary = summarizeText(extractLikelyMailBody(extractedText), 180);
+  const text = cleanText([subject, sentAt, bodySummary, attachmentNames.join(" "), fallbackName].filter(Boolean).join("\n"));
+
+  return {
+    subject,
+    sentAt,
+    bodySummary,
+    attachmentNames,
+    text
+  };
+}
+
+function decodeBytesAs(bytes, encoding) {
+  try {
+    return new TextDecoder(encoding, { fatal: false }).decode(bytes);
+  } catch (_error) {
+    return "";
+  }
+}
+
+function findHeaderValue(headerText, name) {
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = headerText.match(new RegExp(`(?:^|\\n)${escaped}:\\s*(.+)`, "i"));
+  return cleanText(match?.[1] || "");
+}
+
+function decodeMimeHeader(value) {
+  const raw = cleanText(value || "");
+  if (!raw) return "";
+  return raw.replace(/=\?([^?]+)\?([BbQq])\?([^?]+)\?=/g, (_whole, charset, mode, payload) => {
+    try {
+      if (/^b$/i.test(mode)) {
+        const binary = atob(payload);
+        const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+        return new TextDecoder(charset, { fatal: false }).decode(bytes);
+      }
+      const quotedPrintable = payload
+        .replace(/_/g, " ")
+        .replace(/=([0-9A-Fa-f]{2})/g, (_m, hex) => String.fromCharCode(Number.parseInt(hex, 16)));
+      const bytes = Uint8Array.from(quotedPrintable, (char) => char.charCodeAt(0));
+      return new TextDecoder(charset, { fatal: false }).decode(bytes);
+    } catch (_error) {
+      return payload;
+    }
+  });
+}
+
+function summarizeMailBody(bodyText) {
+  const normalized = cleanText(
+    String(bodyText || "")
+      .replace(/Content-[^\n]+/gi, " ")
+      .replace(/--[^\n]+/g, " ")
+      .replace(/<[^>]+>/g, " ")
+  );
+  return summarizeText(normalized, 240);
+}
+
+function summarizeText(text, maxLength) {
+  const normalized = cleanText(text || "");
+  if (!normalized) return "";
+  return normalized.length > maxLength ? `${normalized.slice(0, maxLength)}...` : normalized;
+}
+
+function extractReadableText(text) {
+  return Array.from(
+    new Set(
+      String(text || "")
+        .replace(/\u0000/g, "\n")
+        .split(/\n+/)
+        .map((line) => cleanText(line))
+        .filter((line) => line.length >= 4)
+        .filter((line) => /[A-Za-z\u4e00-\u9fa5]/.test(line))
+        .slice(0, 160)
+    )
+  ).join("\n");
+}
+
+function findHeaderLike(text, regex) {
+  const match = String(text || "").match(regex);
+  return summarizeText(match?.[1] || "", 120);
+}
+
+function extractLikelyMailBody(text) {
+  const normalized = String(text || "");
+  const lines = normalized
+    .split(/\n+/)
+    .map((line) => cleanText(line))
+    .filter(Boolean)
+    .filter((line) => !/^(?:Subject|Date|From|To|Cc|Bcc|Sent)[:：]/i.test(line))
+    .filter((line) => !/^(?:主题|日期|发件人|收件人|抄送|密送|发送时间)[:：]/.test(line));
+  return lines.slice(0, 12).join(" ");
+}
+
+function hasBinaryPrefix(bytes, prefix) {
+  return !!bytes && prefix.every((value, index) => bytes[index] === value);
+}
+
+function sniffZipContainerKind(bytes) {
+  try {
+    const files = Object.keys(unzipSync(bytes) || {});
+    if (files.some((name) => /^word\/(?:document|header\d+|footer\d+)\.xml$/i.test(name))) return "docx";
+    if (files.some((name) => /^xl\/workbook\.xml$/i.test(name))) return "spreadsheet";
+    if (files.some((name) => /(?:^|\/)OFD\.xml$/i.test(name) || /Doc_0\/Document\.xml$/i.test(name))) return "ofd";
+    return "zip";
+  } catch (_error) {
+    return "zip";
+  }
+}

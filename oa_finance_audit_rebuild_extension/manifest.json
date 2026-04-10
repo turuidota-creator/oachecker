@@ -1,0 +1,73 @@
+{
+  "manifest_version": 3,
+  "name": "OA 付款审核重构版",
+  "version": "0.1.0",
+  "description": "从零重构的财务付款审核插件骨架。",
+  "permissions": [
+    "storage",
+    "tabs",
+    "scripting"
+  ],
+  "host_permissions": [
+    "http://oa.cyou-inc.com/*",
+    "https://oa.cyou-inc.com/*",
+    "https://api.siliconflow.cn/*",
+    "http://10.1.41.11:8081/*",
+    "http://10.1.9.119:2212/*",
+    "http://sea.cyou-inc.com:8084/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "http://oa.cyou-inc.com/*",
+        "https://oa.cyou-inc.com/*"
+      ],
+      "js": [
+        "list_page.js"
+      ],
+      "css": [
+        "styles.css"
+      ],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "http://oa.cyou-inc.com/workflow/process/detail/*",
+        "https://oa.cyou-inc.com/workflow/process/detail/*"
+      ],
+      "js": [
+        "shared/models.js",
+        "shared/evidence.js",
+        "page/collector.js",
+        "content.js"
+      ],
+      "css": [
+        "styles.css"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "node_modules/pdfjs-dist/legacy/build/pdf.mjs",
+        "node_modules/pdfjs-dist/legacy/build/pdf.worker.mjs",
+        "node_modules/pdfjs-dist/build/pdf.worker.mjs",
+        "node_modules/pdfjs-dist/cmaps/*",
+        "node_modules/pdfjs-dist/standard_fonts/*",
+        "node_modules/tesseract.js/dist/tesseract.esm.min.js",
+        "node_modules/tesseract.js/dist/worker.min.js",
+        "node_modules/tesseract.js-core/*.js",
+        "node_modules/tesseract.js-core/*.wasm",
+        "assets/tessdata/*"
+      ],
+      "matches": [
+        "<all_urls>"
+      ]
+    }
+  ]
+}

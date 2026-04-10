@@ -1,0 +1,9 @@
+这是 OA 付款审核重构的整理后项目包。
+请将以下目录作为项目根目录使用：
+C:\Users\turui\Documents\OA_Payment_Audit_Rebuild_Project
+包含内容：
+- 浏览器扩展源码
+- 核心项目文档
+- 单案例校验脚本
+归档研究资料和临时输出仍保留在：
+C:\Users\turui\Documents\Playground_oa_finance_rebuild\_archive

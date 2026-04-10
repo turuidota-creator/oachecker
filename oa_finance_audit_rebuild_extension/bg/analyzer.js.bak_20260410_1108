@@ -1,0 +1,2254 @@
+﻿import {
+  accountMatchesPayment,
+  attachmentPreScanPriority,
+  amountMatchesPayment,
+  classifyAttachmentRole,
+  cleanText,
+  companyMatchesPayment,
+  createVerificationItem,
+  detectAttachmentRole,
+  deriveBaseUrl,
+  attachmentSizeHint,
+  extractContractPeriod,
+  extractPaymentTerms,
+  firstLikelyBankAccount,
+  firstMeaningfulText,
+  firstNonEmpty,
+  firstNonEmptyDate,
+  formatAmount,
+  makeEvidence,
+  normalizeCompareText,
+  normalizeError,
+  parseAmount,
+  rolePriority,
+  scoreAttachment,
+  snippetAround,
+  supportsAttachmentTextExtraction
+} from "./common.js";
+import { collectPageSnapshotFromUrl, fetchBinary, setRuntimeContext } from "./io.js";
+import {
+  buildAttachmentTitles,
+  buildFlowableAttachmentList,
+  buildFlowableInvoiceEvidenceList,
+  buildHistoryAttachmentList,
+  discoverProcessRefs,
+  extractFlowableFacts,
+  extractKnownRefs,
+  fetchFlowableDetail,
+  fetchHistoryDetail,
+  findHistoryField,
+  parseProcessRef
+} from "./detail.js";
+import { buildContractLlmPreview, summarizeContractCandidatesWithLlm } from "./contract_llm.js";
+import { buildContractClauseCandidates, deriveLocalContractSummary } from "./contract_terms.js";
+import { extractMailEvidenceFromAttachment, extractReferenceTextsFromAttachment } from "./extract.js";
+
+export const BUILD_TAG = "rebuild-phase5-related-docs-2026-04-09";
+
+function reportProgress(onProgress, phase, text, detail = "") {
+  if (typeof onProgress !== "function") {
+    return;
+  }
+  try {
+    onProgress({
+      phase,
+      text,
+      detail,
+      at: new Date().toISOString()
+    });
+  } catch {
+    // Ignore progress callback errors so analysis can continue.
+  }
+}
+
+export async function analyzePageSnapshot(snapshot, tabId, onProgress = null) {
+  const baseUrl = deriveBaseUrl(snapshot?.pageUrl);
+  setRuntimeContext(baseUrl, tabId);
+
+  reportProgress(onProgress, "payment-root", "姝ｅ湪璇诲彇浠樻鍗?, "鍑嗗璇诲彇褰撳墠浠樻鍗曡鎯呭拰缁撴瀯鍖栧瓧娈?);
+
+  const rootRef = parseProcessRef(snapshot?.pageUrl || "", "payment");
+  const rootDetail = rootRef?.mode === "flowable" ? await fetchFlowableDetail(rootRef, baseUrl) : null;
+  const rootFacts = rootDetail ? extractFlowableFacts(rootDetail) : {};
+  const target = mergePaymentTarget(snapshot?.paymentTarget || {}, rootFacts);
+  const structuredInvoiceSources = rootDetail
+    ? await buildFlowableInvoiceEvidenceList(rootDetail, baseUrl).catch(() => [])
+    : [];
+  const enrichedSnapshot = rootDetail
+    ? {
+        ...snapshot,
+        attachments: dedupeAttachments([...(snapshot?.attachments || []), ...buildFlowableAttachmentList(rootDetail)]),
+        relatedLinks: enrichRelatedLinks(snapshot?.relatedLinks || [], [
+          ...extractKnownRefs(rootDetail, rootRef?.detailId || ""),
+          ...discoverProcessRefs(rootDetail, rootRef?.detailId || "")
+        ])
+      }
+    : snapshot;
+  const normalizedAttachments = normalizeAttachmentCandidates([
+    ...structuredInvoiceSources.map((item) => item.attachment).filter(Boolean),
+    ...(enrichedSnapshot?.attachments || [])
+  ]);
+
+  reportProgress(
+    onProgress,
+    "page-invoice",
+    "姝ｅ湪璇诲彇浠樻椤靛彂绁?,
+    structuredInvoiceSources.length > 0 ? `宸插彂鐜?${structuredInvoiceSources.length} 鏉′粯娆鹃〉鍙戠エ鏄庣粏` : "褰撳墠浠樻椤垫湭鍙戠幇缁撴瀯鍖栧彂绁ㄦ槑缁?
+  );
+
+  reportProgress(
+    onProgress,
+    "page-attachments",
+    "姝ｅ湪鏁寸悊浠樻椤甸檮浠?,
+    `宸插彂鐜?${normalizedAttachments.length} 涓粯娆鹃〉闄勪欢`
+  );
+
+  const inventories = buildSourceInventories({
+    ...enrichedSnapshot,
+    attachments: normalizedAttachments,
+    structuredInvoices: structuredInvoiceSources
+  });
+  const structuredInvoiceMatches = analyzeStructuredInvoiceSources(structuredInvoiceSources, target);
+  const pageAttachmentAnalysis = await analyzeAttachmentList(
+    [
+      ...inventories.invoiceAttachments,
+      ...inventories.bankChangeAttachments,
+      ...inventories.contractAttachments,
+      ...inventories.acceptanceAttachments,
+      ...inventories.otherAttachments
+    ],
+    target,
+    "浠樻椤甸檮浠?,
+    onProgress,
+    "page-attachments"
+  );
+
+  reportProgress(
+    onProgress,
+    "contract-link",
+    "姝ｅ湪杩涘叆鍚堝悓",
+    inventories.contractLinks.length > 0 ? `宸插彂鐜?${inventories.contractLinks.length} 涓悎鍚屽叆鍙 : "鏆傛湭鍙戠幇鏄庣‘鐨勫悎鍚屽叆鍙?
+  );
+  const contractResult = await analyzeContractLinks(enrichedSnapshot?.relatedLinks || [], target, baseUrl, onProgress);
+
+  reportProgress(
+    onProgress,
+    "acceptance-link",
+    "姝ｅ湪鏍稿楠屾敹",
+    inventories.acceptanceLinks.length > 0 ? `宸插彂鐜?${inventories.acceptanceLinks.length} 涓獙鏀跺叆鍙 : "鏆傛湭鍙戠幇鏄庣‘鐨勯獙鏀跺叆鍙?
+  );
+  const acceptanceDocs = await analyzeAcceptanceMailLinksMulti(enrichedSnapshot?.relatedLinks || [], target, baseUrl, onProgress);
+
+  reportProgress(
+    onProgress,
+    "domestic-pr-link",
+    "姝ｅ湪璇诲彇鍥藉唴PR",
+    inventories.domesticPrLinks.length > 0 ? `宸插彂鐜?${inventories.domesticPrLinks.length} 涓浗鍐匬R鍏ュ彛` : "鏆傛湭鍙戠幇鏄庣‘鐨勫浗鍐匬R鍏ュ彛"
+  );
+  const domesticPrDocs = await analyzeDomesticPrLinksMulti(enrichedSnapshot?.relatedLinks || [], target, baseUrl, onProgress);
+
+  reportProgress(
+    onProgress,
+    "purchase-order-link",
+    "姝ｅ湪璇诲彇閲囪喘璁㈠崟",
+    inventories.purchaseOrderLinks.length > 0 ? `宸插彂鐜?${inventories.purchaseOrderLinks.length} 涓噰璐鍗曞叆鍙 : "鏆傛湭鍙戠幇鏄庣‘鐨勯噰璐鍗曞叆鍙?
+  );
+  const purchaseOrderResult = await analyzePurchaseOrderLinks(enrichedSnapshot?.relatedLinks || [], target, baseUrl, onProgress);
+
+  const matches = {
+    amount: structuredInvoiceMatches.amount || pageAttachmentAnalysis.matches.amount || contractResult.matches.amount || null,
+    company: structuredInvoiceMatches.company || pageAttachmentAnalysis.matches.company || contractResult.matches.company || null,
+    account: structuredInvoiceMatches.account || pageAttachmentAnalysis.matches.account || contractResult.matches.account || null
+  };
+
+  reportProgress(onProgress, "summary", "姝ｅ湪姹囨€绘牳瀵圭粨鏋?, "姝ｅ湪鐢熸垚涓夐」涓绘牳瀵圭粨鏋滃拰鍚堝悓鍙傝€冧俊鎭?);
+
+  const verificationItems = [
+    buildAmountVerification(target, inventories, matches.amount),
+    buildCompanyVerification(target, inventories, matches.company),
+    buildAccountVerification(target, inventories, matches.account)
+  ];
+
+  const effectiveContractProcessing = contractResult.ref
+    ? contractResult.processing
+    : buildAttachmentOnlyContractProcessing(pageAttachmentAnalysis, inventories);
+
+  const relatedDocuments = {
+    domesticPr: domesticPrDocs[0] || null,
+    domesticPrItems: domesticPrDocs,
+    purchaseOrder: purchaseOrderResult,
+    acceptance: acceptanceDocs[0] || null,
+    acceptanceItems: acceptanceDocs,
+    contract: buildContractRelatedDocument(contractResult, effectiveContractProcessing)
+  };
+
+  const overallStatus = verificationItems.some((item) => item.status === "fail")
+    ? "fail"
+    : verificationItems.some((item) => item.status === "warn")
+      ? "warn"
+      : "pass";
+
+  reportProgress(onProgress, "done", "鍒嗘瀽瀹屾垚", "涓夐」涓绘牳瀵瑰拰鍚堝悓鍙傝€冧俊鎭凡鐢熸垚");
+
+  return {
+    buildTag: BUILD_TAG,
+    analyzedAt: new Date().toISOString(),
+    phase: "phase-5-related-docs",
+    overallStatus,
+    paymentTarget: target,
+    pageSummary: {
+      attachmentCount: normalizedAttachments.length,
+      invoiceAttachmentCount: inventories.invoiceAttachments.length,
+      invoiceStructuredCount: inventories.invoiceStructuredSources.length,
+      contractAttachmentCount: inventories.contractAttachments.length,
+      bankChangeAttachmentCount: inventories.bankChangeAttachments.length,
+      acceptanceAttachmentCount: inventories.acceptanceAttachments.length,
+      domesticPrLinkCount: inventories.domesticPrLinks.length,
+      purchaseOrderLinkCount: inventories.purchaseOrderLinks.length,
+      contractLinkCount: inventories.contractLinks.length,
+      acceptanceLinkCount: inventories.acceptanceLinks.length,
+      otherLinkCount: inventories.relatedLinks.length
+    },
+    verificationItems,
+    relatedDocuments,
+    contractReference: {
+      effectiveStart: contractResult.facts.effectiveStart || pageAttachmentAnalysis.contractFacts.effectiveStart || "",
+      effectiveEnd: contractResult.facts.effectiveEnd || pageAttachmentAnalysis.contractFacts.effectiveEnd || "",
+      paymentTerms:
+        contractResult.summary?.paymentTermsSummary ||
+        contractResult.facts.paymentTerms ||
+        pageAttachmentAnalysis.contractFacts.paymentTerms ||
+        (contractResult.ref ? `宸插彂鐜板悎鍚屾潵婧愶細${contractResult.ref.detailUrl}` : "灏氭湭鍙戠幇鏄庣‘鐨勫悎鍚屾潵婧?),
+      sourceName:
+        contractResult.facts.sourceName ||
+        pageAttachmentAnalysis.contractFacts.sourceName ||
+        (contractResult.ref ? contractResult.ref.detailUrl : ""),
+      sourceUrl:
+        contractResult.facts.sourceUrl ||
+        pageAttachmentAnalysis.contractFacts.sourceUrl ||
+        (contractResult.ref ? contractResult.ref.detailUrl : "")
+    },
+    contractSummary: contractResult.summary || emptyContractSummary(),
+    contractProcessing: effectiveContractProcessing || emptyContractProcessing("not_found", "灏氭湭鍙戠幇鏄庣‘鐨勫悎鍚屾潵婧?),
+    acceptanceReference: acceptanceDocs[0] || null,
+    evidencePool: inventories,
+    debug: {
+      snapshot: enrichedSnapshot,
+      rootFacts,
+      pageAttachmentAnalysis,
+      domesticPrResult: domesticPrDocs,
+      purchaseOrderResult,
+      contractResult,
+      acceptanceResult: acceptanceDocs
+    }
+  };
+}
+
+function mergePaymentTarget(primary, fallback) {
+  return {
+    ...primary,
+    processCode: firstNonEmpty(primary.processCode, fallback.processCode),
+    processTitle: firstNonEmpty(primary.processTitle, fallback.processTitle),
+    paymentAmount: firstNonEmpty(primary.paymentAmount, fallback.paymentAmount, fallback.invoiceTotal),
+    payeeCompany: firstNonEmpty(primary.payeeCompany, fallback.supplier, fallback.invoiceSupplier),
+    payeeAccount: firstNonEmpty(primary.payeeAccount, fallback.accountNo, fallback.invoiceAccountNo),
+    payeeBank: firstNonEmpty(primary.payeeBank, fallback.bankName),
+    paymentDate: firstNonEmptyDate(primary.paymentDate, fallback.paymentDate)
+  };
+}
+
+function buildSourceInventories(snapshot) {
+  const attachments = normalizeAttachmentCandidates(Array.isArray(snapshot?.attachments) ? snapshot.attachments : []);
+  const relatedLinks = Array.isArray(snapshot?.relatedLinks) ? snapshot.relatedLinks : [];
+  const structuredInvoices = Array.isArray(snapshot?.structuredInvoices) ? snapshot.structuredInvoices : [];
+  const inventories = {
+    invoiceAttachments: [],
+    invoiceStructuredSources: structuredInvoices,
+    contractAttachments: [],
+    bankChangeAttachments: [],
+    acceptanceAttachments: [],
+    otherAttachments: [],
+    domesticPrLinks: [],
+    purchaseOrderLinks: [],
+    contractLinks: [],
+    acceptanceLinks: [],
+    relatedLinks: []
+  };
+
+  for (const attachment of attachments) {
+    const role = classifyAttachmentRole(attachment);
+    if (role === "invoice") inventories.invoiceAttachments.push(attachment);
+    else if (role === "contract") inventories.contractAttachments.push(attachment);
+    else if (role === "bank_notice") inventories.bankChangeAttachments.push(attachment);
+    else if (role === "acceptance") inventories.acceptanceAttachments.push(attachment);
+    else inventories.otherAttachments.push(attachment);
+  }
+
+  for (const link of relatedLinks) {
+    if (link.relation === "domestic_pr") inventories.domesticPrLinks.push(link);
+    else if (link.relation === "purchase_order") inventories.purchaseOrderLinks.push(link);
+    else if (link.relation === "contract") inventories.contractLinks.push(link);
+    else if (link.relation === "acceptance") inventories.acceptanceLinks.push(link);
+    else inventories.relatedLinks.push(link);
+  }
+
+  return inventories;
+}
+
+function analyzeStructuredInvoiceSources(items, target) {
+  const matches = { amount: null, company: null, account: null };
+
+  for (const item of items || []) {
+    const sourceText = cleanText(item?.sourceText || "");
+    const sourceName = item?.sourceName || "浠樻椤靛彂绁ㄦ槑缁?;
+    const sourceUrl = item?.sourceUrl || "";
+
+    if (!matches.amount && amountMatchesPayment(sourceText, target.paymentAmount)) {
+      matches.amount = makeEvidence(
+        sourceName,
+        sourceUrl,
+        formatAmount(target.paymentAmount),
+        sourceText || `浠风◣鍚堣锛?{item?.amount || ""}`
+      );
+    }
+
+    if (!matches.company && companyMatchesPayment(sourceText, target.payeeCompany)) {
+      matches.company = makeEvidence(
+        sourceName,
+        sourceUrl,
+        target.payeeCompany || "",
+        sourceText || `閿€鍞柟锛?{item?.supplier || ""}`
+      );
+    }
+
+    if (!matches.account && accountMatchesPayment(sourceText, target.payeeAccount)) {
+      matches.account = makeEvidence(
+        sourceName,
+        sourceUrl,
+        target.payeeAccount || "",
+        sourceText || `鏀舵璐﹀彿锛?{item?.accountNo || ""}`
+      );
+    }
+  }
+
+  return matches;
+}
+
+function normalizeAttachmentCandidates(items) {
+  const realByUrl = new Map();
+  const realNames = new Set();
+  const placeholders = [];
+
+  for (const item of items || []) {
+    const name = cleanText(item?.name || "");
+    const url = cleanText(item?.url || "");
+    if (!name && !url) continue;
+    if (isSyntheticAttachmentLink(url)) continue;
+
+    const normalized = { ...item, name, url };
+    if (looksLikeRealAttachment(name, url)) {
+      const current = realByUrl.get(url);
+      if (!current || attachmentNameQuality(name) > attachmentNameQuality(current.name || "")) {
+        realByUrl.set(url, normalized);
+      }
+      if (name) {
+        realNames.add(name.toLowerCase());
+      }
+      continue;
+    }
+
+    if (name) {
+      placeholders.push(normalized);
+    }
+  }
+
+  const results = Array.from(realByUrl.values());
+  const placeholderSeen = new Set();
+  for (const item of placeholders) {
+    const key = item.name.toLowerCase();
+    if (realNames.has(key) || placeholderSeen.has(key)) {
+      continue;
+    }
+    placeholderSeen.add(key);
+    results.push(item);
+  }
+  return results;
+}
+
+function mergeAttachmentCandidates(primary, secondary) {
+  return normalizeAttachmentCandidates([...(primary || []), ...(secondary || [])]);
+}
+
+function findFieldValueFromPairs(pairs, ...labels) {
+  for (const label of labels) {
+    const found = (pairs || []).find((item) => String(item?.label || "").includes(label));
+    if (found?.value) {
+      return found.value;
+    }
+  }
+  return "";
+}
+
+function enrichRelatedLinks(existingLinks, refs) {
+  const deduped = [];
+  const seen = new Set();
+
+  for (const item of existingLinks || []) {
+    const key = `${item.relation}|${item.url}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    deduped.push(item);
+  }
+
+  for (const ref of refs || []) {
+    const link = {
+      relation: ref.relation,
+      title: ref.detailUrl,
+      url: ref.detailUrl
+    };
+    const key = `${link.relation}|${link.url}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    deduped.push(link);
+  }
+
+  return deduped;
+}
+
+function createRelatedDocumentBase(input) {
+  return {
+    kind: input.kind || "related",
+    title: input.title || "",
+    itemLabel: input.itemLabel || "",
+    status: input.status || "warn",
+    statusText: input.statusText || "",
+    displayOnly: !!input.displayOnly,
+    sourceName: input.sourceName || "",
+    sourceUrl: input.sourceUrl || "",
+    statement: input.statement || "",
+    fields: input.fields || {},
+    checks: Array.isArray(input.checks) ? input.checks : [],
+    relationHints: Array.isArray(input.relationHints) ? input.relationHints : [],
+    attachmentNames: Array.isArray(input.attachmentNames) ? input.attachmentNames : [],
+    mailAttachmentNames: Array.isArray(input.mailAttachmentNames) ? input.mailAttachmentNames : [],
+    previewItems: Array.isArray(input.previewItems) ? input.previewItems : [],
+    hoverText: input.hoverText || "",
+    notes: Array.isArray(input.notes) ? input.notes : [],
+    errorText: input.errorText || ""
+  };
+}
+
+function buildContractRelatedDocument(contractResult, processing) {
+  const facts = contractResult?.facts || {};
+  const summary = contractResult?.summary || {};
+  const attachmentNames = Array.isArray(processing?.attachmentNames) ? processing.attachmentNames : [];
+  const hasSource = !!(
+    contractResult?.ref ||
+    facts.sourceName ||
+    facts.sourceUrl ||
+    attachmentNames.length > 0 ||
+    (processing?.pageStatus && processing.pageStatus !== "not_found")
+  );
+  const sourceName = firstNonEmpty(
+    facts.sourceName,
+    contractResult?.ref?.detailUrl,
+    attachmentNames[0],
+    processing?.pageStatusText
+  );
+  const sourceUrl = firstNonEmpty(facts.sourceUrl, contractResult?.ref?.detailUrl);
+  return createRelatedDocumentBase({
+    kind: "contract",
+    title: "鍚堝悓",
+    status: hasSource ? "info" : "warn",
+    statusText: hasSource ? "浠呭睍绀? : "鏈壘鍒?,
+    displayOnly: true,
+    sourceName,
+    sourceUrl,
+    statement: hasSource ? "娌跨敤鐜版湁鍚堝悓閫昏緫锛屼粎灞曠ず涓嶈嚜鍔ㄥ垽鏂? : "灏氭湭鍙戠幇鏄庣‘鐨勫悎鍚屾潵婧?,
+    fields: {
+      pageStatusText: processing?.pageStatusText || "",
+      effectiveStart: facts.effectiveStart || "",
+      effectiveEnd: facts.effectiveEnd || "",
+      paymentTerms: summary.paymentTermsSummary || facts.paymentTerms || "",
+      taxRate: summary.taxRate || "",
+      capAmount: summary.capAmount || "",
+      accountChangeRequirement: summary.accountChangeRequirement || ""
+    },
+    attachmentNames,
+    notes: ["浠呭睍绀猴紝涓嶈嚜鍔ㄥ垽鏂?]
+  });
+}
+
+function pickRelatedLink(relatedLinks, relation) {
+  return (relatedLinks || []).find((item) => item.relation === relation) || null;
+}
+
+function pickRelatedLinks(relatedLinks, relation) {
+  return (relatedLinks || []).filter((item) => item.relation === relation);
+}
+
+async function loadRelatedProcessContext(ref, baseUrl, options = {}) {
+  const { includePageSnapshot = true } = options || {};
+  let detailResult = null;
+  let pageResult = null;
+
+  try {
+    detailResult = ref.mode === "flowable" ? await fetchFlowableDetail(ref, baseUrl) : await fetchHistoryDetail(ref, baseUrl);
+  } catch (error) {
+    detailResult = { __error: normalizeError(error) };
+  }
+
+  if (includePageSnapshot) {
+    try {
+      pageResult = await collectPageSnapshotFromUrl(ref.detailUrl);
+    } catch (error) {
+      pageResult = { __error: normalizeError(error) };
+    }
+  }
+
+  return {
+    ref,
+    baseUrl,
+    detail: detailResult?.__error ? null : detailResult,
+    detailError: detailResult?.__error || "",
+    pageSnapshot: pageResult?.__error ? null : pageResult,
+    pageError: pageResult?.__error || "",
+    pageSnapshotLoaded: includePageSnapshot
+  };
+}
+
+async function ensureRelatedProcessPageSnapshot(context) {
+  if (!context || context.pageSnapshotLoaded) {
+    return context;
+  }
+
+  context.pageSnapshotLoaded = true;
+  try {
+    context.pageSnapshot = await collectPageSnapshotFromUrl(context.ref?.detailUrl || "");
+    context.pageError = "";
+  } catch (error) {
+    context.pageSnapshot = null;
+    context.pageError = normalizeError(error);
+  }
+
+  return context;
+}
+
+function toScalarText(value) {
+  if (value == null) return "";
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+    return cleanText(value);
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => toScalarText(item)).filter(Boolean).join(" ");
+  }
+  if (typeof value === "object") {
+    return firstNonEmpty(value.value, value.fieldValue, value.text, value.label, value.name);
+  }
+  return "";
+}
+
+function findValueInObjectByKeyHints(root, ...hints) {
+  const normalizedHints = hints
+    .map((hint) => normalizeCompareText(hint))
+    .filter(Boolean);
+  if (!root || normalizedHints.length === 0) {
+    return "";
+  }
+
+  const queue = [{ node: root, depth: 0 }];
+  let visited = 0;
+  while (queue.length > 0 && visited < 500) {
+    const { node, depth } = queue.shift();
+    visited += 1;
+    if (!node || typeof node !== "object") {
+      continue;
+    }
+
+    for (const [key, value] of Object.entries(node)) {
+      const normalizedKey = normalizeCompareText(key);
+      if (normalizedKey && normalizedHints.some((hint) => normalizedKey.includes(hint))) {
+        const text = toScalarText(value);
+        if (text) {
+          return text;
+        }
+      }
+
+      if (depth < 3 && value && typeof value === "object") {
+        queue.push({ node: value, depth: depth + 1 });
+      }
+    }
+  }
+
+  return "";
+}
+
+function extractProcessField(detail, pageSnapshot, labels, keyHints = labels) {
+  return firstMeaningfulText(
+    findFieldValueFromPairs(pageSnapshot?.fieldPairs, ...labels),
+    findValueInObjectByKeyHints(detail?.flowFormData || detail?.formData || detail || {}, ...keyHints)
+  );
+}
+
+async function extractProcessFieldWithFallback(context, labels, keyHints = labels) {
+  const detailOnlyValue = extractProcessField(context?.detail, null, labels, keyHints);
+  if (detailOnlyValue) {
+    return detailOnlyValue;
+  }
+
+  await ensureRelatedProcessPageSnapshot(context);
+  return extractProcessField(context?.detail, context?.pageSnapshot, labels, keyHints);
+}
+
+function collectFieldValuesFromPairs(pairs, labels, limit = 8) {
+  const results = [];
+  const seen = new Set();
+  for (const pair of pairs || []) {
+    const label = cleanText(pair?.label || "");
+    const value = cleanText(pair?.value || "");
+    if (!label || !value) continue;
+    if (!labels.some((item) => label.includes(item))) continue;
+    const summary = `${label}锛?{value}`;
+    if (seen.has(summary)) continue;
+    seen.add(summary);
+    results.push(summary);
+    if (results.length >= limit) break;
+  }
+  return results;
+}
+
+function collectValuesInObjectByKeyHints(root, hints, limit = 8) {
+  const normalizedHints = (hints || []).map((hint) => normalizeCompareText(hint)).filter(Boolean);
+  if (!root || normalizedHints.length === 0) {
+    return [];
+  }
+
+  const queue = [{ node: root, depth: 0 }];
+  const results = [];
+  const seen = new Set();
+  let visited = 0;
+
+  while (queue.length > 0 && visited < 800 && results.length < limit) {
+    const { node, depth } = queue.shift();
+    visited += 1;
+    if (!node || typeof node !== "object") {
+      continue;
+    }
+
+    for (const [key, value] of Object.entries(node)) {
+      const normalizedKey = normalizeCompareText(key);
+      if (normalizedKey && normalizedHints.some((hint) => normalizedKey.includes(hint))) {
+        const text = toScalarText(value);
+        if (text && !seen.has(text)) {
+          seen.add(text);
+          results.push(text);
+          if (results.length >= limit) {
+            break;
+          }
+        }
+      }
+
+      if (depth < 3 && value && typeof value === "object") {
+        queue.push({ node: value, depth: depth + 1 });
+      }
+    }
+  }
+
+  return results;
+}
+
+function buildRequirementSummary(detail, pageSnapshot) {
+  const pairs = pageSnapshot?.fieldPairs || [];
+  const subformRows = Array.isArray(pageSnapshot?.subformRows) ? pageSnapshot.subformRows : [];
+  const groups = [
+    { labels: ["鍝佺墝"] },
+    { labels: ["鍨嬪彿"] },
+    { labels: ["瑙勬牸"] },
+    { labels: ["閰嶇疆"] },
+    { labels: ["鎶€鏈姹?, "鎶€鏈弬鏁?] },
+    { labels: ["闇€姹傛弿杩?, "闇€姹傝鏄?, "閲囪喘闇€姹?, "鐢ㄩ€旇鏄?, "璇存槑", "澶囨敞"] }
+  ];
+
+  const rowSummaries = [];
+  const rowSeen = new Set();
+  for (const row of subformRows) {
+    const nameField = (row.fields || []).find((field) => cleanText(field.label || "").includes("鍚嶇О"));
+    const detailFields = [];
+    const detailSeen = new Set();
+    for (const field of row.fields || []) {
+      const label = cleanText(field.label || "");
+      const value = cleanText(field.value || "");
+      if (!label || !value || label.includes("鍚嶇О")) {
+        continue;
+      }
+      const isRequirementLike = groups.some((group) => group.labels.some((item) => label.includes(item)));
+      if (!isRequirementLike) {
+        continue;
+      }
+      const key = `${label}|${value}`;
+      if (detailSeen.has(key)) {
+        continue;
+      }
+      detailSeen.add(key);
+      detailFields.push(`${label}锛?{value}`);
+    }
+    const parts = [];
+    if (nameField?.value) {
+      parts.push(`鍚嶇О锛?{nameField.value}`);
+    }
+    parts.push(...detailFields);
+    const summary = parts.join("锛?);
+    if (!summary || rowSeen.has(summary)) {
+      continue;
+    }
+    rowSeen.add(summary);
+    rowSummaries.push(summary);
+  }
+
+  if (rowSummaries.length > 0) {
+    return rowSummaries.slice(0, 4).join("锛?);
+  }
+
+  const summaries = [];
+  const seen = new Set();
+  for (const group of groups) {
+    for (const item of collectFieldValuesFromPairs(pairs, group.labels, 4)) {
+      if (seen.has(item)) continue;
+      seen.add(item);
+      summaries.push(item);
+    }
+  }
+
+  if (summaries.length === 0) {
+    const detailRoot = detail?.flowFormData || detail?.formData || detail || {};
+    for (const group of groups) {
+      const values = collectValuesInObjectByKeyHints(detailRoot, group.labels, 2);
+      for (const value of values) {
+        const item = `${group.labels[0]}锛?{value}`;
+        if (seen.has(item)) continue;
+        seen.add(item);
+        summaries.push(item);
+      }
+    }
+  }
+
+  return summaries.slice(0, 8).join("锛?);
+}
+
+async function buildRequirementSummaryWithFallback(context) {
+  const detailOnlySummary = buildRequirementSummary(context?.detail, null);
+  if (detailOnlySummary) {
+    return detailOnlySummary;
+  }
+
+  await ensureRelatedProcessPageSnapshot(context);
+  return buildRequirementSummary(context?.detail, context?.pageSnapshot);
+}
+
+function buildAttachmentPreviewText(text) {
+  const cleaned = cleanText(text || "");
+  if (!cleaned) {
+    return "";
+  }
+  return cleaned.length > 120 ? `${cleaned.slice(0, 120)}...` : cleaned;
+}
+
+function normalizeRelatedSourceName(pageSnapshot, fallbackTitle, ref, ...candidates) {
+  return firstNonEmpty(
+    ...candidates,
+    pageSnapshot?.paymentTarget?.processTitle,
+    pageSnapshot?.pageTitle,
+    fallbackTitle,
+    ref?.detailUrl
+  );
+}
+
+function buildRelatedReadStatement(label, context) {
+  if (context.detail && context.pageSnapshot) {
+    return `宸茶鍙?{label}璇︽儏椤碉紝浠呭睍绀哄叧閿瓧娈礰;
+  }
+  if (context.detail) {
+    return `宸查€氳繃璇︽儏鎺ュ彛璇诲彇${label}锛岄〉闈㈠揩鐓ц鍙栧け璐;
+  }
+  if (context.pageSnapshot) {
+    return `宸查€氳繃椤甸潰蹇収璇诲彇${label}锛岃鎯呮帴鍙ｈ鍙栧け璐;
+  }
+  return `鏆傛湭璇诲彇鍒?{label}璇︽儏`;
+}
+
+async function analyzeDomesticPrLinks(relatedLinks, target, baseUrl, onProgress) {
+  const prLink = pickRelatedLink(relatedLinks, "domestic_pr");
+  if (!prLink) {
+    return createRelatedDocumentBase({
+      kind: "domestic_pr",
+      title: "鍥藉唴PR",
+      status: "warn",
+      statusText: "鏈壘鍒?,
+      displayOnly: true,
+      statement: "灏氭湭鍙戠幇鏄庣‘鐨勫浗鍐匬R鏉ユ簮",
+      notes: ["浠呭睍绀猴紝涓嶈嚜鍔ㄥ垽鏂?]
+    });
+  }
+
+  const ref = parseProcessRef(prLink.url, "domestic_pr");
+  if (!ref) {
+    return createRelatedDocumentBase({
+      kind: "domestic_pr",
+      title: "鍥藉唴PR",
+      status: "warn",
+      statusText: "閾炬帴寮傚父",
+      displayOnly: true,
+      sourceName: prLink.title || "",
+      sourceUrl: prLink.url || "",
+      statement: "鍥藉唴PR閾炬帴鏍煎紡鏆傛湭璇嗗埆",
+      notes: ["浠呭睍绀猴紝涓嶈嚜鍔ㄥ垽鏂?]
+    });
+  }
+
+  reportProgress(onProgress, "domestic-pr-open", "姝ｅ湪璇诲彇鍥藉唴PR璇︽儏", prLink.title || ref.detailUrl || "鍥藉唴PR鍏ュ彛");
+  const context = await loadRelatedProcessContext(ref, baseUrl, { includePageSnapshot: false });
+  if (!context.detail) {
+    await ensureRelatedProcessPageSnapshot(context);
+  }
+  if (!context.detail && !context.pageSnapshot) {
+    return createRelatedDocumentBase({
+      kind: "domestic_pr",
+      title: "鍥藉唴PR",
+      status: "warn",
+      statusText: "璇诲彇澶辫触",
+      displayOnly: true,
+      sourceName: prLink.title || "",
+      sourceUrl: ref.detailUrl || "",
+      statement: `鍥藉唴PR璇诲彇澶辫触锛?{context.detailError || context.pageError || "鏈煡閿欒"}`,
+      errorText: context.detailError || context.pageError || "",
+      notes: ["浠呭睍绀猴紝涓嶈嚜鍔ㄥ垽鏂?]
+    });
+  }
+
+  const fields = {
+    processCode: await extractProcessFieldWithFallback(context, ["PR鍗曞彿", "娴佺▼缂栧彿", "鍗曞彿"]),
+    costDept: await extractProcessFieldWithFallback(context, ["璐圭敤褰掑睘閮ㄩ棬", "褰掑睘閮ㄩ棬", "鎵€灞為儴闂?]),
+    costProject: await extractProcessFieldWithFallback(context, ["璐圭敤褰掑睘椤圭洰", "褰掑睘椤圭洰", "鎵€灞為」鐩?]),
+    purposeText: await extractProcessFieldWithFallback(context, ["璁㈠崟鐢ㄩ€旇鏄?, "鐢ㄩ€旇鏄?, "璐圭敤鐢ㄩ€旇鏄?, "鐢宠浜嬬敱", "閲囪喘鐢ㄩ€?]),
+    prAmount: await extractProcessFieldWithFallback(context, ["PR閲戦", "PR鎬婚", "PR鐢宠閲戦", "鐢宠閲戰", "閲戰"])
+  };
+
+  return createRelatedDocumentBase({
+    kind: "domestic_pr",
+    title: "鍥藉唴PR",
+    status: "info",
+    statusText: "浠呭睍绀?,
+    displayOnly: true,
+    sourceName: normalizeRelatedSourceName(context.pageSnapshot, prLink.title, ref, fields.processCode),
+    sourceUrl: ref.detailUrl,
+    statement: buildRelatedReadStatement("鍥藉唴PR", context),
+    fields,
+    notes: ["浠呭睍绀猴紝涓嶈嚜鍔ㄥ垽鏂?, "PR閲戦浠呬綔绯荤粺榛樿灞曠ず锛屼笉鍙備笌瑙勫垯璁＄畻"]
+  });
+}
+
+async function analyzeDomesticPrLinksMulti(relatedLinks, target, baseUrl, onProgress) {
+  const prLinks = pickRelatedLinks(relatedLinks, "domestic_pr");
+  if (prLinks.length === 0) {
+    return [
+      createRelatedDocumentBase({
+        kind: "domestic_pr",
+        title: "鍥藉唴PR",
+        status: "warn",
+        statusText: "鏈壘鍒?,
+        displayOnly: true,
+        statement: "灏氭湭鍙戠幇鏄庣‘鐨勫浗鍐匬R鏉ユ簮",
+        notes: ["浠呭睍绀猴紝涓嶈嚜鍔ㄥ垽鏂?]
+      })
+    ];
+  }
+
+  const docs = [];
+  for (let index = 0; index < prLinks.length; index += 1) {
+    const prLink = prLinks[index];
+    const itemLabel = prLinks.length > 1 ? `PR ${index + 1}` : "";
+    const ref = parseProcessRef(prLink.url, "domestic_pr");
+    if (!ref) {
+      docs.push(
+        createRelatedDocumentBase({
+          kind: "domestic_pr",
+          title: "鍥藉唴PR",
+          itemLabel,
+          status: "warn",
+          statusText: "閾炬帴寮傚父",
+          displayOnly: true,
+          sourceName: prLink.title || "",
+          sourceUrl: prLink.url || "",
+          statement: "鍥藉唴PR閾炬帴鏍煎紡鏆傛湭璇嗗埆",
+          notes: ["浠呭睍绀猴紝涓嶈嚜鍔ㄥ垽鏂?]
+        })
+      );
+      continue;
+    }
+
+    reportProgress(onProgress, "domestic-pr-open", "姝ｅ湪璇诲彇鍥藉唴PR璇︽儏", prLink.title || ref.detailUrl || "鍥藉唴PR鍏ュ彛");
+    const context = await loadRelatedProcessContext(ref, baseUrl, { includePageSnapshot: false });
+    if (!context.detail) {
+      await ensureRelatedProcessPageSnapshot(context);
+    }
+    if (!context.detail) {
+      await ensureRelatedProcessPageSnapshot(context);
+    }
+    if (!context.detail && !context.pageSnapshot) {
+      docs.push(
+        createRelatedDocumentBase({
+          kind: "domestic_pr",
+          title: "鍥藉唴PR",
+          itemLabel,
+          status: "warn",
+          statusText: "璇诲彇澶辫触",
+          displayOnly: true,
+          sourceName: prLink.title || "",
+          sourceUrl: ref.detailUrl || "",
+          statement: `鍥藉唴PR璇诲彇澶辫触锛?{context.detailError || context.pageError || "鏈煡閿欒"}`,
+          errorText: context.detailError || context.pageError || "",
+          notes: ["浠呭睍绀猴紝涓嶈嚜鍔ㄥ垽鏂?]
+        })
+      );
+      continue;
+    const fields = {
+      processCode: await extractProcessFieldWithFallback(context, ["PR鍗曞彿", "娴佺▼缂栧彿", "鍗曞彿"]),
+      costDept: await extractProcessFieldWithFallback(context, ["璐圭敤褰掑睘閮ㄩ棬", "褰掑睘閮ㄩ棬", "鎵€灞為儴闂?]),
+      costProject: await extractProcessFieldWithFallback(context, ["璐圭敤褰掑睘椤圭洰", "褰掑睘椤圭洰", "鎵€灞為」鐩?]),
+      purposeText: await extractProcessFieldWithFallback(context, ["璁㈠崟鐢ㄩ€旇鏄?, "鐢ㄩ€旇鏄?, "璐圭敤鐢ㄩ€旇鏄?, "鐢宠浜嬬敱", "閲囪喘鐢ㄩ€?]),
+      prAmount: await extractProcessFieldWithFallback(context, ["PR閲戰", "PR鎬婚", "PR鐢宠閲戰", "鐢宠閲戰", "閲戰"]),
+      requirementSummary: await buildRequirementSummaryWithFallback(context)
+    };
+      costProject: await extractProcessFieldWithFallback(context, ["璐圭敤褰掑睘椤圭洰", "褰掑睘椤圭洰", "鎵€灞為」鐩?]),
+      purposeText: await extractProcessFieldWithFallback(context, ["璁㈠崟鐢ㄩ€旇鏄?, "鐢ㄩ€旇鏄?, "璐圭敤鐢ㄩ€旇鏄?, "鐢宠浜嬬敱", "閲囪喘鐢ㄩ€?]),
+      prAmount: await extractProcessFieldWithFallback(context, ["PR閲戦", "PR鎬婚", "PR鐢宠閲戰", "鐢宠閲戰", "閲戰"]),
+      requirementSummary: await buildRequirementSummaryWithFallback(context)
+    };
+    };
+
+    docs.push(
+      createRelatedDocumentBase({
+        kind: "domestic_pr",
+        title: "鍥藉唴PR",
+        itemLabel,
+        status: "info",
+        statusText: "浠呭睍绀?,
+        displayOnly: true,
+        sourceName: normalizeRelatedSourceName(context.pageSnapshot, prLink.title, ref, fields.processCode),
+        sourceUrl: ref.detailUrl,
+        statement: buildRelatedReadStatement("鍥藉唴PR", context),
+        fields,
+        notes: ["浠呭睍绀猴紝涓嶈嚜鍔ㄥ垽鏂?, "PR閲戦浠呬綔绯荤粺榛樿灞曠ず锛屼笉鍙備笌瑙勫垯璁＄畻"]
+      })
+    );
+  }
+
+  return docs;
+}
+
+function createOrderCheck(key, label, status, statement) {
+  return { key, label, status, statement };
+}
+
+function compareCompanyLoosely(left, right) {
+  const normalizedLeft = normalizeCompareText(left);
+  const normalizedRight = normalizeCompareText(right);
+  if (!normalizedLeft || !normalizedRight) {
+    return false;
+  }
+  if (normalizedLeft === normalizedRight) {
+    return true;
+  }
+  return normalizedLeft.includes(normalizedRight) || normalizedRight.includes(normalizedLeft);
+}
+
+async function analyzePurchaseOrderLinks(relatedLinks, target, baseUrl, onProgress) {
+  const orderLink = pickRelatedLink(relatedLinks, "purchase_order");
+  if (!orderLink) {
+    return createRelatedDocumentBase({
+      kind: "purchase_order",
+      title: "閲囪喘璁㈠崟",
+      status: "warn",
+      statusText: "鏈壘鍒?,
+      statement: "灏氭湭鍙戠幇鏄庣‘鐨勯噰璐鍗曟潵婧?,
+      notes: ["浠呰嚜鍔ㄦ牳瀵规敹娆惧叕鍙镐笌璁㈠崟閲戦涓ら」"]
+    });
+  }
+
+  const ref = parseProcessRef(orderLink.url, "purchase_order");
+  if (!ref) {
+    return createRelatedDocumentBase({
+      kind: "purchase_order",
+      title: "閲囪喘璁㈠崟",
+      status: "warn",
+      statusText: "閾炬帴寮傚父",
+      sourceName: orderLink.title || "",
+      sourceUrl: orderLink.url || "",
+      statement: "閲囪喘璁㈠崟閾炬帴鏍煎紡鏆傛湭璇嗗埆",
+      notes: ["浠呰嚜鍔ㄦ牳瀵规敹娆惧叕鍙镐笌璁㈠崟閲戦涓ら」"]
+    });
+  }
+
+  reportProgress(onProgress, "purchase-order-open", "姝ｅ湪璇诲彇閲囪喘璁㈠崟璇︽儏", orderLink.title || ref.detailUrl || "閲囪喘璁㈠崟鍏ュ彛");
+  const context = await loadRelatedProcessContext(ref, baseUrl, { includePageSnapshot: false });
+  if (!context.detail) {
+    await ensureRelatedProcessPageSnapshot(context);
+  }
+  if (!context.detail && !context.pageSnapshot) {
+    return createRelatedDocumentBase({
+      kind: "purchase_order",
+      title: "閲囪喘璁㈠崟",
+      status: "warn",
+      statusText: "璇诲彇澶辫触",
+      sourceName: orderLink.title || "",
+      sourceUrl: ref.detailUrl || "",
+      statement: `閲囪喘璁㈠崟璇诲彇澶辫触锛?{context.detailError || context.pageError || "鏈煡閿欒"}`,
+      errorText: context.detailError || context.pageError || "",
+      notes: ["浠呰嚜鍔ㄦ牳瀵规敹娆惧叕鍙镐笌璁㈠崟閲戦涓ら」"]
+    });
+  }
+
+  const fields = {
+    processCode: await extractProcessFieldWithFallback(context, ["璁㈠崟缂栧彿", "閲囪喘璁㈠崟缂栧彿", "娴佺▼缂栧彿", "鍗曞彿"]),
+    orderName: await extractProcessFieldWithFallback(context, ["璁㈠崟鍚嶇О", "閲囪喘璁㈠崟鍚嶇О", "鏍囬"]),
+    supplierName: await extractProcessFieldWithFallback(context, ["渚涘簲鍟嗗悕绉?, "渚涘簲鍟?, "鏀舵鍏徃", "瀵规柟鍏徃"]),
+    orderAmount: await extractProcessFieldWithFallback(context, ["璁㈠崟閲戰", "閲囪喘璁㈠崟閲戰", "鍚◣閲戰", "閲戰", "閲戰鍚堣"]),
+    description: await extractProcessFieldWithFallback(context, ["璁㈠崟鍐呭鎻忚堪", "閲囪喘鍐呭", "璁㈠崟璇存槑", "澶囨敞", "鍐呭鎻忚堪"])
+  };
+  };
+
+  const checks = [];
+  if (!target.payeeCompany || !fields.supplierName) {
+    checks.push(createOrderCheck("payee_matches_supplier", "鏀舵鍏徃涓庤鍗曚緵搴斿晢", "warn", "浠樻鍗曟垨閲囪喘璁㈠崟缂哄皯鍏徃瀛楁锛屾殏涓嶈嚜鍔ㄥ垽鏂?));
+  } else if (compareCompanyLoosely(target.payeeCompany, fields.supplierName)) {
+    checks.push(createOrderCheck("payee_matches_supplier", "鏀舵鍏徃涓庤鍗曚緵搴斿晢", "pass", "浠樻鍗曟敹娆惧叕鍙镐笌璁㈠崟渚涘簲鍟嗕竴鑷?));
+  } else {
+    checks.push(createOrderCheck("payee_matches_supplier", "鏀舵鍏徃涓庤鍗曚緵搴斿晢", "fail", "浠樻鍗曟敹娆惧叕鍙镐笌璁㈠崟渚涘簲鍟嗕笉涓€鑷?));
+  }
+
+  const paymentAmount = parseAmount(target.paymentAmount);
+  const orderAmount = parseAmount(fields.orderAmount);
+  if (!(paymentAmount > 0) || !(orderAmount > 0)) {
+    checks.push(createOrderCheck("payment_not_exceed_order_amount", "浠樻閲戦涓嶈秴杩囪鍗曢噾棰?, "warn", "浠樻閲戦鎴栬鍗曢噾棰濈己澶憋紝鏆備笉鑷姩鍒ゆ柇"));
+  } else if (paymentAmount <= orderAmount + 0.01) {
+    checks.push(createOrderCheck("payment_not_exceed_order_amount", "浠樻閲戦涓嶈秴杩囪鍗曢噾棰?, "pass", "浠樻閲戦鏈秴杩囪鍗曢噾棰?));
+  } else {
+    checks.push(createOrderCheck("payment_not_exceed_order_amount", "浠樻閲戦涓嶈秴杩囪鍗曢噾棰?, "fail", "浠樻閲戦瓒呰繃璁㈠崟閲戦"));
+  }
+
+  const hasFail = checks.some((item) => item.status === "fail");
+  const hasWarn = checks.some((item) => item.status === "warn");
+
+  return createRelatedDocumentBase({
+    kind: "purchase_order",
+    title: "閲囪喘璁㈠崟",
+    status: hasFail ? "fail" : hasWarn ? "warn" : "pass",
+    statusText: "鏈夐檺鑷姩鏍稿",
+    sourceName: normalizeRelatedSourceName(context.pageSnapshot, orderLink.title, ref, fields.orderName, fields.processCode),
+    sourceUrl: ref.detailUrl,
+    statement: "閲囪喘璁㈠崟浠呰嚜鍔ㄦ牳瀵规敹娆惧叕鍙镐笌璁㈠崟閲戦涓ら」锛屽叾浠栧瓧娈靛彧灞曠ず涓嶅垽鏂?,
+    fields,
+    checks,
+    notes: ["浠呰嚜鍔ㄦ牳瀵规敹娆惧叕鍙镐笌璁㈠崟閲戦涓ら」"]
+  });
+}
+
+function selectMailLikeAttachments(attachments) {
+  return (attachments || []).filter((item) => {
+    const text = cleanText(`${item?.name || ""} ${item?.url || ""}`);
+    return /\.(?:eml|msg)(?:$|\?)/i.test(text) || /閭欢|outlook|message|mail/i.test(text);
+  });
+}
+
+function summarizeFreeText(value, maxLength = 120) {
+  const text = cleanText(value || "");
+  if (!text) return "";
+  return text.length > maxLength ? `${text.slice(0, maxLength)}...` : text;
+}
+
+function buildAcceptanceRelationHints(target, mailSubject, mailSummary, mailAttachmentNames) {
+  const combined = [mailSubject, mailSummary, ...(mailAttachmentNames || [])].filter(Boolean).join("\n");
+  const hints = [];
+  if (!combined) {
+    return ["鏆傛湭鎻愬彇鍒拌冻澶熺殑閭欢绾跨储锛岃浜哄伐鎵撳紑楠屾敹鍗曡繘涓€姝ョ‘璁?];
+  }
+
+  if (target?.payeeCompany && compareCompanyLoosely(combined, target.payeeCompany)) {
+    hints.push(`閭欢绾跨储鍖呭惈渚涘簲鍟?鏀舵鍏徃锛?{target.payeeCompany}`);
+  }
+  if (target?.paymentAmount && amountMatchesPayment(combined, target.paymentAmount)) {
+    hints.push(`閭欢绾跨储鍖呭惈鏈浠樻閲戦锛?{formatAmount(target.paymentAmount)}`);
+  }
+
+  const normalizedTitle = normalizeCompareText(target?.processTitle || "");
+  if (normalizedTitle.length >= 6 && normalizeCompareText(combined).includes(normalizedTitle.slice(0, 10))) {
+    hints.push("閭欢绾跨储涓庡綋鍓嶄粯娆炬爣棰樺瓨鍦ㄦ槑鏄鹃噸鍚?);
+  }
+
+  if ((mailAttachmentNames || []).length > 0) {
+    hints.push(`閭欢鍐呴檮浠讹細${mailAttachmentNames.slice(0, 3).join("銆?)}`);
+  }
+
+  return hints.length > 0 ? hints : ["宸叉彁鍙栭偖浠跺唴瀹癸紝浣嗘槸鍚﹀搴旀湰娆′粯娆句粛闇€浜哄伐鍒ゆ柇"];
+}
+
+async function analyzeAcceptanceMailLinks(relatedLinks, target, baseUrl, onProgress) {
+  const acceptanceLink = pickRelatedLink(relatedLinks, "acceptance");
+  if (!acceptanceLink) {
+    return createRelatedDocumentBase({
+      kind: "acceptance",
+      title: "楠屾敹鍗?,
+      status: "warn",
+      statusText: "鏈壘鍒?,
+      sourceName: "",
+      sourceUrl: "",
+      statement: "灏氭湭鍙戠幇鏄庣‘鐨勯獙鏀舵潵婧?,
+      notes: ["鍙睍绀洪偖浠堕檮浠朵笌鐩稿叧绾跨储锛屼笉鑷姩鍒ゆ柇鏄惁瀵瑰簲鏈浠樻"]
+    });
+  }
+
+  const ref = parseProcessRef(acceptanceLink.url, "acceptance");
+  if (!ref) {
+    return createRelatedDocumentBase({
+      kind: "acceptance",
+      title: "楠屾敹鍗?,
+      status: "warn",
+      statusText: "閾炬帴寮傚父",
+      sourceName: acceptanceLink.title || "",
+      sourceUrl: acceptanceLink.url || "",
+      statement: "楠屾敹閾炬帴鏍煎紡鏆傛湭璇嗗埆",
+      notes: ["鍙睍绀洪偖浠堕檮浠朵笌鐩稿叧绾跨储锛屼笉鑷姩鍒ゆ柇鏄惁瀵瑰簲鏈浠樻"]
+    });
+  }
+
+  reportProgress(onProgress, "acceptance-open", "姝ｅ湪璇诲彇楠屾敹椤?, acceptanceLink.title || ref.detailUrl || "楠屾敹鍏ュ彛");
+  const context = await loadRelatedProcessContext(ref, baseUrl);
+  if (!context.detail && !context.pageSnapshot) {
+    return createRelatedDocumentBase({
+      kind: "acceptance",
+      title: "楠屾敹鍗?,
+      status: "warn",
+      statusText: "璇诲彇澶辫触",
+      sourceName: acceptanceLink.title || "",
+      sourceUrl: ref.detailUrl || "",
+      statement: `楠屾敹椤佃鍙栧け璐ワ細${context.detailError || context.pageError || "鏈煡閿欒"}`,
+      errorText: context.detailError || context.pageError || "",
+      notes: ["鍙睍绀洪偖浠堕檮浠朵笌鐩稿叧绾跨储锛屼笉鑷姩鍒ゆ柇鏄惁瀵瑰簲鏈浠樻"]
+    });
+  }
+
+  const attachments = mergeAttachmentCandidates(
+    context.detail
+      ? ref.mode === "flowable"
+        ? buildFlowableAttachmentList(context.detail)
+        : buildHistoryAttachmentList(context.detail)
+      : [],
+    Array.isArray(context.pageSnapshot?.attachments) ? context.pageSnapshot.attachments : []
+  );
+  const mailAttachments = selectMailLikeAttachments(attachments).slice(0, 3);
+  const mailEvidenceList = [];
+
+  for (const attachment of mailAttachments) {
+    try {
+      const binary = await fetchBinary(attachment.url);
+      const evidence = await extractMailEvidenceFromAttachment(attachment, binary.bytes, binary.contentType || "");
+      if (evidence) {
+        mailEvidenceList.push(evidence);
+      }
+    } catch (_error) {
+      // Ignore single mail attachment parse failures and keep other clues.
+    }
+  }
+
+  const pageMailSubject = extractProcessField(context.detail, context.pageSnapshot, ["閭欢涓婚", "涓婚", "閭欢鏍囬"]);
+  const pageMailTime = extractProcessField(context.detail, context.pageSnapshot, ["閭欢鏃堕棿", "鍙戦€佹椂闂?, "鍙戜欢鏃堕棿", "鏃ユ湡"]);
+  const pageMailBody = extractProcessField(context.detail, context.pageSnapshot, ["閭欢姝ｆ枃", "閭欢鍐呭", "姝ｆ枃", "鎽樿", "璇存槑"]);
+  const firstMailEvidence = mailEvidenceList[0] || {};
+  const mailAttachmentNames = Array.from(
+    new Set(
+      [
+        ...(firstMailEvidence.attachmentNames || []),
+        ...mailAttachments.map((item) => cleanText(item?.name || ""))
+      ].filter(Boolean)
+    )
+  );
+  const mailSubject = firstNonEmpty(pageMailSubject, firstMailEvidence.subject);
+  const mailSentAt = firstNonEmpty(pageMailTime, firstMailEvidence.sentAt);
+  const mailSummary = firstNonEmpty(pageMailBody, firstMailEvidence.bodySummary, summarizeFreeText(firstMailEvidence.text));
+  const relationHints = buildAcceptanceRelationHints(target, mailSubject, mailSummary, mailAttachmentNames);
+
+  return createRelatedDocumentBase({
+    kind: "acceptance",
+    title: "楠屾敹鍗?,
+    status: "info",
+    statusText: "浜哄伐鍒ゆ柇",
+    sourceName: normalizeRelatedSourceName(context.pageSnapshot, acceptanceLink.title, ref, mailSubject),
+    sourceUrl: ref.detailUrl,
+    statement: mailSubject || mailSummary || mailAttachmentNames.length > 0
+      ? "宸叉彁鍙栭獙鏀跺崟閭欢绾跨储锛岃浜哄伐鍒ゆ柇鏄惁瀵瑰簲鏈浠樻"
+      : "宸茶繘鍏ラ獙鏀堕〉锛屼絾鏆傛湭鎻愬彇鍒版槑纭殑閭欢绾跨储",
+    fields: {
+      mailSubject,
+      mailSentAt,
+      mailSummary
+    },
+    attachmentNames: attachments.map((item) => cleanText(item?.name || "")).filter(Boolean).slice(0, 6),
+    mailAttachmentNames,
+    relationHints,
+    notes: ["鍙睍绀洪偖浠堕檮浠朵笌鐩稿叧绾跨储锛屼笉鑷姩鍒ゆ柇鏄惁瀵瑰簲鏈浠樻"]
+  });
+}
+
+async function extractAcceptanceAttachmentPreviews(attachments) {
+  const previews = [];
+  const candidates = (attachments || [])
+    .filter((item) => supportsAttachmentTextExtraction(item?.name, item?.url))
+    .slice(0, 3);
+
+  for (const attachment of candidates) {
+    try {
+      const binary = await fetchBinary(attachment.url);
+      const entries = await extractReferenceTextsFromAttachment(attachment, binary.bytes, binary.contentType || "");
+      const firstEntry = entries.find((item) => cleanText(item?.text || ""));
+      if (!firstEntry) {
+        continue;
+      }
+      previews.push({
+        name: cleanText(attachment?.name || ""),
+        snippet: buildAttachmentPreviewText(firstEntry.text)
+      });
+    } catch (_error) {
+      // Ignore per-attachment preview errors.
+    }
+  }
+
+  return previews;
+}
+
+async function analyzeAcceptanceMailLinksMulti(relatedLinks, target, baseUrl, onProgress) {
+  const acceptanceLinks = pickRelatedLinks(relatedLinks, "acceptance");
+  if (acceptanceLinks.length === 0) {
+    return [
+      createRelatedDocumentBase({
+        kind: "acceptance",
+        title: "楠屾敹鍗?,
+        status: "warn",
+        statusText: "鏈壘鍒?,
+        statement: "灏氭湭鍙戠幇鏄庣‘鐨勯獙鏀舵潵婧?,
+        notes: ["鍙睍绀洪獙鏀堕檮浠朵笌鐩稿叧绾跨储锛屼笉鑷姩鍒ゆ柇鏄惁瀵瑰簲鏈浠樻"]
+      })
+    ];
+  }
+
+  const docs = [];
+  for (let index = 0; index < acceptanceLinks.length; index += 1) {
+    const acceptanceLink = acceptanceLinks[index];
+    const itemLabel = acceptanceLinks.length > 1 ? `楠屾敹 ${index + 1}` : "";
+    const ref = parseProcessRef(acceptanceLink.url, "acceptance");
+    if (!ref) {
+      docs.push(
+        createRelatedDocumentBase({
+          kind: "acceptance",
+          title: "楠屾敹鍗?,
+          itemLabel,
+          status: "warn",
+          statusText: "閾炬帴寮傚父",
+          sourceName: acceptanceLink.title || "",
+          sourceUrl: acceptanceLink.url || "",
+          statement: "楠屾敹閾炬帴鏍煎紡鏆傛湭璇嗗埆",
+          notes: ["鍙睍绀洪獙鏀堕檮浠朵笌鐩稿叧绾跨储锛屼笉鑷姩鍒ゆ柇鏄惁瀵瑰簲鏈浠樻"]
+        })
+      );
+      continue;
+    }
+
+    reportProgress(onProgress, "acceptance-open", "姝ｅ湪璇诲彇楠屾敹椤?, acceptanceLink.title || ref.detailUrl || "楠屾敹鍏ュ彛");
+    const context = await loadRelatedProcessContext(ref, baseUrl);
+    if (!context.detail && !context.pageSnapshot) {
+      docs.push(
+        createRelatedDocumentBase({
+          kind: "acceptance",
+          title: "楠屾敹鍗?,
+          itemLabel,
+          status: "warn",
+          statusText: "璇诲彇澶辫触",
+          sourceName: acceptanceLink.title || "",
+          sourceUrl: ref.detailUrl || "",
+          statement: `楠屾敹椤佃鍙栧け璐ワ細${context.detailError || context.pageError || "鏈煡閿欒"}`,
+          errorText: context.detailError || context.pageError || "",
+          notes: ["鍙睍绀洪獙鏀堕檮浠朵笌鐩稿叧绾跨储锛屼笉鑷姩鍒ゆ柇鏄惁瀵瑰簲鏈浠樻"]
+        })
+      );
+      continue;
+    }
+
+    const attachments = mergeAttachmentCandidates(
+      context.detail
+        ? ref.mode === "flowable"
+          ? buildFlowableAttachmentList(context.detail)
+          : buildHistoryAttachmentList(context.detail)
+        : [],
+      Array.isArray(context.pageSnapshot?.attachments) ? context.pageSnapshot.attachments : []
+    );
+    const mailAttachments = selectMailLikeAttachments(attachments).slice(0, 3);
+    const mailEvidenceList = [];
+
+    for (const attachment of mailAttachments) {
+      try {
+        const binary = await fetchBinary(attachment.url);
+        const evidence = await extractMailEvidenceFromAttachment(attachment, binary.bytes, binary.contentType || "");
+        if (evidence) {
+          mailEvidenceList.push(evidence);
+        }
+      } catch (_error) {
+        // Ignore single mail attachment parse failures and keep other clues.
+      }
+    }
+
+    const pageMailSubject = extractProcessField(context.detail, context.pageSnapshot, ["閭欢涓婚", "涓婚", "閭欢鏍囬"]);
+    const pageMailTime = extractProcessField(context.detail, context.pageSnapshot, ["閭欢鏃堕棿", "鍙戦€佹椂闂?, "鍙戜欢鏃堕棿", "鏃ユ湡"]);
+    const pageMailBody = extractProcessField(context.detail, context.pageSnapshot, ["閭欢姝ｆ枃", "閭欢鍐呭", "姝ｆ枃", "鎽樿", "璇存槑"]);
+    const firstMailEvidence = mailEvidenceList[0] || {};
+    const mailAttachmentNames = Array.from(
+      new Set(
+        [
+          ...(firstMailEvidence.attachmentNames || []),
+          ...mailAttachments.map((item) => cleanText(item?.name || ""))
+        ].filter(Boolean)
+      )
+    );
+    const attachmentNames = Array.from(
+      new Set(attachments.map((item) => cleanText(item?.name || "")).filter(Boolean))
+    ).slice(0, 6);
+    const attachmentPreviews = await extractAcceptanceAttachmentPreviews(attachments);
+    const mailSubject = firstNonEmpty(pageMailSubject, firstMailEvidence.subject);
+    const mailSentAt = firstNonEmpty(pageMailTime, firstMailEvidence.sentAt);
+    const mailSummary = firstNonEmpty(pageMailBody, firstMailEvidence.bodySummary, summarizeFreeText(firstMailEvidence.text));
+    const relationHints = buildAcceptanceRelationHints(target, mailSubject, mailSummary, mailAttachmentNames);
+
+    docs.push(
+      createRelatedDocumentBase({
+        kind: "acceptance",
+        title: "楠屾敹鍗?,
+        itemLabel,
+        status: "info",
+        statusText: "浜哄伐鍒ゆ柇",
+        sourceName: normalizeRelatedSourceName(context.pageSnapshot, acceptanceLink.title, ref, mailSubject),
+        sourceUrl: ref.detailUrl,
+        statement:
+          attachmentNames.length > 0
+            ? "宸茶繘鍏ラ獙鏀堕〉锛屽睍绀洪獙鏀堕檮浠跺苟淇濈暀浜哄伐鍒ゆ柇"
+            : mailSubject || mailSummary || mailAttachmentNames.length > 0
+              ? "宸叉彁鍙栭獙鏀跺崟閭欢绾跨储锛岃浜哄伐鍒ゆ柇鏄惁瀵瑰簲鏈浠樻"
+              : "宸茶繘鍏ラ獙鏀堕〉锛屼絾鏆傛湭鎻愬彇鍒版槑纭殑閭欢绾跨储",
+        fields: {
+          mailSubject,
+          mailSentAt,
+          mailSummary
+        },
+        attachmentNames,
+        mailAttachmentNames,
+        previewItems: attachmentPreviews,
+        relationHints,
+        notes: ["鍙睍绀洪獙鏀堕檮浠朵笌鐩稿叧绾跨储锛屼笉鑷姩鍒ゆ柇鏄惁瀵瑰簲鏈浠樻"]
+      })
+    );
+  }
+
+  return docs;
+}
+
+async function analyzeContractLinks(relatedLinks, target, baseUrl, onProgress) {
+  const contractLink = (relatedLinks || []).find((item) => item.relation === "contract");
+  if (!contractLink) {
+    return {
+      ref: null,
+      facts: {},
+      matches: { amount: null, company: null, account: null },
+      summary: emptyContractSummary(),
+      processing: emptyContractProcessing("not_found", "灏氭湭鍙戠幇鏄庣‘鐨勫悎鍚屾潵婧?)
+    };
+  }
+
+  const ref = parseProcessRef(contractLink.url, "contract");
+  if (!ref) {
+    return {
+      ref: null,
+      facts: {},
+      matches: { amount: null, company: null, account: null },
+      summary: emptyContractSummary(),
+      processing: emptyContractProcessing("invalid_ref", "宸插彂鐜板悎鍚岄摼鎺ワ紝浣嗛摼鎺ユ牸寮忔殏鏈瘑鍒?)
+    };
+  }
+
+  reportProgress(onProgress, "contract-open", "姝ｅ湪璇诲彇鍚堝悓椤?, contractLink.title || ref.detailUrl || "鍚堝悓鍏ュ彛");
+
+  try {
+    if (ref.mode === "flowable") {
+      const detail = await fetchFlowableDetail(ref, baseUrl);
+      const baseFacts = {
+        processCode: firstNonEmpty(detail.processCode, detail.flowFormData?.EXTARGETNODEID),
+        processTitle: firstNonEmpty(detail.flowFormData?.processTitleInput, detail.flowFormData?.NCBILLCODE),
+        counterpartyCompany: firstNonEmpty(detail.flowFormData?.HT010),
+        contractAccountNo: firstLikelyBankAccount(
+          detail.flowFormData?.HT013,
+          detail.flowFormData?.HT014,
+          detail.flowFormData?.ACCOUNT,
+          detail.flowFormData?.bankAccount
+        ),
+        effectiveStart: firstNonEmptyDate(detail.flowFormData?.HT032),
+        effectiveEnd: firstNonEmptyDate(detail.flowFormData?.HT033),
+        paymentTerms: firstMeaningfulText(
+          detail.flowFormData?.HT030,
+          detail.flowFormData?.HT031,
+          detail.flowFormData?.HT034,
+          detail.flowFormData?.HT035
+        ),
+        sourceName: firstNonEmpty(detail.flowFormData?.processTitleInput, detail.processCode, contractLink.title),
+        sourceUrl: ref.detailUrl
+      };
+      return analyzeContractDetail(ref, buildFlowableAttachmentList(detail), baseFacts, target, "鍚堝悓椤?, onProgress);
+    }
+
+      const detail = await fetchHistoryDetail(ref, baseUrl);
+      const historyPageSnapshot = await collectPageSnapshotFromUrl(ref.detailUrl).catch(() => null);
+      const mainForm = detail?.formData?.mainForm || {};
+      const baseFacts = {
+        processCode: firstNonEmpty(findHistoryField(mainForm, "鍚堝悓缂栧彿", "閲囪喘鍚堝悓缂栧彿")),
+        processTitle: firstNonEmpty(
+          findHistoryField(mainForm, "鍚堝悓鍚嶇О"),
+          findFieldValueFromPairs(historyPageSnapshot?.fieldPairs, "鍚堝悓鍚嶇О"),
+          contractLink.title
+        ),
+        counterpartyCompany: firstNonEmpty(
+          findHistoryField(mainForm, "渚涘簲鍟嗗悕绉?, "涔欐柟", "瀵规柟鍏徃"),
+          findFieldValueFromPairs(historyPageSnapshot?.fieldPairs, "渚涘簲鍟嗗悕绉?, "涔欐柟", "瀵规柟鍏徃")
+        ),
+        contractAccountNo: firstLikelyBankAccount(findHistoryField(mainForm, "鏀舵璐﹀彿", "閾惰璐﹀彿", "寮€鎴疯处鍙?)),
+        effectiveStart: firstNonEmptyDate(
+          findHistoryField(mainForm, "鍚堝悓寮€濮嬫棩鏈?, "寮€濮嬫棩鏈?),
+          findFieldValueFromPairs(historyPageSnapshot?.fieldPairs, "鍚堝悓寮€濮嬫棩鏈?, "寮€濮嬫棩鏈?)
+        ),
+        effectiveEnd: firstNonEmptyDate(
+          findHistoryField(mainForm, "鍚堝悓缁撴潫鏃ユ湡", "缁撴潫鏃ユ湡"),
+          findFieldValueFromPairs(historyPageSnapshot?.fieldPairs, "鍚堝悓缁撴潫鏃ユ湡", "缁撴潫鏃ユ湡")
+        ),
+        paymentTerms: firstMeaningfulText(
+          findHistoryField(mainForm, "浠樻鏂瑰紡", "浠樻鏉′欢", "楠屾敹鏍囧噯"),
+          findFieldValueFromPairs(historyPageSnapshot?.fieldPairs, "浠樻鏂瑰紡", "浠樻鏉′欢", "楠屾敹鏍囧噯")
+        ),
+        sourceName: firstNonEmpty(
+          findHistoryField(mainForm, "鍚堝悓鍚嶇О"),
+          findFieldValueFromPairs(historyPageSnapshot?.fieldPairs, "鍚堝悓鍚嶇О"),
+          contractLink.title
+        ),
+        sourceUrl: ref.detailUrl
+      };
+      const historyAttachments = mergeAttachmentCandidates(
+        buildHistoryAttachmentList(detail),
+        Array.isArray(historyPageSnapshot?.attachments) ? historyPageSnapshot.attachments : []
+      );
+      return analyzeContractDetail(ref, historyAttachments, baseFacts, target, "鍚堝悓椤?, onProgress);
+  } catch (error) {
+    return {
+      ref,
+      facts: {
+        sourceName: contractLink.title || "",
+        sourceUrl: ref.detailUrl || "",
+        paymentTerms: `鍚堝悓椤佃鍙栧け璐ワ細${normalizeError(error)}`
+      },
+      matches: { amount: null, company: null, account: null },
+      summary: {
+        ...emptyContractSummary(),
+        mode: "error",
+        statusText: "璇诲彇澶辫触",
+        errorText: `鍚堝悓椤佃鍙栧け璐ワ細${normalizeError(error)}`
+      },
+      processing: emptyContractProcessing("read_failed", `鍚堝悓椤佃鍙栧け璐ワ細${normalizeError(error)}`)
+    };
+  }
+}
+
+async function analyzeContractDetail(ref, attachments, baseFacts, target, sourceLabelPrefix, onProgress) {
+  const normalizedContractAttachments = normalizeAttachmentCandidates(attachments || []);
+  const contractAttachmentDisplay = summarizeAttachmentDisplay(normalizedContractAttachments);
+  attachments = normalizedContractAttachments;
+  const facts = { ...baseFacts };
+  const matches = {
+    amount: amountMatchesPayment(facts.paymentTerms || "", target.paymentAmount)
+      ? makeEvidence(`${sourceLabelPrefix}琛ㄥ崟`, ref.detailUrl, formatAmount(target.paymentAmount), facts.paymentTerms || "")
+      : null,
+    company:
+      companyMatchesPayment(facts.counterpartyCompany || "", target.payeeCompany) ||
+      companyMatchesPayment(facts.paymentTerms || "", target.payeeCompany)
+        ? makeEvidence(`${sourceLabelPrefix}琛ㄥ崟`, ref.detailUrl, target.payeeCompany || "", facts.counterpartyCompany || facts.paymentTerms || "")
+        : null,
+    account:
+      accountMatchesPayment(facts.contractAccountNo || "", target.payeeAccount) ||
+      accountMatchesPayment(facts.paymentTerms || "", target.payeeAccount)
+        ? makeEvidence(`${sourceLabelPrefix}琛ㄥ崟`, ref.detailUrl, target.payeeAccount || "", facts.contractAccountNo || facts.paymentTerms || "")
+        : null
+  };
+
+  const attachmentAnalysis = await analyzeAttachmentList(attachments || [], target, `${sourceLabelPrefix}闄勪欢`, onProgress, "contract-attachments");
+
+  if (!facts.effectiveStart) facts.effectiveStart = attachmentAnalysis.contractFacts.effectiveStart || "";
+  if (!facts.effectiveEnd) facts.effectiveEnd = attachmentAnalysis.contractFacts.effectiveEnd || "";
+  if (!facts.paymentTerms) facts.paymentTerms = attachmentAnalysis.contractFacts.paymentTerms || "";
+  if (!facts.paymentTerms) facts.paymentTerms = deriveFallbackContractTerms(attachmentAnalysis.referenceEntries || [], target);
+  if (!facts.paymentTerms) facts.paymentTerms = "宸茶繘鍏ュ悎鍚岄〉锛屼絾鏈彁鍙栧埌鏄庣‘浠樻鏉′欢";
+  if (!facts.sourceName) facts.sourceName = attachmentAnalysis.contractFacts.sourceName || ref.detailUrl;
+  if (!facts.sourceUrl) facts.sourceUrl = attachmentAnalysis.contractFacts.sourceUrl || ref.detailUrl;
+
+  const candidateSources = [];
+  if (facts.paymentTerms) {
+    candidateSources.push({
+      sourceName: `${sourceLabelPrefix}琛ㄥ崟`,
+      sourceUrl: ref.detailUrl,
+      text: facts.paymentTerms
+    });
+  }
+  candidateSources.push(...(attachmentAnalysis.referenceEntries || []));
+
+  const clauseCandidates = buildContractClauseCandidates(candidateSources);
+  let summary = deriveLocalContractSummary(clauseCandidates, facts);
+  summary = {
+    ...summary,
+    evidenceClauses: selectSummaryEvidenceClauses(summary.evidenceClauses, clauseCandidates),
+    llmDispatchStatus: clauseCandidates.length > 0 ? "寰呭彂閫? : "鏈彂閫?,
+    llmDispatchReason: clauseCandidates.length > 0 ? "宸茬瓫鍒颁粯娆剧浉鍏虫潯娆惧€欓€夛紝婊¤冻鍙戦€佹潯浠? : "鏈瓫鍒颁粯娆剧浉鍏虫潯娆惧€欓€夛紝浠呭仛鏈湴澶勭悊",
+    llmRequestPreview: clauseCandidates.length > 0
+      ? buildContractLlmPreview({
+          target,
+          facts,
+          candidates: clauseCandidates
+        })
+      : null,
+    errorText: ""
+  };
+
+  if (clauseCandidates.length > 0) {
+    try {
+      const llmSummary = await summarizeContractCandidatesWithLlm({
+        target,
+        facts,
+        candidates: clauseCandidates
+      });
+      summary = {
+        mode: "llm",
+        statusText: "AI鎽樿",
+        paymentMode: llmSummary.paymentMode || summary.paymentMode,
+        paymentTermsSummary: llmSummary.paymentTermsSummary || summary.paymentTermsSummary,
+        acceptanceRequirement: llmSummary.acceptanceRequirement || summary.acceptanceRequirement,
+        invoiceRequirement: llmSummary.invoiceRequirement || summary.invoiceRequirement,
+        paymentDeadline: llmSummary.paymentDeadline || summary.paymentDeadline,
+        installments: llmSummary.installments || summary.installments,
+        accountChangeRequirement: llmSummary.accountChangeRequirement || summary.accountChangeRequirement,
+        taxRate: pickPreferredTaxRate(summary.taxRate, llmSummary.taxRate),
+        capAmount: pickPreferredCapAmount(summary.capAmount, llmSummary.capAmount),
+        evidenceClauseIds: llmSummary.evidenceClauseIds || [],
+        evidenceClauses: selectSummaryEvidenceClauses(llmSummary.evidenceClauseIds, clauseCandidates),
+        llmDispatchStatus: "宸插彂閫?,
+        llmDispatchReason: "宸插皢鑴辨晱鍚庣殑浠樻鐩稿叧鏉℃鍊欓€夊彂閫佺粰澶фā鍨?,
+        llmRequestPreview: summary.llmRequestPreview,
+        errorText: ""
+      };
+    } catch (error) {
+      summary = {
+        ...summary,
+        mode: "local_fallback",
+        statusText: "鏈湴鎽樺綍",
+        llmDispatchStatus: "鍙戦€佸け璐?,
+        llmDispatchReason: "宸插皾璇曞彂閫佺粰澶фā鍨嬶紝浣嗚皟鐢ㄥけ璐ワ紝宸插洖閫€鍒版湰鍦板睍绀?,
+        errorText: `AI鎽樿澶辫触锛?{normalizeError(error)}`
+      };
+    }
+  }
+
+  return {
+    ref,
+    facts,
+    summary,
+    attachmentAnalysis,
+    matches: {
+      amount: matches.amount || attachmentAnalysis.matches.amount,
+      company: matches.company || attachmentAnalysis.matches.company,
+      account: matches.account || attachmentAnalysis.matches.account
+    },
+    processing: {
+      pageStatus: "read_ok",
+      pageStatusText: "宸茶繘鍏ュ悎鍚岄〉",
+      attachmentDiscoveredCount: contractAttachmentDisplay.count,
+      attachmentSupportedCount: attachmentAnalysis.stats.supportedCount,
+      attachmentScannedCount: attachmentAnalysis.stats.scannedCount,
+      attachmentDownloadedCount: attachmentAnalysis.stats.downloadedCount,
+      attachmentParsedCount: attachmentAnalysis.stats.parsedCount,
+      attachmentErrorCount: attachmentAnalysis.stats.errorCount,
+      attachmentNames: contractAttachmentDisplay.names,
+      periodSource: summarizeContractFactSource(
+        baseFacts.effectiveStart || baseFacts.effectiveEnd,
+        attachmentAnalysis.contractFacts.effectiveStart || attachmentAnalysis.contractFacts.effectiveEnd,
+        attachmentAnalysis.contractFacts.sourceName,
+        "鍚堝悓椤佃〃鍗?
+      ),
+      paymentTermsSource: summarizeContractFactSource(
+        baseFacts.paymentTerms,
+        attachmentAnalysis.contractFacts.paymentTerms,
+        attachmentAnalysis.contractFacts.sourceName,
+        "鍚堝悓椤佃〃鍗?
+      ),
+      companySource: summarizeContractFactSource(
+        baseFacts.counterpartyCompany,
+        attachmentAnalysis.matches.company?.matchedValue,
+        attachmentAnalysis.matches.company?.sourceName,
+        "鍚堝悓椤佃〃鍗?
+      ),
+      accountSource: summarizeContractFactSource(
+        baseFacts.contractAccountNo,
+        attachmentAnalysis.matches.account?.matchedValue,
+        attachmentAnalysis.matches.account?.sourceName,
+        "鍚堝悓椤佃〃鍗?
+      ),
+      clauseCandidateCount: clauseCandidates.length,
+      summaryStatusText: summary.statusText || "鏈敓鎴?,
+      summaryErrorText: summary.errorText || ""
+    }
+  };
+}
+
+async function analyzeAcceptanceLinks(relatedLinks, target, baseUrl, onProgress) {
+  const acceptanceLink = (relatedLinks || []).find((item) => item.relation === "acceptance");
+  if (!acceptanceLink) {
+    return { statement: "灏氭湭鍙戠幇鏄庣‘鐨勯獙鏀舵潵婧?, sourceName: "", sourceUrl: "" };
+  }
+
+  const ref = parseProcessRef(acceptanceLink.url, "acceptance");
+  if (!ref) {
+    return { statement: "楠屾敹閾炬帴鏍煎紡鏆傛湭璇嗗埆", sourceName: acceptanceLink.title || "", sourceUrl: acceptanceLink.url || "" };
+  }
+
+  reportProgress(onProgress, "acceptance-open", "姝ｅ湪璇诲彇楠屾敹椤?, acceptanceLink.title || ref.detailUrl || "楠屾敹鍏ュ彛");
+
+  try {
+    const detail = ref.mode === "flowable" ? await fetchFlowableDetail(ref, baseUrl) : await fetchHistoryDetail(ref, baseUrl);
+    const titles =
+      ref.mode === "flowable"
+        ? buildAttachmentTitles(detail)
+        : buildHistoryAttachmentList(detail)
+            .map((item) => item.name)
+            .filter(Boolean);
+    return {
+      statement: acceptanceTitleMatch(target, titles),
+      sourceName: acceptanceLink.title || "",
+      sourceUrl: ref.detailUrl
+    };
+  } catch (error) {
+    return {
+      statement: `楠屾敹椤佃鍙栧け璐ワ細${normalizeError(error)}`,
+      sourceName: acceptanceLink.title || "",
+      sourceUrl: ref.detailUrl || ""
+    };
+  }
+}
+
+function acceptanceTitleMatch(target, titles) {
+  if (!titles.length) {
+    return "楠屾敹娴佺▼鏈彁鍙栧埌闄勪欢鏍囬";
+  }
+
+  const paymentTitle = cleanText(target?.processTitle || "").replace(/\s+/g, "");
+  const amountText = target?.paymentAmount ? String(Math.round(Number(String(target.paymentAmount).replace(/[^\d.]/g, "") || 0))) : "";
+  const company = cleanText(target?.payeeCompany || "").replace(/\s+/g, "");
+  const matched = titles.find((title) => {
+    const normalized = cleanText(title).replace(/\s+/g, "");
+    let score = 0;
+    if (paymentTitle && normalized.includes(paymentTitle.slice(0, Math.min(paymentTitle.length, 8)))) score += 1;
+    if (amountText && normalized.includes(amountText)) score += 1;
+    if (company && normalized.includes(company.slice(0, Math.min(company.length, 6)))) score += 1;
+    return score >= 2;
+  });
+
+  return matched ? `宸插彂鐜伴獙鏀舵爣棰樹笌褰撳墠浠樻鍗曠浉绗︼細${matched}` : "楠屾敹鏍囬鏆傛湭鏄庢樉鍖归厤褰撳墠浠樻鍗?;
+}
+
+async function analyzeAttachmentList(attachments, target, sourceLabelPrefix, onProgress, progressPhase) {
+  const normalizedAttachments = normalizeAttachmentCandidates(attachments || []);
+  const items = normalizedAttachments
+    .filter((item) => supportsAttachmentTextExtraction(item?.name, item?.url))
+    .sort((left, right) => {
+      const priorityDiff = attachmentPreScanPriority(left) - attachmentPreScanPriority(right);
+      if (priorityDiff !== 0) return priorityDiff;
+      return attachmentSizeHint(left) - attachmentSizeHint(right);
+    })
+    .slice(0, 12);
+
+  const contractFacts = {
+    effectiveStart: "",
+    effectiveEnd: "",
+    paymentTerms: "",
+    sourceName: "",
+    sourceUrl: ""
+  };
+  const matches = { amount: null, company: null, account: null };
+  const matchMeta = { amount: null, company: null, account: null };
+  const referenceEntries = [];
+  const errors = [];
+  const stats = {
+    discoveredCount: normalizedAttachments.length,
+    supportedCount: items.length,
+    scannedCount: 0,
+    downloadedCount: 0,
+    parsedCount: 0,
+    extractedEntryCount: 0,
+    errorCount: 0
+  };
+
+  if (items.length === 0) {
+    reportProgress(onProgress, progressPhase, `姝ｅ湪鏌ョ湅${sourceLabelPrefix}`, "褰撳墠闃舵娌℃湁鍙В鏋愮殑闄勪欢");
+    return { matches, contractFacts, referenceEntries, errors, stats };
+  }
+
+  reportProgress(onProgress, progressPhase, `姝ｅ湪鏌ョ湅${sourceLabelPrefix}`, `鍑嗗鎵弿 ${items.length} 涓檮浠禶);
+
+  for (let index = 0; index < items.length; index += 1) {
+    const attachment = items[index];
+    stats.scannedCount += 1;
+    reportProgress(
+      onProgress,
+      progressPhase,
+      `姝ｅ湪鏌ョ湅${sourceLabelPrefix}`,
+      `姝ｅ湪鎵弿 ${index + 1}/${items.length}锛?{attachment?.name || "鏈懡鍚嶉檮浠?}`
+    );
+
+    try {
+      const binary = await fetchBinary(attachment.url);
+      const bytes = binary?.bytes || null;
+      if (!bytes || bytes.byteLength < 64) {
+        continue;
+      }
+      stats.downloadedCount += 1;
+
+      const entries = await extractReferenceTextsFromAttachment(attachment, bytes, binary.contentType || "");
+      if (entries.length > 0) {
+        stats.parsedCount += 1;
+        stats.extractedEntryCount += entries.length;
+      }
+      for (const entry of entries) {
+        const text = cleanText(entry.text);
+        if (!text) {
+          continue;
+        }
+        const detectedRole = detectAttachmentRole(attachment, text);
+        const sourceName = `${sourceLabelPrefix}锛?{attachment.name || "鏈懡鍚嶉檮浠?}`;
+        referenceEntries.push({
+          sourceName,
+          sourceUrl: attachment.url || "",
+          attachmentName: attachment.name || "",
+          role: detectedRole?.role || "other",
+          text
+        });
+
+        if (!contractFacts.sourceName && /鍚堝悓|鍗忚/i.test(attachment.name || "")) {
+          const period = extractContractPeriod(text);
+          const terms = extractPaymentTerms(text);
+          if (period.start || period.end || terms) {
+            contractFacts.effectiveStart = period.start;
+            contractFacts.effectiveEnd = period.end;
+            contractFacts.paymentTerms = terms;
+            contractFacts.sourceName = attachment.name || "";
+            contractFacts.sourceUrl = attachment.url || "";
+          }
+        }
+
+        if (amountMatchesPayment(text, target.paymentAmount)) {
+          considerEvidence(
+            matches,
+            matchMeta,
+            "amount",
+            makeEvidence(sourceName, attachment.url || "", formatAmount(target.paymentAmount), snippetAround(text, String(target.paymentAmount || ""))),
+            detectedRole,
+            attachment
+          );
+        }
+
+        if (companyMatchesPayment(text, target.payeeCompany)) {
+          considerEvidence(
+            matches,
+            matchMeta,
+            "company",
+            makeEvidence(sourceName, attachment.url || "", target.payeeCompany || "", snippetAround(text, target.payeeCompany)),
+            detectedRole,
+            attachment
+          );
+        }
+
+        if (accountMatchesPayment(text, target.payeeAccount)) {
+          considerEvidence(
+            matches,
+            matchMeta,
+            "account",
+            makeEvidence(sourceName, attachment.url || "", target.payeeAccount || "", snippetAround(text, target.payeeAccount)),
+            detectedRole,
+            attachment
+          );
+        }
+      }
+    } catch (error) {
+      stats.errorCount += 1;
+      errors.push({
+        attachmentName: attachment?.name || "",
+        attachmentUrl: attachment?.url || "",
+        error: normalizeError(error)
+      });
+    }
+
+    if (
+      matches.amount &&
+      matches.company &&
+      matches.account &&
+      contractFacts.sourceName &&
+      rolePriority(matchMeta.amount?.role) >= rolePriority("invoice") &&
+      rolePriority(matchMeta.company?.role) >= rolePriority("invoice")
+    ) {
+      break;
+    }
+  }
+
+  return { matches, contractFacts, referenceEntries, errors, stats };
+}
+
+function emptyContractProcessing(pageStatus, pageStatusText) {
+  return {
+    pageStatus,
+    pageStatusText,
+    attachmentDiscoveredCount: 0,
+    attachmentSupportedCount: 0,
+    attachmentScannedCount: 0,
+    attachmentDownloadedCount: 0,
+    attachmentParsedCount: 0,
+    attachmentErrorCount: 0,
+    attachmentNames: [],
+    periodSource: "",
+    paymentTermsSource: "",
+    companySource: "",
+    accountSource: "",
+    clauseCandidateCount: 0,
+    summaryStatusText: "鏈敓鎴?,
+    summaryErrorText: ""
+  };
+}
+
+function buildAttachmentOnlyContractProcessing(pageAttachmentAnalysis, inventories) {
+  const contractFacts = pageAttachmentAnalysis?.contractFacts || {};
+  const contractAttachments = Array.isArray(inventories?.contractAttachments) ? inventories.contractAttachments : [];
+  const referenceEntries = Array.isArray(pageAttachmentAnalysis?.referenceEntries) ? pageAttachmentAnalysis.referenceEntries : [];
+  const contractEntries = referenceEntries.filter((item) => item.role === "contract");
+
+  if (!contractFacts.sourceName && contractAttachments.length === 0) {
+    return emptyContractProcessing("not_found", "灏氭湭鍙戠幇鏄庣‘鐨勫悎鍚屾潵婧?);
+  }
+
+  const attachmentNames = contractAttachments
+    .map((item) => cleanText(item?.name || ""))
+    .filter(Boolean)
+    .slice(0, 6);
+
+  return {
+    pageStatus: "attachment_only",
+    pageStatusText: "宸插湪浠樻椤甸檮浠朵腑鍙戠幇鍚堝悓鏉ユ簮",
+    attachmentDiscoveredCount: contractAttachments.length,
+    attachmentSupportedCount: contractAttachments.length,
+    attachmentScannedCount: contractAttachments.length,
+    attachmentDownloadedCount: contractEntries.length,
+    attachmentParsedCount: contractEntries.length,
+    attachmentErrorCount: 0,
+    attachmentNames,
+    periodSource: contractFacts.effectiveStart || contractFacts.effectiveEnd ? contractFacts.sourceName || "浠樻椤靛悎鍚岄檮浠? : "鏈彁鍙?,
+    paymentTermsSource: contractFacts.paymentTerms ? contractFacts.sourceName || "浠樻椤靛悎鍚岄檮浠? : "鏈彁鍙?,
+    companySource: "",
+    accountSource: "",
+    clauseCandidateCount: 0,
+    summaryStatusText: "鏈敓鎴?,
+    summaryErrorText: ""
+  };
+}
+
+function emptyContractSummary() {
+  return {
+    mode: "none",
+    statusText: "鏈敓鎴?,
+    paymentMode: "",
+    paymentTermsSummary: "",
+    acceptanceRequirement: "",
+    invoiceRequirement: "",
+    paymentDeadline: "",
+    installments: "",
+    accountChangeRequirement: "",
+    taxRate: "",
+    capAmount: "",
+    evidenceClauseIds: [],
+    evidenceClauses: [],
+    llmDispatchStatus: "鏈彂閫?,
+    llmDispatchReason: "鏈瓫鍒颁粯娆剧浉鍏虫潯娆惧€欓€夛紝浠呭仛鏈湴澶勭悊",
+    llmRequestPreview: null,
+    errorText: ""
+  };
+}
+
+function selectSummaryEvidenceClauses(selectedIds, candidates) {
+  const items = Array.isArray(candidates) ? candidates : [];
+  if (!Array.isArray(selectedIds)) {
+    return items.slice(0, 3);
+  }
+  const picked = selectedIds
+    .map((clauseId) => items.find((item) => item.clauseId === clauseId))
+    .filter(Boolean);
+  return picked.length > 0 ? picked.slice(0, 3) : items.slice(0, 3);
+}
+
+function summarizeContractFactSource(formValue, attachmentValue, attachmentSourceName, fallbackFormLabel) {
+  if (attachmentValue) {
+    return attachmentSourceName || "鍚堝悓闄勪欢";
+  }
+  if (formValue) {
+    return fallbackFormLabel;
+  }
+  return "鏈彁鍙?;
+}
+
+function deriveFallbackContractTerms(referenceEntries, target) {
+  const monthlyFeeSentence = findContractReferenceSentence(
+    referenceEntries,
+    (sentence) =>
+      /鏈堢鏈嶅姟璐圭敤|鏈堢|鏈堣垂|鍏僜/鏈?.test(sentence) &&
+      (/璐圭敤|鏈嶅姟|鎶ヤ环/.test(sentence) || amountMatchesPayment(sentence, target?.paymentAmount))
+  );
+  const amountSentence =
+    findContractReferenceSentence(
+      referenceEntries,
+      (sentence) => amountMatchesPayment(sentence, target?.paymentAmount) && /璐圭敤|鏈堢|鏈堣垂|鎶ヤ环|鍚◣|鏈嶅姟/.test(sentence)
+    );
+  const termSentence = findContractReferenceSentence(
+    referenceEntries,
+    (sentence) => /鏈嶅姟鍚堢害鏈焲鑷姩寤舵湡涓€骞磡鎻愬墠\d+\s*涓湀.*涓嶇画绾?.test(sentence)
+  );
+  const originalContractSentence =
+    findContractReferenceSentence(referenceEntries, (sentence) => /鎸夊師鍚堝悓绾﹀畾鎵ц|鏈敖浜嬪疁.*鍘熷悎鍚?.test(sentence)) ||
+    findContractReferenceSentence(
+      referenceEntries,
+      (sentence) => /鍘熷悎鍚?*鍚岀瓑娉曞緥鏁堝姏|鏈夊啿绐佺殑浠ヨˉ鍏呭崗璁负鍑?.test(sentence)
+    );
+
+  const parts = [];
+  if (originalContractSentence) parts.push(originalContractSentence);
+  if (amountSentence) parts.push(amountSentence);
+  if (monthlyFeeSentence && !/鏈堢鏈嶅姟璐圭敤|鏈堢|鏈堣垂|鍏僜/鏈?.test(amountSentence || "")) parts.push(monthlyFeeSentence);
+  if (!amountSentence && termSentence) parts.push(termSentence);
+
+  return dedupeTextParts(parts).join("锛?);
+}
+
+function findContractReferenceSentence(referenceEntries, matcher) {
+  for (const entry of Array.isArray(referenceEntries) ? referenceEntries : []) {
+    const text = cleanText(entry?.text || "");
+    if (!text) {
+      continue;
+    }
+
+    const sentences = text
+      .split(/[銆傦紱;\n]/)
+      .map((item) => cleanText(item))
+      .filter((item) => item.length >= 6);
+
+    const matchedSentence = sentences.find((sentence) => {
+      try {
+        return matcher(sentence);
+      } catch {
+        return false;
+      }
+    });
+    if (matchedSentence) {
+      return matchedSentence;
+    }
+  }
+  return "";
+}
+
+function dedupeTextParts(parts) {
+  const result = [];
+  const seen = new Set();
+  for (const part of Array.isArray(parts) ? parts : []) {
+    const text = cleanText(part);
+    if (!text) {
+      continue;
+    }
+    const key = normalizeCompareText(text);
+    if (!key || seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    result.push(text);
+  }
+  return result;
+}
+
+function considerEvidence(matches, matchMeta, key, evidence, detectedRole, attachment) {
+  const nextPriority = rolePriority(detectedRole?.role);
+  const nextScore = Number.isFinite(detectedRole?.score) ? detectedRole.score : nextPriority;
+  const current = matchMeta[key];
+  if (
+    !current ||
+    nextPriority > current.priority ||
+    (nextPriority === current.priority && nextScore > current.score) ||
+    (nextPriority === current.priority && nextScore === current.score && scoreAttachment(attachment) > current.attachmentScore)
+  ) {
+    matches[key] = evidence;
+    matchMeta[key] = {
+      role: detectedRole?.role || "other",
+      priority: nextPriority,
+      score: nextScore,
+      attachmentScore: scoreAttachment(attachment)
+    };
+  }
+}
+
+function buildAmountVerification(target, inventories, matched) {
+  if (!target.paymentAmount) {
+    return createVerificationItem(
+      "amount",
+      "閲戦涓€鑷?,
+      "warn",
+      "鏈粠浠樻鍗曢〉闈㈣瘑鍒埌浠樻閲戦",
+      "",
+      "",
+      "",
+      "浠樻鍗曢噾棰濈己澶憋紝鏃犳硶鐢ㄥ閮ㄨ瘉鎹牳楠?
+    );
+  }
+
+  if (matched) {
+    return createVerificationItem(
+      "amount",
+      "閲戦涓€鑷?,
+      "pass",
+      `宸插湪${matched.sourceName}涓牳瀹炰粯娆鹃噾棰漙,
+      matched.sourceName,
+      matched.sourceUrl,
+      matched.matchedValue,
+      matched.snippet
+    );
+  }
+
+  return createVerificationItem(
+    "amount",
+    "閲戦涓€鑷?,
+    "warn",
+    hasInvoiceSource(inventories) ? "宸插彂鐜板彂绁ㄦ潵婧愶紝浣嗗皻鏈懡涓粯娆鹃噾棰? : "灏氭湭鍙戠幇鍙敤浜庢牳瀹炰粯娆鹃噾棰濈殑澶栭儴鏉ユ簮",
+    "",
+    "",
+    formatAmount(target.paymentAmount),
+    `浠樻鍗曢噾棰濓細${formatAmount(target.paymentAmount)}`
+  );
+}
+
+function buildCompanyVerification(target, inventories, matched) {
+  if (!target.payeeCompany) {
+    return createVerificationItem(
+      "company",
+      "鏀舵鍏徃鍚嶇О涓€鑷?,
+      "warn",
+      "鏈粠浠樻鍗曢〉闈㈣瘑鍒埌鏀舵鍏徃鍚嶇О",
+      "",
+      "",
+      "",
+      "浠樻鍗曟敹娆惧叕鍙哥己澶憋紝鏃犳硶鐢ㄥ閮ㄨ瘉鎹牳楠?
+    );
+  }
+
+  if (matched) {
+    return createVerificationItem(
+      "company",
+      "鏀舵鍏徃鍚嶇О涓€鑷?,
+      "pass",
+      `宸插湪${matched.sourceName}涓牳瀹炴敹娆惧叕鍙稿悕绉癭,
+      matched.sourceName,
+      matched.sourceUrl,
+      matched.matchedValue,
+      matched.snippet
+    );
+  }
+
+  const hasExternal =
+    hasInvoiceSource(inventories) ||
+    inventories.contractAttachments.length > 0 ||
+    inventories.bankChangeAttachments.length > 0 ||
+    inventories.contractLinks.length > 0;
+
+  return createVerificationItem(
+    "company",
+    "鏀舵鍏徃鍚嶇О涓€鑷?,
+    "warn",
+    hasExternal ? "宸插彂鐜板閮ㄦ潵婧愶紝浣嗗皻鏈懡涓敹娆惧叕鍙稿悕绉? : "灏氭湭鍙戠幇鍙敤浜庢牳瀹炴敹娆惧叕鍙哥殑澶栭儴鏉ユ簮",
+    "",
+    "",
+    target.payeeCompany,
+    `浠樻鍗曟敹娆惧叕鍙革細${target.payeeCompany}`
+  );
+}
+
+function buildAccountVerification(target, inventories, matched) {
+  if (!target.payeeAccount) {
+    return createVerificationItem(
+      "account",
+      "鏀舵璐﹀彿涓€鑷?,
+      "warn",
+      "鏈粠浠樻鍗曢〉闈㈣瘑鍒埌鏀舵璐﹀彿",
+      "",
+      "",
+      "",
+      "浠樻鍗曟敹娆捐处鍙风己澶憋紝鏃犳硶鐢ㄥ閮ㄨ瘉鎹牳楠?
+    );
+  }
+
+  if (matched) {
+    return createVerificationItem(
+      "account",
+      "鏀舵璐﹀彿涓€鑷?,
+      "pass",
+      `宸插湪${matched.sourceName}涓牳瀹炴敹娆捐处鍙穈,
+      matched.sourceName,
+      matched.sourceUrl,
+      matched.matchedValue,
+      matched.snippet
+    );
+  }
+
+  const hasInvoice = hasInvoiceSource(inventories);
+  const hasFallback =
+    inventories.bankChangeAttachments.length > 0 ||
+    inventories.contractAttachments.length > 0 ||
+    inventories.contractLinks.length > 0;
+
+  return createVerificationItem(
+    "account",
+    "鏀舵璐﹀彿涓€鑷?,
+    "warn",
+    hasInvoice
+      ? "鍙戠エ涓皻鏈懡涓敹娆捐处鍙凤紝灏嗙户缁互鍚堝悓鎴栧叾浠栭檮浠朵綔涓鸿ˉ鍏呮潵婧?
+      : hasFallback
+        ? "宸插彂鐜板悎鍚屾垨璐﹀彿闄勪欢锛屼絾灏氭湭鍛戒腑鏀舵璐﹀彿"
+        : "灏氭湭鍙戠幇鍙敤浜庢牳瀹炴敹娆捐处鍙风殑澶栭儴鏉ユ簮",
+    "",
+    "",
+    target.payeeAccount,
+    `浠樻鍗曟敹娆捐处鍙凤細${target.payeeAccount}`
+  );
+}
+
+function hasInvoiceSource(inventories) {
+  return (inventories?.invoiceAttachments?.length || 0) > 0 || (inventories?.invoiceStructuredSources?.length || 0) > 0;
+}
+
+function dedupeAttachments(items) {
+  const seen = new Set();
+  const deduped = [];
+
+  for (const item of items || []) {
+    if (!item?.url) {
+      continue;
+    }
+    const key = `${item.url}|${item.name || ""}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    deduped.push(item);
+  }
+
+  return deduped;
+}
+
+function looksLikeRealAttachment(name, url) {
+  if (!url || /^javascript:/i.test(url)) {
+    return false;
+  }
+  return supportsAttachmentTextExtraction(name, url);
+}
+
+function isSyntheticAttachmentLink(url) {
+  return /#\/oa\/contract\/cost/i.test(String(url || ""));
+}
+
+function attachmentNameQuality(name) {
+  const value = cleanText(name || "");
+  if (!value) return 0;
+  let score = 1;
+  if (/[涓€-榫/.test(value)) score += 4;
+  if (/\.(pdf|docx?|xlsx?|csv|ofd|png|jpe?g|msg|eml|zip)$/i.test(value)) score += 2;
+  if (/\s/.test(value)) score += 1;
+  if (/^[a-f0-9]{32}(?:\.[a-z0-9]+)?$/i.test(value)) score -= 5;
+  return score;
+}
+
+function summarizeAttachmentDisplay(attachments) {
+  const names = [];
+  const seen = new Set();
+  const fallback = [];
+  for (const item of attachments || []) {
+    const name = cleanText(item?.name || "");
+    if (!name) {
+      continue;
+    }
+    const key = name.toLowerCase();
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    if (isOpaqueAttachmentName(name)) {
+      fallback.push(name);
+      continue;
+    }
+    names.push(name);
+  }
+
+  const displayNames = (names.length > 0 ? names : fallback).slice(0, 6);
+  return {
+    count: names.length > 0 ? names.length : fallback.length,
+    names: displayNames
+  };
+}
+
+function isOpaqueAttachmentName(name) {
+  const value = cleanText(name || "");
+  if (!value) return true;
+  return /^[a-f0-9]{32}(?:\.[a-z0-9]+)?$/i.test(value);
+}
+
+function pickPreferredTaxRate(localValue, llmValue) {
+  const localText = cleanText(localValue || "");
+  const llmText = cleanText(llmValue || "");
+  const localHasRate = /\d+(?:\.\d+)?%/.test(localText);
+  const llmHasRate = /\d+(?:\.\d+)?%/.test(llmText);
+
+  if (llmHasRate) return llmText;
+  if (localHasRate) return localText;
+  if (!llmText || /鏈彁鍙東鏈槑纭?.test(llmText)) return localText || llmText;
+  return localText || llmText;
+}
+
+function pickPreferredCapAmount(localValue, llmValue) {
+  const localText = cleanText(localValue || "");
+  const llmText = cleanText(llmValue || "");
+  const capPattern = /鏃犻噾棰濅笂闄恷涓嶈涓婇檺|涓婇檺涓嶉檺|鏃犲皝椤秥(?:(涓婇檺|灏侀《|鏈€楂榺涓嶈秴杩噟绱|鎬婚).{0,24}(楼|锟浜烘皯甯亅\d[\d,]*(?:\.\d+)?\s*(?:鍏億涓囧厓|浜垮厓)))/;
+  const localIsCap = capPattern.test(localText);
+  const llmIsCap = capPattern.test(llmText);
+
+  if (llmIsCap) return llmText;
+  if (localIsCap) return localText;
+  if (!llmText || /鏈彁鍙東鏈槑纭?.test(llmText)) return localText || llmText;
+  return localText || llmText;
+}
