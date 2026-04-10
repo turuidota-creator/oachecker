@@ -11,7 +11,9 @@ if ($current.ProxyOverride) {
 
 $requiredItems = @(
   "oa.cyou-inc.com",
+  "www.cyou-inc.com",
   "*.cyou-inc.com",
+  "ai.cy.com",
   "10.*",
   "localhost",
   "127.0.0.1",

@@ -65,7 +65,7 @@ export async function analyzePageSnapshot(snapshot, tabId, onProgress = null) {
   const baseUrl = deriveBaseUrl(snapshot?.pageUrl);
   setRuntimeContext(baseUrl, tabId);
 
-  reportProgress(onProgress, "payment-root", "姝ｅ湪璇诲彇浠樻鍗?", "鍑嗗璇诲彇褰撳墠浠樻鍗曡鎯呭拰缁撴瀯鍖栧瓧娈?");
+  reportProgress(onProgress, "payment-root", "正在读取付款单", "准备读取当前付款单详情和结构化字段");
 
   const rootRef = parseProcessRef(snapshot?.pageUrl || "", "payment");
   const rootDetail = rootRef?.mode === "flowable" ? await fetchFlowableDetail(rootRef, baseUrl) : null;
@@ -92,15 +92,15 @@ export async function analyzePageSnapshot(snapshot, tabId, onProgress = null) {
   reportProgress(
     onProgress,
     "page-invoice",
-    "姝ｅ湪璇诲彇浠樻椤靛彂绁?",
-    structuredInvoiceSources.length > 0 ? `宸插彂鐜?${structuredInvoiceSources.length} 鏉′粯娆鹃〉鍙戠エ鏄庣粏` : "褰撳墠浠樻椤垫湭鍙戠幇缁撴瀯鍖栧彂绁ㄦ槑缁?"
+    "正在读取付款页发票",
+    structuredInvoiceSources.length > 0 ? `已发现 ${structuredInvoiceSources.length} 条付款页发票明细` : "当前付款页未发现结构化发票明细"
   );
 
   reportProgress(
     onProgress,
     "page-attachments",
-    "姝ｅ湪鏁寸悊浠樻椤甸檮浠?",
-    `宸插彂鐜?${normalizedAttachments.length} 涓粯娆鹃〉闄勪欢`
+    "验收入口来自详情页",
+    `已发现 ${normalizedAttachments.length} 个付款页附件`
   );
 
   const inventories = buildSourceInventories({
@@ -118,7 +118,7 @@ export async function analyzePageSnapshot(snapshot, tabId, onProgress = null) {
       ...inventories.otherAttachments
     ],
     target,
-    "浠樻椤甸檮浠?",
+    "付款页附件",
     onProgress,
     "page-attachments"
   );
@@ -126,32 +126,32 @@ export async function analyzePageSnapshot(snapshot, tabId, onProgress = null) {
   reportProgress(
     onProgress,
     "contract-link",
-    "姝ｅ湪杩涘叆鍚堝悓",
-    inventories.contractLinks.length > 0 ? `?????${inventories.contractLinks.length} ????????` : "?????????????????"
+    "正在进入合同",
+    inventories.contractLinks.length > 0 ? `已发现 ${inventories.contractLinks.length} 个合同入口` : "暂未发现明确的合同入口"
   );
   const contractResult = await analyzeContractLinks(enrichedSnapshot?.relatedLinks || [], target, baseUrl, onProgress);
 
   reportProgress(
     onProgress,
     "acceptance-link",
-    "姝ｅ湪鏍稿楠屾敹",
-    inventories.acceptanceLinks.length > 0 ? `?????${inventories.acceptanceLinks.length} ????????` : "?????????????????"
+    "正在核对附件",
+    inventories.acceptanceLinks.length > 0 ? `已发现 ${inventories.acceptanceLinks.length} 个验收入口` : "尚未发现明确验收入口"
   );
   const acceptanceDocs = await analyzeAcceptanceMailLinksMulti(enrichedSnapshot?.relatedLinks || [], target, baseUrl, onProgress);
 
   reportProgress(
     onProgress,
     "domestic-pr-link",
-    "姝ｅ湪璇诲彇鍥藉唴PR",
-    inventories.domesticPrLinks.length > 0 ? `宸插彂鐜?${inventories.domesticPrLinks.length} 涓浗鍐匬R鍏ュ彛` : "鏆傛湭鍙戠幇鏄庣‘鐨勫浗鍐匬R鍏ュ彛"
+    "正在读取国内PR",
+    inventories.domesticPrLinks.length > 0 ? `已发现 ${inventories.domesticPrLinks.length} 个国内PR入口` : "暂未发现明确的国内PR入口"
   );
   const domesticPrDocs = await analyzeDomesticPrLinksMulti(enrichedSnapshot?.relatedLinks || [], target, baseUrl, onProgress);
 
   reportProgress(
     onProgress,
     "purchase-order-link",
-    "姝ｅ湪璇诲彇閲囪喘璁㈠崟",
-    inventories.purchaseOrderLinks.length > 0 ? `?????${inventories.purchaseOrderLinks.length} ???????????` : "????????????????????"
+    "正在读取采购订单",
+    inventories.purchaseOrderLinks.length > 0 ? `已发现 ${inventories.purchaseOrderLinks.length} 个采购订单入口` : "暂未发现明确的采购订单入口"
   );
   const purchaseOrderResult = await analyzePurchaseOrderLinks(enrichedSnapshot?.relatedLinks || [], target, baseUrl, onProgress);
 
@@ -161,7 +161,7 @@ export async function analyzePageSnapshot(snapshot, tabId, onProgress = null) {
     account: structuredInvoiceMatches.account || pageAttachmentAnalysis.matches.account || contractResult.matches.account || null
   };
 
-  reportProgress(onProgress, "summary", "姝ｅ湪姹囨€绘牳瀵圭粨鏋?", "姝ｅ湪鐢熸垚涓夐」涓绘牳瀵圭粨鏋滃拰鍚堝悓鍙傝€冧俊鎭?");
+  reportProgress(onProgress, "summary", "正在汇总核对结果", "验收入口、核对结果和合同参考信息");
 
   const verificationItems = [
     buildAmountVerification(target, inventories, matches.amount),
@@ -188,7 +188,7 @@ export async function analyzePageSnapshot(snapshot, tabId, onProgress = null) {
       ? "warn"
       : "pass";
 
-  reportProgress(onProgress, "done", "鍒嗘瀽瀹屾垚", "涓夐」涓绘牳瀵瑰拰鍚堝悓鍙傝€冧俊鎭凡鐢熸垚");
+  reportProgress(onProgress, "done", "分析完成", "已生成主核对、关联摘要和合同参考信息");
 
   return {
     buildTag: BUILD_TAG,
@@ -218,7 +218,7 @@ export async function analyzePageSnapshot(snapshot, tabId, onProgress = null) {
         contractResult.summary?.paymentTermsSummary ||
         contractResult.facts.paymentTerms ||
         pageAttachmentAnalysis.contractFacts.paymentTerms ||
-        (contractResult.ref ? `宸插彂鐜板悎鍚屾潵婧愶細${contractResult.ref.detailUrl}` : "灏氭湭鍙戠幇鏄庣‘鐨勫悎鍚屾潵婧?"),
+        (contractResult.ref ? `宸插彂鐜板悎鍚屾潵婧愶細${contractResult.ref.detailUrl}` : "尚未发现明确的合同来源"),
       sourceName:
         contractResult.facts.sourceName ||
         pageAttachmentAnalysis.contractFacts.sourceName ||
@@ -229,7 +229,7 @@ export async function analyzePageSnapshot(snapshot, tabId, onProgress = null) {
         (contractResult.ref ? contractResult.ref.detailUrl : "")
     },
     contractSummary: contractResult.summary || emptyContractSummary(),
-    contractProcessing: effectiveContractProcessing || emptyContractProcessing("not_found", "灏氭湭鍙戠幇鏄庣‘鐨勫悎鍚屾潵婧?"),
+    contractProcessing: effectiveContractProcessing || emptyContractProcessing("not_found", "尚未发现明确的合同来源"),
     acceptanceReference: acceptanceDocs[0] || null,
     evidencePool: inventories,
     debug: {
@@ -308,7 +308,7 @@ function analyzeStructuredInvoiceSources(items, target) {
         sourceName,
         sourceUrl,
         formatAmount(target.paymentAmount),
-        sourceText || `浠风◣鍚堣锛?{item?.amount || ""}`
+        sourceText || `价税合计：${item?.amount || ""}`
       );
     }
 
@@ -317,7 +317,7 @@ function analyzeStructuredInvoiceSources(items, target) {
         sourceName,
         sourceUrl,
         target.payeeCompany || "",
-        sourceText || `閿€鍞柟锛?{item?.supplier || ""}`
+        sourceText || `销售方：${item?.supplier || ""}`
       );
     }
 
@@ -326,7 +326,7 @@ function analyzeStructuredInvoiceSources(items, target) {
         sourceName,
         sourceUrl,
         target.payeeAccount || "",
-        sourceText || `鏀舵璐﹀彿锛?{item?.accountNo || ""}`
+        sourceText || `收款账号：${item?.accountNo || ""}`
       );
     }
   }
@@ -387,6 +387,27 @@ function findFieldValueFromPairs(pairs, ...labels) {
     }
   }
   return "";
+}
+
+function findFieldValuesFromPairs(pairs, ...labels) {
+  const results = [];
+  const seen = new Set();
+
+  for (const label of labels) {
+    for (const item of pairs || []) {
+      if (!String(item?.label || "").includes(label)) {
+        continue;
+      }
+      const value = cleanText(item?.value || "");
+      if (!value || seen.has(value)) {
+        continue;
+      }
+      seen.add(value);
+      results.push(value);
+    }
+  }
+
+  return results;
 }
 
 function enrichRelatedLinks(existingLinks, refs) {
@@ -462,13 +483,13 @@ function buildContractRelatedDocument(contractResult, processing) {
   const sourceUrl = firstNonEmpty(facts.sourceUrl, contractResult?.ref?.detailUrl);
   return createRelatedDocumentBase({
     kind: "contract",
-    title: "鍚堝悓",
+    title: "合同",
     status: hasSource ? "info" : "warn",
-    statusText: hasSource ? "?????" : "?????",
+    statusText: hasSource ? "仅展示" : "未找到",
     displayOnly: true,
     sourceName,
     sourceUrl,
-    statement: hasSource ? "??????????????????????????" : "?????????????????",
+    statement: hasSource ? "沿用现有合同逻辑，仅展示不自动判断" : "尚未发现明确的合同来源",
     fields: {
       pageStatusText: processing?.pageStatusText || "",
       effectiveStart: facts.effectiveStart || "",
@@ -479,7 +500,7 @@ function buildContractRelatedDocument(contractResult, processing) {
       accountChangeRequirement: summary.accountChangeRequirement || ""
     },
     attachmentNames,
-    notes: ["浠呭睍绀猴紝涓嶈嚜鍔ㄥ垽鏂?"]
+    notes: ["仅展示，不自动判断"]
   });
 }
 
@@ -594,6 +615,35 @@ function extractProcessField(detail, pageSnapshot, labels, keyHints = labels) {
   );
 }
 
+function extractProcessFieldCandidates(detail, pageSnapshot, labels, keyHints = labels, limit = 8) {
+  const results = [];
+  const seen = new Set();
+  const pushValue = (value) => {
+    const text = cleanText(value || "");
+    if (!text || seen.has(text)) {
+      return;
+    }
+    seen.add(text);
+    results.push(text);
+  };
+
+  for (const item of findFieldValuesFromPairs(pageSnapshot?.fieldPairs, ...labels)) {
+    pushValue(item);
+    if (results.length >= limit) {
+      return results;
+    }
+  }
+
+  for (const item of collectValuesInObjectByKeyHints(detail?.flowFormData || detail?.formData || detail || {}, keyHints, limit)) {
+    pushValue(item);
+    if (results.length >= limit) {
+      return results;
+    }
+  }
+
+  return results;
+}
+
 async function extractProcessFieldWithFallback(context, labels, keyHints = labels) {
   const detailOnlyValue = extractProcessField(context?.detail, null, labels, keyHints);
   if (detailOnlyValue) {
@@ -604,6 +654,16 @@ async function extractProcessFieldWithFallback(context, labels, keyHints = label
   return extractProcessField(context?.detail, context?.pageSnapshot, labels, keyHints);
 }
 
+async function extractProcessFieldCandidatesWithFallback(context, labels, keyHints = labels, limit = 8) {
+  const detailOnlyValues = extractProcessFieldCandidates(context?.detail, null, labels, keyHints, limit);
+  if (detailOnlyValues.length > 0) {
+    return detailOnlyValues;
+  }
+
+  await ensureRelatedProcessPageSnapshot(context);
+  return extractProcessFieldCandidates(context?.detail, context?.pageSnapshot, labels, keyHints, limit);
+}
+
 function collectFieldValuesFromPairs(pairs, labels, limit = 8) {
   const results = [];
   const seen = new Set();
@@ -612,7 +672,7 @@ function collectFieldValuesFromPairs(pairs, labels, limit = 8) {
     const value = cleanText(pair?.value || "");
     if (!label || !value) continue;
     if (!labels.some((item) => label.includes(item))) continue;
-    const summary = `${label}锛?{value}`;
+    const summary = `${label}：${value}`;
     if (seen.has(summary)) continue;
     seen.add(summary);
     results.push(summary);
@@ -665,24 +725,24 @@ function buildRequirementSummary(detail, pageSnapshot) {
   const pairs = pageSnapshot?.fieldPairs || [];
   const subformRows = Array.isArray(pageSnapshot?.subformRows) ? pageSnapshot.subformRows : [];
   const groups = [
-    { labels: ["鍝佺墝"] },
-    { labels: ["鍨嬪彿"] },
-    { labels: ["瑙勬牸"] },
-    { labels: ["閰嶇疆"] },
-    { labels: ["鎶€鏈姹?", "鎶€鏈弬鏁?"] },
-    { labels: ["闇€姹傛弿杩?", "闇€姹傝鏄?", "閲囪喘闇€姹?", "鐢ㄩ€旇鏄?", "璇存槑", "澶囨敞"] }
+    { labels: ["品牌"] },
+    { labels: ["型号"] },
+    { labels: ["规格"] },
+    { labels: ["配置"] },
+    { labels: ["技术要求", "技术参数"] },
+    { labels: ["需求描述", "需求说明", "采购内容", "用途说明", "说明", "备注"] }
   ];
 
   const rowSummaries = [];
   const rowSeen = new Set();
   for (const row of subformRows) {
-    const nameField = (row.fields || []).find((field) => cleanText(field.label || "").includes("鍚嶇О"));
+    const nameField = (row.fields || []).find((field) => cleanText(field.label || "").includes("名称"));
     const detailFields = [];
     const detailSeen = new Set();
     for (const field of row.fields || []) {
       const label = cleanText(field.label || "");
       const value = cleanText(field.value || "");
-      if (!label || !value || label.includes("鍚嶇О")) {
+      if (!label || !value || label.includes("名称")) {
         continue;
       }
       const isRequirementLike = groups.some((group) => group.labels.some((item) => label.includes(item)));
@@ -694,14 +754,14 @@ function buildRequirementSummary(detail, pageSnapshot) {
         continue;
       }
       detailSeen.add(key);
-      detailFields.push(`${label}锛?{value}`);
+      detailFields.push(`${label}：${value}`);
     }
     const parts = [];
     if (nameField?.value) {
-      parts.push(`鍚嶇О锛?{nameField.value}`);
+      parts.push(`名称：${cleanText(nameField.value)}`);
     }
     parts.push(...detailFields);
-    const summary = parts.join("锛?");
+    const summary = parts.join("；");
     if (!summary || rowSeen.has(summary)) {
       continue;
     }
@@ -710,7 +770,7 @@ function buildRequirementSummary(detail, pageSnapshot) {
   }
 
   if (rowSummaries.length > 0) {
-    return rowSummaries.slice(0, 4).join("锛?");
+    return rowSummaries.slice(0, 4).join("；");
   }
 
   const summaries = [];
@@ -728,7 +788,7 @@ function buildRequirementSummary(detail, pageSnapshot) {
     for (const group of groups) {
       const values = collectValuesInObjectByKeyHints(detailRoot, group.labels, 2);
       for (const value of values) {
-        const item = `${group.labels[0]}锛?{value}`;
+        const item = `${group.labels[0]}：${value}`;
         if (seen.has(item)) continue;
         seen.add(item);
         summaries.push(item);
@@ -736,7 +796,7 @@ function buildRequirementSummary(detail, pageSnapshot) {
     }
   }
 
-  return summaries.slice(0, 8).join("锛?");
+  return summaries.slice(0, 8).join("；");
 }
 
 async function buildRequirementSummaryWithFallback(context) {
@@ -880,12 +940,12 @@ async function analyzeDomesticPrLinks(relatedLinks, target, baseUrl, onProgress)
   if (!prLink) {
     return createRelatedDocumentBase({
       kind: "domestic_pr",
-      title: "鍥藉唴PR",
+      title: "国内PR",
       status: "warn",
-      statusText: "鏈壘鍒?",
+      statusText: "未找到",
       displayOnly: true,
-      statement: "灏氭湭鍙戠幇鏄庣‘鐨勫浗鍐匬R鏉ユ簮",
-      notes: ["浠呭睍绀猴紝涓嶈嚜鍔ㄥ垽鏂?"]
+      statement: "尚未发现明确的国内PR来源",
+      notes: ["仅展示，不自动判断"]
     });
   }
 
@@ -893,18 +953,18 @@ async function analyzeDomesticPrLinks(relatedLinks, target, baseUrl, onProgress)
   if (!ref) {
     return createRelatedDocumentBase({
       kind: "domestic_pr",
-      title: "鍥藉唴PR",
+      title: "国内PR",
       status: "warn",
-      statusText: "閾炬帴寮傚父",
+      statusText: "链接异常",
       displayOnly: true,
       sourceName: prLink.title || "",
       sourceUrl: prLink.url || "",
-      statement: "鍥藉唴PR閾炬帴鏍煎紡鏆傛湭璇嗗埆",
-      notes: ["浠呭睍绀猴紝涓嶈嚜鍔ㄥ垽鏂?"]
+      statement: "国内PR链接格式暂未识别",
+      notes: ["仅展示，不自动判断"]
     });
   }
 
-  reportProgress(onProgress, "domestic-pr-open", "姝ｅ湪璇诲彇鍥藉唴PR璇︽儏", prLink.title || ref.detailUrl || "鍥藉唴PR鍏ュ彛");
+  reportProgress(onProgress, "domestic-pr-open", "正在读取国内PR详情", prLink.title || ref.detailUrl || "国内PR入口");
   const context = await loadRelatedProcessContext(ref, baseUrl, { includePageSnapshot: false });
   if (!context.detail) {
     await ensureRelatedProcessPageSnapshot(context);
@@ -912,24 +972,24 @@ async function analyzeDomesticPrLinks(relatedLinks, target, baseUrl, onProgress)
   if (!context.detail && !context.pageSnapshot) {
     return createRelatedDocumentBase({
       kind: "domestic_pr",
-      title: "鍥藉唴PR",
+      title: "国内PR",
       status: "warn",
-      statusText: "璇诲彇澶辫触",
+      statusText: "读取失败",
       displayOnly: true,
       sourceName: prLink.title || "",
       sourceUrl: ref.detailUrl || "",
-      statement: `鍥藉唴PR璇诲彇澶辫触锛?{context.detailError || context.pageError || "鏈煡閿欒"}`,
+      statement: `国内PR读取失败：${context.detailError || context.pageError || "未知错误"}`,
       errorText: context.detailError || context.pageError || "",
-      notes: ["浠呭睍绀猴紝涓嶈嚜鍔ㄥ垽鏂?"]
+      notes: ["仅展示，不自动判断"]
     });
   }
 
   const fields = {
-    processCode: await extractProcessFieldWithFallback(context, ["PR鍗曞彿", "娴佺▼缂栧彿", "鍗曞彿"]),
-    costDept: await extractProcessFieldWithFallback(context, ["璐圭敤褰掑睘閮ㄩ棬", "褰掑睘閮ㄩ棬", "鎵€灞為儴闂?"]),
-    costProject: await extractProcessFieldWithFallback(context, ["璐圭敤褰掑睘椤圭洰", "褰掑睘椤圭洰", "鎵€灞為」鐩?"]),
-    purposeText: await extractProcessFieldWithFallback(context, ["璁㈠崟鐢ㄩ€旇鏄?", "鐢ㄩ€旇鏄?", "璐圭敤鐢ㄩ€旇鏄?", "鐢宠浜嬬敱", "閲囪喘鐢ㄩ€?"]),
-    prAmount: await extractProcessFieldWithFallback(context, ["PR閲戦", "PR鎬婚", "PR鐢宠閲戦", "鐢宠閲戰", "閲戰"])
+    processCode: await extractProcessFieldWithFallback(context, ["PR单号", "流程编号", "单号"]),
+    costDept: await extractProcessFieldWithFallback(context, ["费用归属部门", "归属部门", "所属部门"]),
+    costProject: await extractProcessFieldWithFallback(context, ["费用归属项目", "归属项目", "所属项目"]),
+    purposeText: await extractProcessFieldWithFallback(context, ["订单用途说明", "用途说明", "费用用途说明", "申请事由", "采购用途"]),
+    prAmount: await extractProcessFieldWithFallback(context, ["PR金额", "PR总额", "PR申请金额", "申请金额", "金额"])
   };
   if (!fields.purposeText && context.pageSnapshot) {
     fields.purposeText = buildGenericSubformSummary(context.pageSnapshot, 2, 4);
@@ -937,15 +997,15 @@ async function analyzeDomesticPrLinks(relatedLinks, target, baseUrl, onProgress)
 
   return createRelatedDocumentBase({
     kind: "domestic_pr",
-    title: "鍥藉唴PR",
+    title: "国内PR",
     status: "info",
-    statusText: "浠呭睍绀?",
+    statusText: "仅展示",
     displayOnly: true,
     sourceName: normalizeRelatedSourceName(context.pageSnapshot, prLink.title, ref, fields.processCode),
     sourceUrl: ref.detailUrl,
-    statement: buildRelatedReadStatement("鍥藉唴PR", context),
+    statement: buildRelatedReadStatement("国内PR", context),
     fields,
-    notes: ["浠呭睍绀猴紝涓嶈嚜鍔ㄥ垽鏂?", "PR閲戦浠呬綔绯荤粺榛樿灞曠ず锛屼笉鍙備笌瑙勫垯璁＄畻"]
+    notes: ["仅展示，不自动判断", "PR金额仅作系统默认展示，不参与规则计算"]
   });
 }
 
@@ -955,12 +1015,12 @@ async function analyzeDomesticPrLinksMulti(relatedLinks, target, baseUrl, onProg
     return [
       createRelatedDocumentBase({
         kind: "domestic_pr",
-        title: "鍥藉唴PR",
+        title: "国内PR",
         status: "warn",
-        statusText: "鏈壘鍒?",
+        statusText: "未找到",
         displayOnly: true,
-        statement: "灏氭湭鍙戠幇鏄庣‘鐨勫浗鍐匬R鏉ユ簮",
-        notes: ["浠呭睍绀猴紝涓嶈嚜鍔ㄥ垽鏂?"]
+        statement: "尚未发现明确的国内PR来源",
+        notes: ["仅展示，不自动判断"]
       })
     ];
   }
@@ -974,21 +1034,21 @@ async function analyzeDomesticPrLinksMulti(relatedLinks, target, baseUrl, onProg
       docs.push(
         createRelatedDocumentBase({
           kind: "domestic_pr",
-          title: "鍥藉唴PR",
+          title: "国内PR",
           itemLabel,
           status: "warn",
-          statusText: "閾炬帴寮傚父",
+          statusText: "链接异常",
           displayOnly: true,
           sourceName: prLink.title || "",
           sourceUrl: prLink.url || "",
-          statement: "鍥藉唴PR閾炬帴鏍煎紡鏆傛湭璇嗗埆",
-          notes: ["浠呭睍绀猴紝涓嶈嚜鍔ㄥ垽鏂?"]
+          statement: "国内PR链接格式暂未识别",
+          notes: ["仅展示，不自动判断"]
         })
       );
       continue;
     }
 
-    reportProgress(onProgress, "domestic-pr-open", "?????????PR???", prLink.title || ref.detailUrl || "???PR???");
+    reportProgress(onProgress, "domestic-pr-open", "正在读取国内PR详情", prLink.title || ref.detailUrl || "国内PR入口");
     const context = await loadRelatedProcessContext(ref, baseUrl, { includePageSnapshot: false });
     if (!context.detail) {
       await ensureRelatedProcessPageSnapshot(context);
@@ -997,27 +1057,27 @@ async function analyzeDomesticPrLinksMulti(relatedLinks, target, baseUrl, onProg
       docs.push(
         createRelatedDocumentBase({
           kind: "domestic_pr",
-          title: "???PR",
+          title: "国内PR",
           itemLabel,
           status: "warn",
-          statusText: "??????",
+          statusText: "读取失败",
           displayOnly: true,
           sourceName: prLink.title || "",
           sourceUrl: ref.detailUrl || "",
-          statement: `???PR????????{context.detailError || context.pageError || "??????"}`,
+          statement: `国内PR读取失败：${context.detailError || context.pageError || "未知错误"}`,
           errorText: context.detailError || context.pageError || "",
-          notes: ["??????????????"]
+          notes: ["仅展示，不自动判断"]
         })
       );
       continue;
     }
 
     const fields = {
-      processCode: await extractProcessFieldWithFallback(context, ["PR鍗曞彿", "娴佺▼缂栧彿", "鍗曞彿"]),
-      costDept: await extractProcessFieldWithFallback(context, ["璐圭敤褰掑睘閮ㄩ棬", "褰掑睘閮ㄩ棬", "鎵€灞為儴闂?"]),
-      costProject: await extractProcessFieldWithFallback(context, ["璐圭敤褰掑睘椤圭洰", "褰掑睘椤圭洰", "鎵€灞為」鐩?"]),
-      purposeText: await extractProcessFieldWithFallback(context, ["璁㈠崟鐢ㄩ€旇鏄?", "鐢ㄩ€旇鏄?", "璐圭敤鐢ㄩ€旇鏄?", "鐢宠浜嬬敱", "閲囪喘鐢ㄩ€?"]),
-      prAmount: await extractProcessFieldWithFallback(context, ["PR閲戦", "PR鎬婚", "PR鐢宠閲戦", "鐢宠閲戰", "閲戰"]),
+      processCode: await extractProcessFieldWithFallback(context, ["PR单号", "流程编号", "单号"]),
+      costDept: await extractProcessFieldWithFallback(context, ["费用归属部门", "归属部门", "所属部门"]),
+      costProject: await extractProcessFieldWithFallback(context, ["费用归属项目", "归属项目", "所属项目"]),
+      purposeText: await extractProcessFieldWithFallback(context, ["订单用途说明", "用途说明", "费用用途说明", "申请事由", "采购用途"]),
+      prAmount: await extractProcessFieldWithFallback(context, ["PR金额", "PR总额", "PR申请金额", "申请金额", "金额"]),
       requirementSummary: await buildRequirementSummaryWithFallback(context)
     };
     if (!fields.requirementSummary && context.pageSnapshot) {
@@ -1030,16 +1090,16 @@ async function analyzeDomesticPrLinksMulti(relatedLinks, target, baseUrl, onProg
     docs.push(
       createRelatedDocumentBase({
         kind: "domestic_pr",
-        title: "鍥藉唴PR",
+        title: "国内PR",
         itemLabel,
         status: "info",
-        statusText: "浠呭睍绀?",
+        statusText: "仅展示",
         displayOnly: true,
         sourceName: normalizeRelatedSourceName(context.pageSnapshot, prLink.title, ref, fields.processCode),
         sourceUrl: ref.detailUrl,
-        statement: buildRelatedReadStatement("鍥藉唴PR", context),
+        statement: buildRelatedReadStatement("国内PR", context),
         fields,
-        notes: ["浠呭睍绀猴紝涓嶈嚜鍔ㄥ垽鏂?", "PR閲戦浠呬綔绯荤粺榛樿灞曠ず锛屼笉鍙備笌瑙勫垯璁＄畻"]
+        notes: ["仅展示，不自动判断", "PR金额仅作系统默认展示，不参与规则计算"]
       })
     );
   }
@@ -1063,16 +1123,32 @@ function compareCompanyLoosely(left, right) {
   return normalizedLeft.includes(normalizedRight) || normalizedRight.includes(normalizedLeft);
 }
 
+function pickPreferredCompanyCandidate(candidates, preferredCompany = "") {
+  const cleanedCandidates = (candidates || []).map((item) => cleanText(item || "")).filter(Boolean);
+  if (cleanedCandidates.length === 0) {
+    return "";
+  }
+
+  if (preferredCompany) {
+    const matched = cleanedCandidates.find((item) => compareCompanyLoosely(item, preferredCompany));
+    if (matched) {
+      return matched;
+    }
+  }
+
+  return cleanedCandidates[0];
+}
+
 async function analyzePurchaseOrderLinks(relatedLinks, target, baseUrl, onProgress) {
   const orderLink = pickRelatedLink(relatedLinks, "purchase_order");
   if (!orderLink) {
     return createRelatedDocumentBase({
       kind: "purchase_order",
-      title: "閲囪喘璁㈠崟",
+      title: "采购订单",
       status: "warn",
-      statusText: "鏈壘鍒?",
-      statement: "灏氭湭鍙戠幇鏄庣‘鐨勯噰璐鍗曟潵婧?",
-      notes: ["浠呰嚜鍔ㄦ牳瀵规敹娆惧叕鍙镐笌璁㈠崟閲戦涓ら」"]
+      statusText: "未找到",
+      statement: "尚未发现明确的采购订单来源",
+      notes: ["仅自动核对收款公司与订单金额两项"]
     });
   }
 
@@ -1080,17 +1156,17 @@ async function analyzePurchaseOrderLinks(relatedLinks, target, baseUrl, onProgre
   if (!ref) {
     return createRelatedDocumentBase({
       kind: "purchase_order",
-      title: "閲囪喘璁㈠崟",
+      title: "采购订单",
       status: "warn",
-      statusText: "閾炬帴寮傚父",
+      statusText: "链接异常",
       sourceName: orderLink.title || "",
       sourceUrl: orderLink.url || "",
-      statement: "閲囪喘璁㈠崟閾炬帴鏍煎紡鏆傛湭璇嗗埆",
-      notes: ["浠呰嚜鍔ㄦ牳瀵规敹娆惧叕鍙镐笌璁㈠崟閲戦涓ら」"]
+      statement: "采购订单链接格式暂未识别",
+      notes: ["仅自动核对收款公司与订单金额两项"]
     });
   }
 
-  reportProgress(onProgress, "purchase-order-open", "姝ｅ湪璇诲彇閲囪喘璁㈠崟璇︽儏", orderLink.title || ref.detailUrl || "閲囪喘璁㈠崟鍏ュ彛");
+  reportProgress(onProgress, "purchase-order-open", "正在读取采购订单详情", orderLink.title || ref.detailUrl || "采购订单入口");
   const context = await loadRelatedProcessContext(ref, baseUrl, { includePageSnapshot: false });
   if (!context.detail) {
     await ensureRelatedProcessPageSnapshot(context);
@@ -1098,24 +1174,31 @@ async function analyzePurchaseOrderLinks(relatedLinks, target, baseUrl, onProgre
   if (!context.detail && !context.pageSnapshot) {
     return createRelatedDocumentBase({
       kind: "purchase_order",
-      title: "閲囪喘璁㈠崟",
+      title: "采购订单",
       status: "warn",
-      statusText: "璇诲彇澶辫触",
+      statusText: "读取失败",
       sourceName: orderLink.title || "",
       sourceUrl: ref.detailUrl || "",
-      statement: `閲囪喘璁㈠崟璇诲彇澶辫触锛?{context.detailError || context.pageError || "鏈煡閿欒"}`,
+      statement: `采购订单读取失败：${context.detailError || context.pageError || "未知错误"}`,
       errorText: context.detailError || context.pageError || "",
-      notes: ["浠呰嚜鍔ㄦ牳瀵规敹娆惧叕鍙镐笌璁㈠崟閲戦涓ら」"]
+      notes: ["仅自动核对收款公司与订单金额两项"]
     });
   }
 
   const fields = {
-    processCode: await extractProcessFieldWithFallback(context, ["??????", "?????????", "??????", "???"]),
-    orderName: await extractProcessFieldWithFallback(context, ["??????", "?????????", "???"]),
-    supplierName: await extractProcessFieldWithFallback(context, ["????????", "?????", "??????", "??????"]),
-    orderAmount: await extractProcessFieldWithFallback(context, ["??????", "?????????", "??????", "???", "??????"]),
-    description: await extractProcessFieldWithFallback(context, ["?????????", "??????", "??????", "???", "??????"])
+    processCode: await extractProcessFieldWithFallback(context, ["订单编号", "流程编号", "单号", "编号"]),
+    orderName: await extractProcessFieldWithFallback(context, ["订单名称", "采购订单名称", "名称"]),
+    supplierName: "",
+    orderAmount: await extractProcessFieldWithFallback(context, ["订单金额", "订单总金额", "含税总金额", "金额", "总价"]),
+    description: await extractProcessFieldWithFallback(context, ["订单内容摘要", "订单内容", "物料明细", "说明", "采购内容"])
   };
+  const supplierCandidates = await extractProcessFieldCandidatesWithFallback(
+    context,
+    ["订单供应商", "供应商名称", "供应商"],
+    ["订单供应商", "供应商名称", "供应商"],
+    6
+  );
+  fields.supplierName = pickPreferredCompanyCandidate(supplierCandidates, target.payeeCompany);
   if (!fields.supplierName && context.pageSnapshot) {
     fields.supplierName = inferSupplierNameFromSnapshot(context.pageSnapshot, target.payeeCompany);
   }
@@ -1128,21 +1211,21 @@ async function analyzePurchaseOrderLinks(relatedLinks, target, baseUrl, onProgre
 
   const checks = [];
   if (!target.payeeCompany || !fields.supplierName) {
-    checks.push(createOrderCheck("payee_matches_supplier", "鏀舵鍏徃涓庤鍗曚緵搴斿晢", "warn", "浠樻鍗曟垨閲囪喘璁㈠崟缂哄皯鍏徃瀛楁锛屾殏涓嶈嚜鍔ㄥ垽鏂?"));
+    checks.push(createOrderCheck("payee_matches_supplier", "收款公司与订单供应商", "warn", "付款单或采购订单缺少公司字段，暂不自动判断"));
   } else if (compareCompanyLoosely(target.payeeCompany, fields.supplierName)) {
-    checks.push(createOrderCheck("payee_matches_supplier", "鏀舵鍏徃涓庤鍗曚緵搴斿晢", "pass", "浠樻鍗曟敹娆惧叕鍙镐笌璁㈠崟渚涘簲鍟嗕竴鑷?"));
+    checks.push(createOrderCheck("payee_matches_supplier", "收款公司与订单供应商", "pass", "付款单收款公司与订单供应商一致"));
   } else {
-    checks.push(createOrderCheck("payee_matches_supplier", "鏀舵鍏徃涓庤鍗曚緵搴斿晢", "fail", "浠樻鍗曟敹娆惧叕鍙镐笌璁㈠崟渚涘簲鍟嗕笉涓€鑷?"));
+    checks.push(createOrderCheck("payee_matches_supplier", "收款公司与订单供应商", "fail", "付款单收款公司与订单供应商不一致"));
   }
 
   const paymentAmount = parseAmount(target.paymentAmount);
   const orderAmount = parseAmount(fields.orderAmount);
   if (!(paymentAmount > 0) || !(orderAmount > 0)) {
-    checks.push(createOrderCheck("payment_not_exceed_order_amount", "浠樻閲戦涓嶈秴杩囪鍗曢噾棰?", "warn", "浠樻閲戦鎴栬鍗曢噾棰濈己澶憋紝鏆備笉鑷姩鍒ゆ柇"));
+    checks.push(createOrderCheck("payment_not_exceed_order_amount", "付款金额不超过订单金额", "warn", "付款金额或订单金额缺失，暂不自动判断"));
   } else if (paymentAmount <= orderAmount + 0.01) {
-    checks.push(createOrderCheck("payment_not_exceed_order_amount", "浠樻閲戦涓嶈秴杩囪鍗曢噾棰?", "pass", "浠樻閲戦鏈秴杩囪鍗曢噾棰?"));
+    checks.push(createOrderCheck("payment_not_exceed_order_amount", "付款金额不超过订单金额", "pass", "付款金额未超过订单金额"));
   } else {
-    checks.push(createOrderCheck("payment_not_exceed_order_amount", "浠樻閲戦涓嶈秴杩囪鍗曢噾棰?", "fail", "浠樻閲戦瓒呰繃璁㈠崟閲戦"));
+    checks.push(createOrderCheck("payment_not_exceed_order_amount", "付款金额不超过订单金额", "fail", "浠樻閲戦瓒呰繃璁㈠崟閲戦"));
   }
 
   const hasFail = checks.some((item) => item.status === "fail");
@@ -1150,15 +1233,15 @@ async function analyzePurchaseOrderLinks(relatedLinks, target, baseUrl, onProgre
 
   return createRelatedDocumentBase({
     kind: "purchase_order",
-    title: "閲囪喘璁㈠崟",
+    title: "采购订单",
     status: hasFail ? "fail" : hasWarn ? "warn" : "pass",
-    statusText: "鏈夐檺鑷姩鏍稿",
+    statusText: "有限自动核对",
     sourceName: normalizeRelatedSourceName(context.pageSnapshot, orderLink.title, ref, fields.orderName, fields.processCode),
     sourceUrl: ref.detailUrl,
-    statement: "閲囪喘璁㈠崟浠呰嚜鍔ㄦ牳瀵规敹娆惧叕鍙镐笌璁㈠崟閲戦涓ら」锛屽叾浠栧瓧娈靛彧灞曠ず涓嶅垽鏂?",
+    statement: "采购订单仅自动核对收款公司与订单金额两项，其他字段只展示不判断",
     fields,
     checks,
-    notes: ["浠呰嚜鍔ㄦ牳瀵规敹娆惧叕鍙镐笌璁㈠崟閲戦涓ら」"]
+    notes: ["仅自动核对收款公司与订单金额两项"]
   });
 }
 
@@ -1179,26 +1262,26 @@ function buildAcceptanceRelationHints(target, mailSubject, mailSummary, mailAtta
   const combined = [mailSubject, mailSummary, ...(mailAttachmentNames || [])].filter(Boolean).join("\n");
   const hints = [];
   if (!combined) {
-    return ["鏆傛湭鎻愬彇鍒拌冻澶熺殑閭欢绾跨储锛岃浜哄伐鎵撳紑楠屾敹鍗曡繘涓€姝ョ‘璁?"];
+    return ["暂未提取到足够的邮件线索，请人工打开验收单进一步确认"];
   }
 
   if (target?.payeeCompany && compareCompanyLoosely(combined, target.payeeCompany)) {
-    hints.push(`閭欢绾跨储鍖呭惈渚涘簲鍟?鏀舵鍏徃锛?{target.payeeCompany}`);
+    hints.push(`邮件线索包含供应商/收款公司：${target.payeeCompany}`);
   }
   if (target?.paymentAmount && amountMatchesPayment(combined, target.paymentAmount)) {
-    hints.push(`閭欢绾跨储鍖呭惈鏈浠樻閲戦锛?{formatAmount(target.paymentAmount)}`);
+    hints.push(`邮件线索包含本次付款金额：${formatAmount(target.paymentAmount)}`);
   }
 
   const normalizedTitle = normalizeCompareText(target?.processTitle || "");
   if (normalizedTitle.length >= 6 && normalizeCompareText(combined).includes(normalizedTitle.slice(0, 10))) {
-    hints.push("閭欢绾跨储涓庡綋鍓嶄粯娆炬爣棰樺瓨鍦ㄦ槑鏄鹃噸鍚?");
+    hints.push("邮件线索与当前付款标题存在明显重合");
   }
 
   if ((mailAttachmentNames || []).length > 0) {
-    hints.push(`閭欢鍐呴檮浠讹細${mailAttachmentNames.slice(0, 3).join("銆?")}`);
+    hints.push(`邮件内附件：${mailAttachmentNames.slice(0, 3).join("、")}`);
   }
 
-  return hints.length > 0 ? hints : ["宸叉彁鍙栭偖浠跺唴瀹癸紝浣嗘槸鍚﹀搴旀湰娆′粯娆句粛闇€浜哄伐鍒ゆ柇"];
+  return hints.length > 0 ? hints : ["已提取邮件内容，但是否对应本次付款仍需人工判断"];
 }
 
 async function analyzeAcceptanceMailLinks(relatedLinks, target, baseUrl, onProgress) {
@@ -1206,13 +1289,13 @@ async function analyzeAcceptanceMailLinks(relatedLinks, target, baseUrl, onProgr
   if (!acceptanceLink) {
     return createRelatedDocumentBase({
       kind: "acceptance",
-      title: "楠屾敹鍗?",
+      title: "验收单",
       status: "warn",
-      statusText: "鏈壘鍒?",
+      statusText: "未找到",
       sourceName: "",
       sourceUrl: "",
-      statement: "灏氭湭鍙戠幇鏄庣‘鐨勯獙鏀舵潵婧?",
-      notes: ["鍙睍绀洪偖浠堕檮浠朵笌鐩稿叧绾跨储锛屼笉鑷姩鍒ゆ柇鏄惁瀵瑰簲鏈浠樻"]
+      statement: "尚未发现明确的验收来源",
+      notes: ["只展示邮件附件与相关线索，不自动判断是否对应本次付款"]
     });
   }
 
@@ -1220,29 +1303,29 @@ async function analyzeAcceptanceMailLinks(relatedLinks, target, baseUrl, onProgr
   if (!ref) {
     return createRelatedDocumentBase({
       kind: "acceptance",
-      title: "楠屾敹鍗?",
+      title: "验收单",
       status: "warn",
-      statusText: "閾炬帴寮傚父",
+      statusText: "链接异常",
       sourceName: acceptanceLink.title || "",
       sourceUrl: acceptanceLink.url || "",
-      statement: "楠屾敹閾炬帴鏍煎紡鏆傛湭璇嗗埆",
-      notes: ["鍙睍绀洪偖浠堕檮浠朵笌鐩稿叧绾跨储锛屼笉鑷姩鍒ゆ柇鏄惁瀵瑰簲鏈浠樻"]
+      statement: "验收链接格式暂未识别",
+      notes: ["只展示邮件附件与相关线索，不自动判断是否对应本次付款"]
     });
   }
 
-  reportProgress(onProgress, "acceptance-open", "姝ｅ湪璇诲彇楠屾敹椤?", acceptanceLink.title || ref.detailUrl || "楠屾敹鍏ュ彛");
+  reportProgress(onProgress, "acceptance-open", "正在读取验收页", acceptanceLink.title || ref.detailUrl || "验收入口");
   const context = await loadRelatedProcessContext(ref, baseUrl);
   if (!context.detail && !context.pageSnapshot) {
     return createRelatedDocumentBase({
       kind: "acceptance",
-      title: "楠屾敹鍗?",
+      title: "验收单",
       status: "warn",
-      statusText: "璇诲彇澶辫触",
+      statusText: "读取失败",
       sourceName: acceptanceLink.title || "",
       sourceUrl: ref.detailUrl || "",
-      statement: `楠屾敹椤佃鍙栧け璐ワ細${context.detailError || context.pageError || "鏈煡閿欒"}`,
+      statement: `验收页读取失败：${context.detailError || context.pageError || "鏈煡閿欒"}`,
       errorText: context.detailError || context.pageError || "",
-      notes: ["鍙睍绀洪偖浠堕檮浠朵笌鐩稿叧绾跨储锛屼笉鑷姩鍒ゆ柇鏄惁瀵瑰簲鏈浠樻"]
+      notes: ["只展示邮件附件与相关线索，不自动判断是否对应本次付款"]
     });
   }
 
@@ -1269,9 +1352,9 @@ async function analyzeAcceptanceMailLinks(relatedLinks, target, baseUrl, onProgr
     }
   }
 
-  const pageMailSubject = extractProcessField(context.detail, context.pageSnapshot, ["閭欢涓婚", "涓婚", "閭欢鏍囬"]);
-  const pageMailTime = extractProcessField(context.detail, context.pageSnapshot, ["閭欢鏃堕棿", "鍙戦€佹椂闂?", "鍙戜欢鏃堕棿", "鏃ユ湡"]);
-  const pageMailBody = extractProcessField(context.detail, context.pageSnapshot, ["閭欢姝ｆ枃", "閭欢鍐呭", "姝ｆ枃", "鎽樿", "璇存槑"]);
+  const pageMailSubject = extractProcessField(context.detail, context.pageSnapshot, ["邮件主题", "主题", "邮件标题"]);
+  const pageMailTime = extractProcessField(context.detail, context.pageSnapshot, ["邮件时间", "发送时间", "发件时间", "日期"]);
+  const pageMailBody = extractProcessField(context.detail, context.pageSnapshot, ["邮件正文", "邮件内容", "正文", "摘要", "说明"]);
   const firstMailEvidence = mailEvidenceList[0] || {};
   const mailAttachmentNames = Array.from(
     new Set(
@@ -1288,14 +1371,14 @@ async function analyzeAcceptanceMailLinks(relatedLinks, target, baseUrl, onProgr
 
   return createRelatedDocumentBase({
     kind: "acceptance",
-    title: "楠屾敹鍗?",
+    title: "验收单",
     status: "info",
-    statusText: "浜哄伐鍒ゆ柇",
+    statusText: "人工判断",
     sourceName: normalizeRelatedSourceName(context.pageSnapshot, acceptanceLink.title, ref, mailSubject),
     sourceUrl: ref.detailUrl,
     statement: mailSubject || mailSummary || mailAttachmentNames.length > 0
-      ? "宸叉彁鍙栭獙鏀跺崟閭欢绾跨储锛岃浜哄伐鍒ゆ柇鏄惁瀵瑰簲鏈浠樻"
-      : "宸茶繘鍏ラ獙鏀堕〉锛屼絾鏆傛湭鎻愬彇鍒版槑纭殑閭欢绾跨储",
+      ? "已提取验收单邮件线索，请人工判断是否对应本次付款"
+      : "已进入验收页，但暂未提取到明确的邮件线索",
     fields: {
       mailSubject,
       mailSentAt,
@@ -1304,7 +1387,7 @@ async function analyzeAcceptanceMailLinks(relatedLinks, target, baseUrl, onProgr
     attachmentNames: attachments.map((item) => cleanText(item?.name || "")).filter(Boolean).slice(0, 6),
     mailAttachmentNames,
     relationHints,
-    notes: ["鍙睍绀洪偖浠堕檮浠朵笌鐩稿叧绾跨储锛屼笉鑷姩鍒ゆ柇鏄惁瀵瑰簲鏈浠樻"]
+    notes: ["只展示邮件附件与相关线索，不自动判断是否对应本次付款"]
   });
 }
 
@@ -1340,11 +1423,11 @@ async function analyzeAcceptanceMailLinksMulti(relatedLinks, target, baseUrl, on
     return [
       createRelatedDocumentBase({
         kind: "acceptance",
-        title: "楠屾敹鍗?",
+        title: "验收单",
         status: "warn",
-        statusText: "鏈壘鍒?",
-        statement: "灏氭湭鍙戠幇鏄庣‘鐨勯獙鏀舵潵婧?",
-        notes: ["鍙睍绀洪獙鏀堕檮浠朵笌鐩稿叧绾跨储锛屼笉鑷姩鍒ゆ柇鏄惁瀵瑰簲鏈浠樻"]
+        statusText: "未找到",
+        statement: "尚未发现明确的验收来源",
+        notes: ["只展示验收附件与相关线索，不自动判断是否对应本次付款"]
       })
     ];
   }
@@ -1352,40 +1435,40 @@ async function analyzeAcceptanceMailLinksMulti(relatedLinks, target, baseUrl, on
   const docs = [];
   for (let index = 0; index < acceptanceLinks.length; index += 1) {
     const acceptanceLink = acceptanceLinks[index];
-    const itemLabel = acceptanceLinks.length > 1 ? `楠屾敹 ${index + 1}` : "";
+    const itemLabel = acceptanceLinks.length > 1 ? `验收 ${index + 1}` : "";
     const ref = parseProcessRef(acceptanceLink.url, "acceptance");
     if (!ref) {
       docs.push(
         createRelatedDocumentBase({
           kind: "acceptance",
-          title: "楠屾敹鍗?",
+          title: "验收单",
           itemLabel,
           status: "warn",
-          statusText: "閾炬帴寮傚父",
+          statusText: "链接异常",
           sourceName: acceptanceLink.title || "",
           sourceUrl: acceptanceLink.url || "",
-          statement: "楠屾敹閾炬帴鏍煎紡鏆傛湭璇嗗埆",
-          notes: ["鍙睍绀洪獙鏀堕檮浠朵笌鐩稿叧绾跨储锛屼笉鑷姩鍒ゆ柇鏄惁瀵瑰簲鏈浠樻"]
+          statement: "验收链接格式暂未识别",
+          notes: ["只展示验收附件与相关线索，不自动判断是否对应本次付款"]
         })
       );
       continue;
     }
 
-    reportProgress(onProgress, "acceptance-open", "姝ｅ湪璇诲彇楠屾敹椤?", acceptanceLink.title || ref.detailUrl || "楠屾敹鍏ュ彛");
+    reportProgress(onProgress, "acceptance-open", "正在读取验收页", acceptanceLink.title || ref.detailUrl || "验收入口");
     const context = await loadRelatedProcessContext(ref, baseUrl);
     if (!context.detail && !context.pageSnapshot) {
       docs.push(
         createRelatedDocumentBase({
           kind: "acceptance",
-          title: "楠屾敹鍗?",
+          title: "验收单",
           itemLabel,
           status: "warn",
-          statusText: "璇诲彇澶辫触",
+          statusText: "读取失败",
           sourceName: acceptanceLink.title || "",
           sourceUrl: ref.detailUrl || "",
-          statement: `楠屾敹椤佃鍙栧け璐ワ細${context.detailError || context.pageError || "鏈煡閿欒"}`,
+          statement: `验收页读取失败：${context.detailError || context.pageError || "鏈煡閿欒"}`,
           errorText: context.detailError || context.pageError || "",
-          notes: ["鍙睍绀洪獙鏀堕檮浠朵笌鐩稿叧绾跨储锛屼笉鑷姩鍒ゆ柇鏄惁瀵瑰簲鏈浠樻"]
+          notes: ["只展示验收附件与相关线索，不自动判断是否对应本次付款"]
         })
       );
       continue;
@@ -1414,9 +1497,9 @@ async function analyzeAcceptanceMailLinksMulti(relatedLinks, target, baseUrl, on
       }
     }
 
-    const pageMailSubject = extractProcessField(context.detail, context.pageSnapshot, ["閭欢涓婚", "涓婚", "閭欢鏍囬"]);
-    const pageMailTime = extractProcessField(context.detail, context.pageSnapshot, ["閭欢鏃堕棿", "鍙戦€佹椂闂?", "鍙戜欢鏃堕棿", "鏃ユ湡"]);
-    const pageMailBody = extractProcessField(context.detail, context.pageSnapshot, ["閭欢姝ｆ枃", "閭欢鍐呭", "姝ｆ枃", "鎽樿", "璇存槑"]);
+    const pageMailSubject = extractProcessField(context.detail, context.pageSnapshot, ["邮件主题", "主题", "邮件标题"]);
+    const pageMailTime = extractProcessField(context.detail, context.pageSnapshot, ["邮件时间", "发送时间", "发件时间", "日期"]);
+    const pageMailBody = extractProcessField(context.detail, context.pageSnapshot, ["邮件正文", "邮件内容", "正文", "摘要", "说明"]);
     const firstMailEvidence = mailEvidenceList[0] || {};
     const mailAttachmentNames = Array.from(
       new Set(
@@ -1438,18 +1521,18 @@ async function analyzeAcceptanceMailLinksMulti(relatedLinks, target, baseUrl, on
     docs.push(
       createRelatedDocumentBase({
         kind: "acceptance",
-        title: "楠屾敹鍗?",
+        title: "验收单",
         itemLabel,
         status: "info",
-        statusText: "浜哄伐鍒ゆ柇",
+        statusText: "人工判断",
         sourceName: normalizeRelatedSourceName(context.pageSnapshot, acceptanceLink.title, ref, mailSubject),
         sourceUrl: ref.detailUrl,
         statement:
           attachmentNames.length > 0
-            ? "宸茶繘鍏ラ獙鏀堕〉锛屽睍绀洪獙鏀堕檮浠跺苟淇濈暀浜哄伐鍒ゆ柇"
+            ? "已进入验收页，展示验收附件并保留人工判断"
             : mailSubject || mailSummary || mailAttachmentNames.length > 0
-              ? "宸叉彁鍙栭獙鏀跺崟閭欢绾跨储锛岃浜哄伐鍒ゆ柇鏄惁瀵瑰簲鏈浠樻"
-              : "宸茶繘鍏ラ獙鏀堕〉锛屼絾鏆傛湭鎻愬彇鍒版槑纭殑閭欢绾跨储",
+              ? "已提取验收单邮件线索，请人工判断是否对应本次付款"
+              : "已进入验收页，但暂未提取到明确的邮件线索",
         fields: {
           mailSubject,
           mailSentAt,
@@ -1459,7 +1542,7 @@ async function analyzeAcceptanceMailLinksMulti(relatedLinks, target, baseUrl, on
         mailAttachmentNames,
         previewItems: attachmentPreviews,
         relationHints,
-        notes: ["鍙睍绀洪獙鏀堕檮浠朵笌鐩稿叧绾跨储锛屼笉鑷姩鍒ゆ柇鏄惁瀵瑰簲鏈浠樻"]
+        notes: ["只展示验收附件与相关线索，不自动判断是否对应本次付款"]
       })
     );
   }
@@ -1475,7 +1558,7 @@ async function analyzeContractLinks(relatedLinks, target, baseUrl, onProgress) {
       facts: {},
       matches: { amount: null, company: null, account: null },
       summary: emptyContractSummary(),
-      processing: emptyContractProcessing("not_found", "灏氭湭鍙戠幇鏄庣‘鐨勫悎鍚屾潵婧?")
+      processing: emptyContractProcessing("not_found", "尚未发现明确的合同来源")
     };
   }
 
@@ -1486,11 +1569,11 @@ async function analyzeContractLinks(relatedLinks, target, baseUrl, onProgress) {
       facts: {},
       matches: { amount: null, company: null, account: null },
       summary: emptyContractSummary(),
-      processing: emptyContractProcessing("invalid_ref", "宸插彂鐜板悎鍚岄摼鎺ワ紝浣嗛摼鎺ユ牸寮忔殏鏈瘑鍒?")
+      processing: emptyContractProcessing("invalid_ref", "已发现合同链接，但链接格式暂未识别")
     };
   }
 
-  reportProgress(onProgress, "contract-open", "姝ｅ湪璇诲彇鍚堝悓椤?", contractLink.title || ref.detailUrl || "鍚堝悓鍏ュ彛");
+  reportProgress(onProgress, "contract-open", "正在读取合同页", contractLink.title || ref.detailUrl || "合同入口");
 
   try {
     if (ref.mode === "flowable") {
@@ -1516,39 +1599,39 @@ async function analyzeContractLinks(relatedLinks, target, baseUrl, onProgress) {
         sourceName: firstNonEmpty(detail.flowFormData?.processTitleInput, detail.processCode, contractLink.title),
         sourceUrl: ref.detailUrl
       };
-      return analyzeContractDetail(ref, buildFlowableAttachmentList(detail), baseFacts, target, "鍚堝悓椤?", onProgress);
+      return analyzeContractDetail(ref, buildFlowableAttachmentList(detail), baseFacts, target, "合同页", onProgress);
     }
 
       const detail = await fetchHistoryDetail(ref, baseUrl);
       const historyPageSnapshot = await collectPageSnapshotFromUrl(ref.detailUrl).catch(() => null);
       const mainForm = detail?.formData?.mainForm || {};
       const baseFacts = {
-        processCode: firstNonEmpty(findHistoryField(mainForm, "鍚堝悓缂栧彿", "閲囪喘鍚堝悓缂栧彿")),
+        processCode: firstNonEmpty(findHistoryField(mainForm, "合同编号", "采购合同编号")),
         processTitle: firstNonEmpty(
-          findHistoryField(mainForm, "鍚堝悓鍚嶇О"),
-          findFieldValueFromPairs(historyPageSnapshot?.fieldPairs, "鍚堝悓鍚嶇О"),
+          findHistoryField(mainForm, "合同名称"),
+          findFieldValueFromPairs(historyPageSnapshot?.fieldPairs, "合同名称"),
           contractLink.title
         ),
         counterpartyCompany: firstNonEmpty(
-          findHistoryField(mainForm, "渚涘簲鍟嗗悕绉?", "涔欐柟", "瀵规柟鍏徃"),
-          findFieldValueFromPairs(historyPageSnapshot?.fieldPairs, "渚涘簲鍟嗗悕绉?", "涔欐柟", "瀵规柟鍏徃")
+          findHistoryField(mainForm, "供应商名称", "乙方", "对方公司"),
+          findFieldValueFromPairs(historyPageSnapshot?.fieldPairs, "供应商名称", "乙方", "对方公司")
         ),
-        contractAccountNo: firstLikelyBankAccount(findHistoryField(mainForm, "鏀舵璐﹀彿", "閾惰璐﹀彿", "寮€鎴疯处鍙?")),
+        contractAccountNo: firstLikelyBankAccount(findHistoryField(mainForm, "收款账号", "银行账号", "开户账号")),
         effectiveStart: firstNonEmptyDate(
-          findHistoryField(mainForm, "鍚堝悓寮€濮嬫棩鏈?", "寮€濮嬫棩鏈?"),
-          findFieldValueFromPairs(historyPageSnapshot?.fieldPairs, "鍚堝悓寮€濮嬫棩鏈?", "寮€濮嬫棩鏈?")
+          findHistoryField(mainForm, "合同开始日", "开始日"),
+          findFieldValueFromPairs(historyPageSnapshot?.fieldPairs, "合同开始日", "开始日")
         ),
         effectiveEnd: firstNonEmptyDate(
-          findHistoryField(mainForm, "鍚堝悓缁撴潫鏃ユ湡", "缁撴潫鏃ユ湡"),
-          findFieldValueFromPairs(historyPageSnapshot?.fieldPairs, "鍚堝悓缁撴潫鏃ユ湡", "缁撴潫鏃ユ湡")
+          findHistoryField(mainForm, "合同结束日期", "结束日期"),
+          findFieldValueFromPairs(historyPageSnapshot?.fieldPairs, "合同结束日期", "结束日期")
         ),
         paymentTerms: firstMeaningfulText(
-          findHistoryField(mainForm, "浠樻鏂瑰紡", "浠樻鏉′欢", "楠屾敹鏍囧噯"),
-          findFieldValueFromPairs(historyPageSnapshot?.fieldPairs, "浠樻鏂瑰紡", "浠樻鏉′欢", "楠屾敹鏍囧噯")
+          findHistoryField(mainForm, "付款方式", "付款条件", "验收标准"),
+          findFieldValueFromPairs(historyPageSnapshot?.fieldPairs, "付款方式", "付款条件", "验收标准")
         ),
         sourceName: firstNonEmpty(
-          findHistoryField(mainForm, "鍚堝悓鍚嶇О"),
-          findFieldValueFromPairs(historyPageSnapshot?.fieldPairs, "鍚堝悓鍚嶇О"),
+          findHistoryField(mainForm, "合同名称"),
+          findFieldValueFromPairs(historyPageSnapshot?.fieldPairs, "合同名称"),
           contractLink.title
         ),
         sourceUrl: ref.detailUrl
@@ -1557,23 +1640,23 @@ async function analyzeContractLinks(relatedLinks, target, baseUrl, onProgress) {
         buildHistoryAttachmentList(detail),
         Array.isArray(historyPageSnapshot?.attachments) ? historyPageSnapshot.attachments : []
       );
-      return analyzeContractDetail(ref, historyAttachments, baseFacts, target, "鍚堝悓椤?", onProgress);
+      return analyzeContractDetail(ref, historyAttachments, baseFacts, target, "合同页", onProgress);
   } catch (error) {
     return {
       ref,
       facts: {
         sourceName: contractLink.title || "",
         sourceUrl: ref.detailUrl || "",
-        paymentTerms: `鍚堝悓椤佃鍙栧け璐ワ細${normalizeError(error)}`
+        paymentTerms: `合同页读取失败：${normalizeError(error)}`
       },
       matches: { amount: null, company: null, account: null },
       summary: {
         ...emptyContractSummary(),
         mode: "error",
-        statusText: "璇诲彇澶辫触",
-        errorText: `鍚堝悓椤佃鍙栧け璐ワ細${normalizeError(error)}`
+        statusText: "读取失败",
+        errorText: `合同页读取失败：${normalizeError(error)}`
       },
-      processing: emptyContractProcessing("read_failed", `鍚堝悓椤佃鍙栧け璐ワ細${normalizeError(error)}`)
+      processing: emptyContractProcessing("read_failed", `合同页读取失败：${normalizeError(error)}`)
     };
   }
 }
@@ -1605,7 +1688,7 @@ async function analyzeContractDetail(ref, attachments, baseFacts, target, source
   if (!facts.effectiveEnd) facts.effectiveEnd = attachmentAnalysis.contractFacts.effectiveEnd || "";
   if (!facts.paymentTerms) facts.paymentTerms = attachmentAnalysis.contractFacts.paymentTerms || "";
   if (!facts.paymentTerms) facts.paymentTerms = deriveFallbackContractTerms(attachmentAnalysis.referenceEntries || [], target);
-  if (!facts.paymentTerms) facts.paymentTerms = "宸茶繘鍏ュ悎鍚岄〉锛屼絾鏈彁鍙栧埌鏄庣‘浠樻鏉′欢";
+  if (!facts.paymentTerms) facts.paymentTerms = "已进入合同页，但未提取到明确付款条件";
   if (!facts.sourceName) facts.sourceName = attachmentAnalysis.contractFacts.sourceName || ref.detailUrl;
   if (!facts.sourceUrl) facts.sourceUrl = attachmentAnalysis.contractFacts.sourceUrl || ref.detailUrl;
 
@@ -1624,8 +1707,8 @@ async function analyzeContractDetail(ref, attachments, baseFacts, target, source
   summary = {
     ...summary,
     evidenceClauses: selectSummaryEvidenceClauses(summary.evidenceClauses, clauseCandidates),
-    llmDispatchStatus: clauseCandidates.length > 0 ? "?????" : "?????",
-    llmDispatchReason: clauseCandidates.length > 0 ? "?????????????????????????????" : "????????????????????????????",
+    llmDispatchStatus: clauseCandidates.length > 0 ? "已发送" : "未发送",
+    llmDispatchReason: clauseCandidates.length > 0 ? "已将脱敏后的付款相关条款候选发送给大模型" : "未筛到付款相关条款候选，仅做本地处理",
     llmRequestPreview: clauseCandidates.length > 0
       ? buildContractLlmPreview({
           target,
@@ -1645,7 +1728,7 @@ async function analyzeContractDetail(ref, attachments, baseFacts, target, source
       });
       summary = {
         mode: "llm",
-        statusText: "AI鎽樿",
+        statusText: "AI摘要",
         paymentMode: llmSummary.paymentMode || summary.paymentMode,
         paymentTermsSummary: llmSummary.paymentTermsSummary || summary.paymentTermsSummary,
         acceptanceRequirement: llmSummary.acceptanceRequirement || summary.acceptanceRequirement,
@@ -1657,8 +1740,8 @@ async function analyzeContractDetail(ref, attachments, baseFacts, target, source
         capAmount: pickPreferredCapAmount(summary.capAmount, llmSummary.capAmount),
         evidenceClauseIds: llmSummary.evidenceClauseIds || [],
         evidenceClauses: selectSummaryEvidenceClauses(llmSummary.evidenceClauseIds, clauseCandidates),
-        llmDispatchStatus: "宸插彂閫?",
-        llmDispatchReason: "宸插皢鑴辨晱鍚庣殑浠樻鐩稿叧鏉℃鍊欓€夊彂閫佺粰澶фā鍨?",
+        llmDispatchStatus: "已发送",
+        llmDispatchReason: "已将脱敏后的付款相关条款候选发送给大模型",
         llmRequestPreview: summary.llmRequestPreview,
         errorText: ""
       };
@@ -1666,10 +1749,10 @@ async function analyzeContractDetail(ref, attachments, baseFacts, target, source
       summary = {
         ...summary,
         mode: "local_fallback",
-        statusText: "鏈湴鎽樺綍",
-        llmDispatchStatus: "鍙戦€佸け璐?",
-        llmDispatchReason: "宸插皾璇曞彂閫佺粰澶фā鍨嬶紝浣嗚皟鐢ㄥけ璐ワ紝宸插洖閫€鍒版湰鍦板睍绀?",
-        errorText: `AI鎽樿澶辫触锛?{normalizeError(error)}`
+        statusText: "本地摘录",
+        llmDispatchStatus: "发送失败",
+        llmDispatchReason: "已尝试发送给大模型，但调用失败，已回退到本地展示",
+        errorText: `AI摘要失败：${normalizeError(error)}`
       };
     }
   }
@@ -1686,7 +1769,7 @@ async function analyzeContractDetail(ref, attachments, baseFacts, target, source
     },
     processing: {
       pageStatus: "read_ok",
-      pageStatusText: "宸茶繘鍏ュ悎鍚岄〉",
+      pageStatusText: "已进入合同页",
       attachmentDiscoveredCount: contractAttachmentDisplay.count,
       attachmentSupportedCount: attachmentAnalysis.stats.supportedCount,
       attachmentScannedCount: attachmentAnalysis.stats.scannedCount,
@@ -1698,28 +1781,28 @@ async function analyzeContractDetail(ref, attachments, baseFacts, target, source
         baseFacts.effectiveStart || baseFacts.effectiveEnd,
         attachmentAnalysis.contractFacts.effectiveStart || attachmentAnalysis.contractFacts.effectiveEnd,
         attachmentAnalysis.contractFacts.sourceName,
-        "鍚堝悓椤佃〃鍗?"
+        "合同页表单"
       ),
       paymentTermsSource: summarizeContractFactSource(
         baseFacts.paymentTerms,
         attachmentAnalysis.contractFacts.paymentTerms,
         attachmentAnalysis.contractFacts.sourceName,
-        "鍚堝悓椤佃〃鍗?"
+        "合同页表单"
       ),
       companySource: summarizeContractFactSource(
         baseFacts.counterpartyCompany,
         attachmentAnalysis.matches.company?.matchedValue,
         attachmentAnalysis.matches.company?.sourceName,
-        "鍚堝悓椤佃〃鍗?"
+        "合同页表单"
       ),
       accountSource: summarizeContractFactSource(
         baseFacts.contractAccountNo,
         attachmentAnalysis.matches.account?.matchedValue,
         attachmentAnalysis.matches.account?.sourceName,
-        "鍚堝悓椤佃〃鍗?"
+        "合同页表单"
       ),
       clauseCandidateCount: clauseCandidates.length,
-      summaryStatusText: summary.statusText || "鏈敓鎴?",
+      summaryStatusText: summary.statusText || "未生成",
       summaryErrorText: summary.errorText || ""
     }
   };
@@ -1728,15 +1811,15 @@ async function analyzeContractDetail(ref, attachments, baseFacts, target, source
 async function analyzeAcceptanceLinks(relatedLinks, target, baseUrl, onProgress) {
   const acceptanceLink = (relatedLinks || []).find((item) => item.relation === "acceptance");
   if (!acceptanceLink) {
-    return { statement: "灏氭湭鍙戠幇鏄庣‘鐨勯獙鏀舵潵婧?", sourceName: "", sourceUrl: "" };
+    return { statement: "尚未发现明确的验收来源", sourceName: "", sourceUrl: "" };
   }
 
   const ref = parseProcessRef(acceptanceLink.url, "acceptance");
   if (!ref) {
-    return { statement: "楠屾敹閾炬帴鏍煎紡鏆傛湭璇嗗埆", sourceName: acceptanceLink.title || "", sourceUrl: acceptanceLink.url || "" };
+    return { statement: "验收链接格式暂未识别", sourceName: acceptanceLink.title || "", sourceUrl: acceptanceLink.url || "" };
   }
 
-  reportProgress(onProgress, "acceptance-open", "姝ｅ湪璇诲彇楠屾敹椤?", acceptanceLink.title || ref.detailUrl || "楠屾敹鍏ュ彛");
+  reportProgress(onProgress, "acceptance-open", "正在读取验收页", acceptanceLink.title || ref.detailUrl || "验收入口");
 
   try {
     const detail = ref.mode === "flowable" ? await fetchFlowableDetail(ref, baseUrl) : await fetchHistoryDetail(ref, baseUrl);
@@ -1753,7 +1836,7 @@ async function analyzeAcceptanceLinks(relatedLinks, target, baseUrl, onProgress)
     };
   } catch (error) {
     return {
-      statement: `楠屾敹椤佃鍙栧け璐ワ細${normalizeError(error)}`,
+      statement: `验收页读取失败：${normalizeError(error)}`,
       sourceName: acceptanceLink.title || "",
       sourceUrl: ref.detailUrl || ""
     };
@@ -1762,7 +1845,7 @@ async function analyzeAcceptanceLinks(relatedLinks, target, baseUrl, onProgress)
 
 function acceptanceTitleMatch(target, titles) {
   if (!titles.length) {
-    return "楠屾敹娴佺▼鏈彁鍙栧埌闄勪欢鏍囬";
+    return "验收流程未提取到附件标题";
   }
 
   const paymentTitle = cleanText(target?.processTitle || "").replace(/\s+/g, "");
@@ -1777,7 +1860,7 @@ function acceptanceTitleMatch(target, titles) {
     return score >= 2;
   });
 
-  return matched ? `宸插彂鐜伴獙鏀舵爣棰樹笌褰撳墠浠樻鍗曠浉绗︼細${matched}` : "楠屾敹鏍囬鏆傛湭鏄庢樉鍖归厤褰撳墠浠樻鍗?";
+  return matched ? `已发现验收标题与当前付款单相符：${matched}` : "验收标题暂未明显匹配当前付款单";
 }
 
 async function analyzeAttachmentList(attachments, target, sourceLabelPrefix, onProgress, progressPhase) {
@@ -1813,11 +1896,11 @@ async function analyzeAttachmentList(attachments, target, sourceLabelPrefix, onP
   };
 
   if (items.length === 0) {
-    reportProgress(onProgress, progressPhase, `姝ｅ湪鏌ョ湅${sourceLabelPrefix}`, "褰撳墠闃舵娌℃湁鍙В鏋愮殑闄勪欢");
+    reportProgress(onProgress, progressPhase, `正在查看${sourceLabelPrefix}`, "当前阶段没有可展示的概览");
     return { matches, contractFacts, referenceEntries, errors, stats };
   }
 
-  reportProgress(onProgress, progressPhase, `??????${sourceLabelPrefix}`, `?????? ${items.length} ?????`);
+  reportProgress(onProgress, progressPhase, `正在查看${sourceLabelPrefix}`, `准备扫描 ${items.length} 个附件`);
 
   for (let index = 0; index < items.length; index += 1) {
     const attachment = items[index];
@@ -1825,8 +1908,8 @@ async function analyzeAttachmentList(attachments, target, sourceLabelPrefix, onP
     reportProgress(
       onProgress,
       progressPhase,
-      `姝ｅ湪鏌ョ湅${sourceLabelPrefix}`,
-      `?????? ${index + 1}/${items.length}: ${attachment?.name || "????????"}`
+      `正在查看${sourceLabelPrefix}`,
+      `正在扫描 ${index + 1}/${items.length}: ${attachment?.name || "未命名附件"}`
     );
 
     try {
@@ -1848,7 +1931,7 @@ async function analyzeAttachmentList(attachments, target, sourceLabelPrefix, onP
           continue;
         }
         const detectedRole = detectAttachmentRole(attachment, text);
-        const sourceName = `${sourceLabelPrefix}: ${attachment.name || "????????"}`;
+        const sourceName = `${sourceLabelPrefix}: ${attachment.name || "未命名附件"}`;
         referenceEntries.push({
           sourceName,
           sourceUrl: attachment.url || "",
@@ -1942,7 +2025,7 @@ function emptyContractProcessing(pageStatus, pageStatusText) {
     companySource: "",
     accountSource: "",
     clauseCandidateCount: 0,
-    summaryStatusText: "鏈敓鎴?",
+    summaryStatusText: "未生成",
     summaryErrorText: ""
   };
 }
@@ -1954,7 +2037,7 @@ function buildAttachmentOnlyContractProcessing(pageAttachmentAnalysis, inventori
   const contractEntries = referenceEntries.filter((item) => item.role === "contract");
 
   if (!contractFacts.sourceName && contractAttachments.length === 0) {
-    return emptyContractProcessing("not_found", "灏氭湭鍙戠幇鏄庣‘鐨勫悎鍚屾潵婧?");
+    return emptyContractProcessing("not_found", "尚未发现明确的合同来源");
   }
 
   const attachmentNames = contractAttachments
@@ -1964,7 +2047,7 @@ function buildAttachmentOnlyContractProcessing(pageAttachmentAnalysis, inventori
 
   return {
     pageStatus: "attachment_only",
-    pageStatusText: "宸插湪浠樻椤甸檮浠朵腑鍙戠幇鍚堝悓鏉ユ簮",
+    pageStatusText: "已在付款页附件中发现合同来源",
     attachmentDiscoveredCount: contractAttachments.length,
     attachmentSupportedCount: contractAttachments.length,
     attachmentScannedCount: contractAttachments.length,
@@ -1972,12 +2055,12 @@ function buildAttachmentOnlyContractProcessing(pageAttachmentAnalysis, inventori
     attachmentParsedCount: contractEntries.length,
     attachmentErrorCount: 0,
     attachmentNames,
-    periodSource: contractFacts.effectiveStart || contractFacts.effectiveEnd ? contractFacts.sourceName || "???????????" : "?????",
-    paymentTermsSource: contractFacts.paymentTerms ? contractFacts.sourceName || "???????????" : "?????",
+    periodSource: contractFacts.effectiveStart || contractFacts.effectiveEnd ? contractFacts.sourceName || "合同页表单" : "未提供",
+    paymentTermsSource: contractFacts.paymentTerms ? contractFacts.sourceName || "合同页表单" : "未提供",
     companySource: "",
     accountSource: "",
     clauseCandidateCount: 0,
-    summaryStatusText: "鏈敓鎴?",
+    summaryStatusText: "未生成",
     summaryErrorText: ""
   };
 }
@@ -1985,7 +2068,7 @@ function buildAttachmentOnlyContractProcessing(pageAttachmentAnalysis, inventori
 function emptyContractSummary() {
   return {
     mode: "none",
-    statusText: "鏈敓鎴?",
+    statusText: "未生成",
     paymentMode: "",
     paymentTermsSummary: "",
     acceptanceRequirement: "",
@@ -1997,8 +2080,8 @@ function emptyContractSummary() {
     capAmount: "",
     evidenceClauseIds: [],
     evidenceClauses: [],
-    llmDispatchStatus: "鏈彂閫?",
-    llmDispatchReason: "鏈瓫鍒颁粯娆剧浉鍏虫潯娆惧€欓€夛紝浠呭仛鏈湴澶勭悊",
+    llmDispatchStatus: "未发送",
+    llmDispatchReason: "未筛到付款相关条款候选，仅做本地处理",
     llmRequestPreview: null,
     errorText: ""
   };
@@ -2017,12 +2100,12 @@ function selectSummaryEvidenceClauses(selectedIds, candidates) {
 
 function summarizeContractFactSource(formValue, attachmentValue, attachmentSourceName, fallbackFormLabel) {
   if (attachmentValue) {
-    return attachmentSourceName || "鍚堝悓闄勪欢";
+    return attachmentSourceName || "合同附件";
   }
   if (formValue) {
     return fallbackFormLabel;
   }
-  return "鏈彁鍙?";
+  return "未提供";
 }
 
 function deriveFallbackContractTerms(referenceEntries, target) {
@@ -2054,7 +2137,7 @@ function deriveFallbackContractTerms(referenceEntries, target) {
   if (monthlyFeeSentence && !/monthly|rent|fee/i.test(amountSentence || "")) parts.push(monthlyFeeSentence);
   if (!amountSentence && termSentence) parts.push(termSentence);
 
-  return dedupeTextParts(parts).join("锛?");
+  return dedupeTextParts(parts).join("；");
 }
 
 function findContractReferenceSentence(referenceEntries, matcher) {
@@ -2125,22 +2208,22 @@ function buildAmountVerification(target, inventories, matched) {
   if (!target.paymentAmount) {
     return createVerificationItem(
       "amount",
-      "閲戦涓€鑷?",
+      "金额一致",
       "warn",
-      "鏈粠浠樻鍗曢〉闈㈣瘑鍒埌浠樻閲戦",
+      "未从付款单页识别到付款金额",
       "",
       "",
       "",
-      "浠樻鍗曢噾棰濈己澶憋紝鏃犳硶鐢ㄥ閮ㄨ瘉鎹牳楠?"
+      "付款单金额缺失，无法用外部证据核对"
     );
   }
 
   if (matched) {
     return createVerificationItem(
       "amount",
-      "閲戦涓€鑷?",
+      "金额一致",
       "pass",
-      `???${matched.sourceName}???????????`, 
+      `已在${matched.sourceName}中找到相同金额`,
       matched.sourceName,
       matched.sourceUrl,
       matched.matchedValue,
@@ -2150,13 +2233,13 @@ function buildAmountVerification(target, inventories, matched) {
 
   return createVerificationItem(
     "amount",
-    "閲戦涓€鑷?",
+    "金额一致",
     "warn",
-    hasInvoiceSource(inventories) ? "??????????????????????????" : "???????????????????????????",
+    hasInvoiceSource(inventories) ? "发票来源未命中金额，验收页及合同页附件作为补充来源" : "尚未发现可用于核实金额的外部来源",
     "",
     "",
     formatAmount(target.paymentAmount),
-    `浠樻鍗曢噾棰濓細${formatAmount(target.paymentAmount)}`
+    `付款单金额：${formatAmount(target.paymentAmount)}`
   );
 }
 
@@ -2164,22 +2247,22 @@ function buildCompanyVerification(target, inventories, matched) {
   if (!target.payeeCompany) {
     return createVerificationItem(
       "company",
-      "鏀舵鍏徃鍚嶇О涓€鑷?",
+      "收款公司名称一致",
       "warn",
-      "鏈粠浠樻鍗曢〉闈㈣瘑鍒埌鏀舵鍏徃鍚嶇О",
+      "未从付款单页识别收款公司名称",
       "",
       "",
       "",
-      "浠樻鍗曟敹娆惧叕鍙哥己澶憋紝鏃犳硶鐢ㄥ閮ㄨ瘉鎹牳楠?"
+      "付款单收款公司缺失，无法用外部证据核对"
     );
   }
 
   if (matched) {
     return createVerificationItem(
       "company",
-      "鏀舵鍏徃鍚嶇О涓€鑷?",
+      "收款公司名称一致",
       "pass",
-      `???${matched.sourceName}??????????????`, 
+      `已在${matched.sourceName}中找到相同收款公司`,
       matched.sourceName,
       matched.sourceUrl,
       matched.matchedValue,
@@ -2195,13 +2278,13 @@ function buildCompanyVerification(target, inventories, matched) {
 
   return createVerificationItem(
     "company",
-    "鏀舵鍏徃鍚嶇О涓€鑷?",
+    "收款公司名称一致",
     "warn",
-    hasExternal ? "?????????????????????????????" : "???????????????????????????",
+    hasExternal ? "已发现外部来源，但尚未命中一致的收款公司名称" : "尚未发现可用于核实收款公司的外部来源",
     "",
     "",
     target.payeeCompany,
-    `浠樻鍗曟敹娆惧叕鍙革細${target.payeeCompany}`
+    `付款单收款公司：${target.payeeCompany}`
   );
 }
 
@@ -2209,22 +2292,22 @@ function buildAccountVerification(target, inventories, matched) {
   if (!target.payeeAccount) {
     return createVerificationItem(
       "account",
-      "鏀舵璐﹀彿涓€鑷?",
+      "收款账号一致",
       "warn",
-      "鏈粠浠樻鍗曢〉闈㈣瘑鍒埌鏀舵璐﹀彿",
+      "未从付款单页识别收款账号",
       "",
       "",
       "",
-      "浠樻鍗曟敹娆捐处鍙风己澶憋紝鏃犳硶鐢ㄥ閮ㄨ瘉鎹牳楠?"
+      "付款单收款账号缺失，无法用外部证据核对"
     );
   }
 
   if (matched) {
     return createVerificationItem(
       "account",
-      "鏀舵璐﹀彿涓€鑷?",
+      "收款账号一致",
       "pass",
-      `???${matched.sourceName}???????????`, 
+      `已在${matched.sourceName}中找到相同收款账号`,
       matched.sourceName,
       matched.sourceUrl,
       matched.matchedValue,
@@ -2240,17 +2323,17 @@ function buildAccountVerification(target, inventories, matched) {
 
   return createVerificationItem(
     "account",
-    "鏀舵璐﹀彿涓€鑷?",
+    "收款账号一致",
     "warn",
     hasInvoice
-      ? "鍙戠エ涓皻鏈懡涓敹娆捐处鍙凤紝灏嗙户缁互鍚堝悓鎴栧叾浠栭檮浠朵綔涓鸿ˉ鍏呮潵婧?"
+      ? "发票来源未命中收款账号，验收页及合同页附件作为补充来源"
       : hasFallback
-        ? "宸插彂鐜板悎鍚屾垨璐﹀彿闄勪欢锛屼絾灏氭湭鍛戒腑鏀舵璐﹀彿"
-        : "灏氭湭鍙戠幇鍙敤浜庢牳瀹炴敹娆捐处鍙风殑澶栭儴鏉ユ簮",
+        ? "已发现合同侧账号，但发票来源未命中收款账号"
+        : "尚未发现可用于核实收款账号的外部来源",
     "",
     "",
     target.payeeAccount,
-    `浠樻鍗曟敹娆捐处鍙凤細${target.payeeAccount}`
+    `付款单收款账号：${target.payeeAccount}`
   );
 }
 
@@ -2357,3 +2440,6 @@ function pickPreferredCapAmount(localValue, llmValue) {
   if (!llmText || /unknown|not found/i.test(llmText)) return localText || llmText;
   return localText || llmText;
 }
+
+
+

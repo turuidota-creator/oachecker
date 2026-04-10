@@ -713,6 +713,34 @@
   word-break: break-word;
 }
 
+.oa-finance-auto-review-inline-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 6px;
+}
+
+.oa-finance-auto-review-inline-link {
+  display: inline-flex;
+  align-items: center;
+  min-height: 28px;
+  padding: 0 10px;
+  border-radius: 999px;
+  background: #eef5ff;
+  color: #1d64d7;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1;
+  text-decoration: none;
+}
+
+.oa-finance-auto-review-inline-hint {
+  color: #607489;
+  font-size: 11px;
+  line-height: 1.4;
+}
+
 .oa-finance-auto-review-mini-pill {
   border-radius: 999px;
   padding: 2px 8px;

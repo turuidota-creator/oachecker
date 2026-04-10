@@ -1,4 +1,4 @@
-(() => {
+﻿(() => {
   const SCRIPT_FLAG = "__oaFinanceAutoReviewListMounted__";
   if (globalThis[SCRIPT_FLAG]) {
     return;
@@ -142,7 +142,7 @@
       chrome.runtime.sendMessage(message, (response) => {
         const runtimeError = chrome.runtime.lastError;
         if (runtimeError) {
-          reject(new Error(runtimeError.message || "扩展通信失败"));
+          reject(new Error(runtimeError.message || "鎵╁睍閫氫俊澶辫触"));
           return;
         }
         resolve(response || null);
@@ -159,6 +159,7 @@
         detailUrl: "",
         rowMeta: null,
         requestId: "",
+        progressPhase: "",
         progressText: "",
         updatedAt: ""
       });
@@ -394,11 +395,52 @@
     return STATUS_META[rowState.status] || STATUS_META.idle;
   }
 
+  function formatRunningLabel(rowState) {
+    const phase = cleanText(rowState?.progressPhase);
+    if (phase === "payment-root" || phase === "open-detail" || phase === "collect-snapshot") {
+      return "读取付款";
+    }
+    if (phase === "page-invoice") {
+      return "查看发票";
+    }
+    if (phase === "page-attachments") {
+      return "查看附件";
+    }
+    if (phase === "contract-link" || phase === "contract-open") {
+      return "分析合同";
+    }
+    if (phase === "acceptance-link" || phase === "acceptance-open") {
+      return "分析验收";
+    }
+    if (phase === "purchase-order-link" || phase === "purchase-order-open") {
+      return "查看订单";
+    }
+    if (phase === "domestic-pr-link" || phase === "domestic-pr-open") {
+      return "查看PR";
+    }
+    if (phase === "summary") {
+      return "汇总结果";
+    }
+
+    const text = cleanText(rowState?.progressText);
+    if (text.includes("发票")) return "查看发票";
+    if (text.includes("附件")) return "查看附件";
+    if (text.includes("合同")) return "分析合同";
+    if (text.includes("验收")) return "分析验收";
+    if (text.includes("订单")) return "查看订单";
+    if (text.includes("PR")) return "查看PR";
+    if (text.includes("汇总")) return "汇总结果";
+    if (text.includes("付款")) return "读取付款";
+    return rowState?.status === "reading" ? "读取付款" : "正在分析";
+  }
+
   function renderStatusButton(processCode) {
     const rowState = ensureRowState(processCode);
     const meta = statusMetaOf(processCode);
     const canOpen = !!rowState.result || !!rowState.errorText;
     const titleText = rowState.errorText || rowState.progressText || meta.label;
+    const buttonLabel =
+      rowState.status === "reading" || rowState.status === "analyzing" ? formatRunningLabel(rowState) : meta.label;
     return `
       <button
         type="button"
@@ -408,7 +450,7 @@
         title="${escapeHtml(titleText)}"
       >
         <span class="oa-finance-auto-review-dot"></span>
-        <span class="oa-finance-auto-review-label">${escapeHtml(meta.label)}</span>
+        <span class="oa-finance-auto-review-label">${escapeHtml(buttonLabel)}</span>
       </button>
     `;
   }
@@ -443,6 +485,91 @@
     return "预警";
   }
 
+  function isLikelyBrokenText(value) {
+    const text = cleanText(value);
+    if (!text) {
+      return false;
+    }
+    if (/\?{3,}/.test(text)) {
+      return true;
+    }
+    return /[�]|[鍀-鿿]/.test(text);
+  }
+
+  function prettifySourceName(sourceName, sourceUrl) {
+    const text = cleanText(sourceName);
+    if (text && !/^https?:\/\//i.test(text) && !isLikelyBrokenText(text)) {
+      return text;
+    }
+    const url = cleanText(sourceUrl || sourceName);
+    if (!url) {
+      return "";
+    }
+    if (/\/workflow\/process\/history\/detail\//i.test(url) || /\/workflow\/process\/detail\//i.test(url)) {
+      return "来源流程";
+    }
+    const matched = url.match(/\/([^/?#]+\.(?:pdf|docx?|xlsx?|jpg|jpeg|png|msg|eml))(?:[?#]|$)/i);
+    if (matched) {
+      try {
+        return decodeURIComponent(matched[1]);
+      } catch (_error) {
+        return matched[1];
+      }
+    }
+    return "来源附件";
+  }
+
+  function formatVerificationLabel(item, index) {
+    const key = cleanText(item?.key);
+    if (key === "amount") return "金额一致";
+    if (key === "company") return "收款公司名称一致";
+    if (key === "account") return "收款账号一致";
+    if (index === 0) return "金额一致";
+    if (index === 1) return "收款公司名称一致";
+    if (index === 2) return "收款账号一致";
+    return cleanText(item?.label) || "核对项";
+  }
+
+  function formatVerificationStatement(item, label) {
+    const matchedValue = cleanText(item?.matchedValue);
+    const status = cleanText(item?.status);
+    if (status === "pass") {
+      if (label === "金额一致") {
+        return matchedValue ? `已命中一致金额：${matchedValue}` : "已命中一致金额";
+      }
+      if (label === "收款公司名称一致") {
+        return matchedValue ? `已命中一致收款公司：${matchedValue}` : "已命中一致收款公司";
+      }
+      if (label === "收款账号一致") {
+        return matchedValue ? `已命中一致收款账号：${matchedValue}` : "已命中一致收款账号";
+      }
+    }
+    if (status === "fail") {
+      if (label === "金额一致") return "已发现不一致金额，请人工复核";
+      if (label === "收款公司名称一致") return "已发现不一致收款公司，请人工复核";
+      if (label === "收款账号一致") return "已发现不一致收款账号，请人工复核";
+    }
+    const statement = cleanText(item?.statement);
+    if (statement && !isLikelyBrokenText(statement)) {
+      return statement;
+    }
+    if (label === "金额一致") return "暂未拿到可确认的一致金额证据";
+    if (label === "收款公司名称一致") return "暂未拿到可确认的一致收款公司证据";
+    if (label === "收款账号一致") return "暂未拿到可确认的一致收款账号证据";
+    return "暂未生成说明";
+  }
+
+  function renderSourceAction(sourceName, sourceUrl, label = "打开来源") {
+    const url = cleanText(sourceUrl);
+    if (!url) {
+      return "";
+    }
+    const title = prettifySourceName(sourceName, url) || label;
+    return `<a class="oa-finance-auto-review-inline-link" href="${escapeHtml(url)}" target="_blank" rel="noreferrer">${escapeHtml(
+      label
+    )}</a><span class="oa-finance-auto-review-inline-hint">${escapeHtml(title)}</span>`;
+  }
+
   function joinMeaningfulTexts(values, limit = 3) {
     return (values || [])
       .map((item) => cleanText(item))
@@ -458,17 +585,23 @@
     }
     return items
       .map(
-        (item) => `
+        (item, index) => {
+          const label = formatVerificationLabel(item, index);
+          const statement = formatVerificationStatement(item, label);
+          const sourceAction = renderSourceAction(item?.sourceName, item?.sourceUrl, "打开证据");
+          return `
           <div class="oa-finance-auto-review-check">
             <div class="oa-finance-auto-review-check-head">
-              <strong>${escapeHtml(item?.label || "核对项")}</strong>
+              <strong>${escapeHtml(label)}</strong>
               <span class="oa-finance-auto-review-mini-pill is-${escapeHtml(item?.status || "warn")}">${escapeHtml(
                 formatStatusText(item?.status)
               )}</span>
             </div>
-            <div class="oa-finance-auto-review-check-text">${escapeHtml(item?.statement || "暂无说明")}</div>
+            <div class="oa-finance-auto-review-check-text">${escapeHtml(statement)}</div>
+            ${sourceAction ? `<div class="oa-finance-auto-review-inline-actions">${sourceAction}</div>` : ""}
           </div>
-        `
+        `;
+        }
       )
       .join("");
   }
@@ -500,16 +633,29 @@
 
     const purchaseOrder = related.purchaseOrder;
     if (purchaseOrder) {
-      const checkText = (purchaseOrder.checks || [])
-        .map((item) => `${cleanText(item?.label)}：${cleanText(item?.statement)}`)
-        .filter(Boolean)
-        .join("；");
+      const amountCheck = (purchaseOrder.checks || []).find((item) => cleanText(item?.key) === "payment_not_exceed_order_amount");
+      const supplierCheck = (purchaseOrder.checks || []).find((item) => cleanText(item?.key) === "payee_matches_supplier");
+      const compactText = joinMeaningfulTexts(
+        [
+          amountCheck ? `金额核对：${formatStatusText(amountCheck.status)}` : "",
+          supplierCheck ? `供应商核对：${formatStatusText(supplierCheck.status)}` : ""
+        ],
+        2
+      );
       const description = cleanText(purchaseOrder.fields?.description);
-      const combined = joinMeaningfulTexts([checkText, description], 2);
       blocks.push(`
         <div class="oa-finance-auto-review-related-item">
           <strong>采购订单</strong>
-          <div>${escapeHtml(combined || cleanText(purchaseOrder.summary) || "已读取采购订单")}</div>
+          <div title="${escapeHtml(description || "未提取到订单内容描述")}">${escapeHtml(compactText || "已读取采购订单")}</div>
+          ${
+            purchaseOrder.sourceUrl
+              ? `<div class="oa-finance-auto-review-inline-actions">${renderSourceAction(
+                  purchaseOrder.sourceName,
+                  purchaseOrder.sourceUrl,
+                  "打开订单"
+                )}</div>`
+              : ""
+          }
         </div>
       `);
     }
@@ -533,14 +679,24 @@
     }
 
     const contractSource = cleanText(result?.contractReference?.sourceName);
+    const contractSourceUrl = cleanText(result?.contractReference?.sourceUrl || related?.contract?.sourceUrl);
     const contractSummary = cleanText(
       result?.contractSummary?.paymentTermsSummary || result?.contractReference?.paymentTerms
     );
-    if (contractSource || contractSummary) {
+    if (contractSource || contractSummary || contractSourceUrl) {
       blocks.push(`
         <div class="oa-finance-auto-review-related-item">
           <strong>合同摘要</strong>
-          <div>${escapeHtml(joinMeaningfulTexts([contractSource, contractSummary], 2) || "已读取合同信息")}</div>
+          <div>${escapeHtml(contractSummary || "已读取合同信息")}</div>
+          ${
+            contractSourceUrl
+              ? `<div class="oa-finance-auto-review-inline-actions">${renderSourceAction(
+                  contractSource,
+                  contractSourceUrl,
+                  "打开合同来源"
+                )}</div>`
+              : ""
+          }
         </div>
       `);
     }
@@ -649,11 +805,7 @@
     popover.style.top = `${top}px`;
   }
 
-  function togglePopover(processCode, anchorEl) {
-    if (state.popover && !state.popover.hidden && state.popoverCode === processCode) {
-      hidePopover();
-      return;
-    }
+  function openPopover(processCode, anchorEl) {
     showPopover(processCode, anchorEl);
   }
 
@@ -665,6 +817,7 @@
       result: null,
       errorText: "",
       requestId,
+      progressPhase: "payment-root",
       progressText: "正在读取付款单详情",
       updatedAt: new Date().toISOString()
     });
@@ -714,6 +867,7 @@
         result: response.result || null,
         errorText: "",
         requestId: "",
+        progressPhase: "",
         progressText: "",
         updatedAt: new Date().toISOString()
       });
@@ -722,6 +876,7 @@
         status: "error",
         errorText: cleanText(error?.message || String(error) || "自动审核失败"),
         requestId: "",
+        progressPhase: "",
         progressText: ""
       });
     } finally {
@@ -810,6 +965,14 @@
     ensureToolbar(context);
     ensureHeaderCell(context.headerTable);
     context.rowInfos.forEach((item) => ensureBodyCell(item.rowEl, item.processCode, context.bodyTable));
+    if (state.popover && !state.popover.hidden && state.popoverCode) {
+      const anchor = findTriggerByProcessCode(state.popoverCode);
+      if (anchor) {
+        showPopover(state.popoverCode, anchor);
+      } else {
+        hidePopover();
+      }
+    }
   }
 
   function findTriggerByProcessCode(processCode) {
@@ -834,6 +997,7 @@
     }
     patchRowState(processCode, {
       status: nextStatus,
+      progressPhase: cleanText(payload.phase),
       progressText: cleanText(payload.text),
       updatedAt: new Date().toISOString()
     });
@@ -850,7 +1014,7 @@
         return;
       }
       if (rowState.result || rowState.errorText) {
-        togglePopover(processCode, trigger);
+        openPopover(processCode, trigger);
         return;
       }
       void auditProcessCode(processCode);
@@ -888,3 +1052,4 @@
 
   mount();
 })();
+
