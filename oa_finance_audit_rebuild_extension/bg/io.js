@@ -42,9 +42,43 @@ export async function fetchJson(url) {
 }
 
 export async function fetchBinary(url) {
-  const response = currentPageTabId && isSameOaOrigin(url)
-    ? await pageFetch(currentPageTabId, { url, responseType: "arrayBuffer" })
-    : await directFetchBinary(url);
+  const attempts =
+    currentPageTabId && isSameOaOrigin(url)
+      ? [
+          () => pageFetch(currentPageTabId, { url, responseType: "arrayBuffer" }),
+          () => directFetchBinary(url)
+        ]
+      : [
+          () => directFetchBinary(url),
+          () => (currentPageTabId ? pageFetch(currentPageTabId, { url, responseType: "arrayBuffer" }) : null)
+        ];
+
+  let response = null;
+  let lastError = null;
+  for (const runAttempt of attempts) {
+    if (typeof runAttempt !== "function") {
+      continue;
+    }
+    try {
+      const candidate = await runAttempt();
+      if (isUsableBinaryResponse(candidate)) {
+        response = candidate;
+        break;
+      }
+      if (!response) {
+        response = candidate;
+      }
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  if (!response && lastError) {
+    throw lastError;
+  }
+  if (!response) {
+    throw new Error("附件下载失败：未取得附件响应");
+  }
 
   if (!response.ok) {
     throw new Error(`附件下载失败: ${response.status} ${response.statusText}`.trim());
@@ -56,6 +90,16 @@ export async function fetchBinary(url) {
     throw new Error("附件响应为空");
   }
   return { bytes: base64ToUint8Array(response.base64), contentType: response.contentType || "" };
+}
+
+function isUsableBinaryResponse(response) {
+  if (!response || !response.ok) {
+    return false;
+  }
+  if (/text\/html/i.test(response.contentType || "") && /oauth|login|登录/i.test(response.text || "")) {
+    return false;
+  }
+  return !!response.base64;
 }
 
 export async function collectPageSnapshotFromUrl(url) {
@@ -110,7 +154,8 @@ export async function collectPageSnapshotFromUrl(url) {
 }
 
 async function directFetchText(url) {
-  const response = await fetch(url, { credentials: "include", cache: "no-store" });
+  const headers = await getRuntimeAuthHeaders();
+  const response = await fetch(url, { credentials: "include", cache: "no-store", headers });
   return {
     ok: response.ok,
     status: response.status,
@@ -121,7 +166,8 @@ async function directFetchText(url) {
 }
 
 async function directFetchBinary(url) {
-  const response = await fetch(url, { credentials: "include", cache: "no-store" });
+  const headers = await getRuntimeAuthHeaders();
+  const response = await fetch(url, { credentials: "include", cache: "no-store", headers });
   const contentType = response.headers.get("content-type") || "";
   if (/text\/html/i.test(contentType)) {
     return {
@@ -140,6 +186,93 @@ async function directFetchBinary(url) {
     contentType,
     base64: uint8ArrayToBase64(new Uint8Array(buffer))
   };
+}
+
+async function getRuntimeAuthHeaders() {
+  if (!Number.isInteger(currentPageTabId)) {
+    return {};
+  }
+  try {
+    const headers =
+      (await executeScriptFunction(currentPageTabId, () => {
+        const readCookie = (name) => {
+          const entries = String(document.cookie || "")
+            .split(";")
+            .map((item) => item.trim())
+            .filter(Boolean);
+          for (const entry of entries) {
+            if (!entry.startsWith(`${name}=`)) continue;
+            return decodeURIComponent(entry.slice(name.length + 1));
+          }
+          return "";
+        };
+
+        const walkValue = (value, results, depth = 0) => {
+          if (depth > 3 || value == null) return;
+          if (typeof value === "string") {
+            const trimmed = value.trim();
+            if (trimmed) results.push(trimmed);
+            if ((trimmed.startsWith("{") || trimmed.startsWith("[")) && trimmed.length < 50000) {
+              try {
+                walkValue(JSON.parse(trimmed), results, depth + 1);
+              } catch (_error) {}
+            }
+            return;
+          }
+          if (Array.isArray(value)) {
+            value.slice(0, 30).forEach((item) => walkValue(item, results, depth + 1));
+            return;
+          }
+          if (typeof value === "object") {
+            Object.values(value)
+              .slice(0, 50)
+              .forEach((item) => walkValue(item, results, depth + 1));
+          }
+        };
+
+        const findTokenInStorage = (storage) => {
+          const directKeys = ["Admin-Token", "adminToken", "admin-token", "token", "access_token", "accessToken", "Authorization"];
+          for (const key of directKeys) {
+            const value = storage.getItem(key);
+            if (value) return value.replace(/^Bearer\s+/i, "").trim();
+          }
+          const candidates = [];
+          for (let index = 0; index < storage.length; index += 1) {
+            const key = storage.key(index);
+            if (!key) continue;
+            const raw = storage.getItem(key);
+            if (!raw) continue;
+            if (/token|auth|admin/i.test(key) || raw.length < 50000) candidates.push(raw);
+          }
+          const flattened = [];
+          candidates.forEach((item) => walkValue(item, flattened));
+          const tokenLike = flattened.find(
+            (item) => /^Bearer\s+/i.test(item) || (/^[A-Za-z0-9._-]{16,}$/.test(item) && item.length >= 16)
+          );
+          return tokenLike ? tokenLike.replace(/^Bearer\s+/i, "").trim() : "";
+        };
+
+        const headers = {
+          Accept: "application/json, text/plain, */*",
+          "Content-Language": "zh_CN"
+        };
+        const adminToken =
+          readCookie("Admin-Token") ||
+          findTokenInStorage(window.localStorage) ||
+          findTokenInStorage(window.sessionStorage);
+        const oaAuthToken =
+          readCookie("oauthtoken") ||
+          window.localStorage.getItem("oauthtoken") ||
+          window.sessionStorage.getItem("oauthtoken") ||
+          "";
+        if (adminToken) headers.Authorization = `Bearer ${adminToken}`;
+        if (oaAuthToken) headers.oauthtoken = oaAuthToken;
+        return headers;
+      })) || {};
+    return headers && typeof headers === "object" ? headers : {};
+  } catch {
+    return {};
+  }
 }
 
 function pageFetch(tabId, request) {

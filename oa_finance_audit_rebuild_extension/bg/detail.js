@@ -325,14 +325,18 @@ function walk(node, visitor) {
 }
 
 function dedupeRefs(refs) {
-  const seen = new Set();
   const deduped = [];
+  const indexByKey = new Map();
   for (const ref of refs || []) {
     if (!ref) continue;
     const key = `${ref.mode}|${ref.detailId}|${ref.relation}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    deduped.push(ref);
+    const existingIndex = indexByKey.get(key);
+    if (existingIndex == null) {
+      indexByKey.set(key, deduped.length);
+      deduped.push(ref);
+      continue;
+    }
+    deduped[existingIndex] = mergeRefMeta(deduped[existingIndex], ref);
   }
   return deduped;
 }
@@ -340,6 +344,8 @@ function dedupeRefs(refs) {
 function extractRefsFromRows(rows, relation, currentDetailId) {
   const refs = [];
   for (const row of rows || []) {
+    const rowHints = collectRowHints(row);
+    const titleHint = pickRefTitleHint(rowHints, relation);
     for (const value of Object.values(row || {})) {
       if (typeof value !== "string") {
         continue;
@@ -347,12 +353,85 @@ function extractRefsFromRows(rows, relation, currentDetailId) {
       for (const match of value.matchAll(PROCESS_LINK_RE)) {
         const ref = parseProcessRef(match[0], relation);
         if (ref && ref.detailId !== currentDetailId) {
-          refs.push(ref);
+          refs.push({
+            ...ref,
+            titleHint,
+            rowHints
+          });
         }
       }
     }
   }
   return refs;
+}
+
+function mergeRefMeta(left, right) {
+  const leftHints = Array.isArray(left?.rowHints) ? left.rowHints : [];
+  const rightHints = Array.isArray(right?.rowHints) ? right.rowHints : [];
+  return {
+    ...left,
+    ...right,
+    titleHint: firstNonEmpty(left?.titleHint, right?.titleHint),
+    rowHints: [...new Set([...leftHints, ...rightHints].filter(Boolean))].slice(0, 8)
+  };
+}
+
+function collectRowHints(row) {
+  const results = [];
+  const seen = new Set();
+  for (const [key, value] of Object.entries(row || {})) {
+    if (typeof value !== "string") {
+      continue;
+    }
+    const text = cleanText(value);
+    if (!text || seen.has(text)) {
+      continue;
+    }
+    if (/^https?:\/\//i.test(text) || PROCESS_LINK_RE.test(text)) {
+      continue;
+    }
+    if (/^(?:GNPR|CYNCDD|CYNCHT|CYNCFK|DDFK)-\d+$/i.test(text)) {
+      continue;
+    }
+    if (/^\d{4}-\d{2}-\d{2}(?:\s+\d{2}:\d{2}(?::\d{2})?)?$/.test(text)) {
+      continue;
+    }
+    const normalizedKey = cleanText(key);
+    results.push({
+      key: normalizedKey,
+      value: text
+    });
+    seen.add(text);
+  }
+  return results.slice(0, 12);
+}
+
+function pickRefTitleHint(rowHints, relation) {
+  const candidates = Array.isArray(rowHints) ? rowHints : [];
+  if (candidates.length === 0) {
+    return "";
+  }
+
+  const relationPatterns =
+    relation === "acceptance"
+      ? [/邮件/, /主题/, /标题/, /验收/, /结算/, /答复/, /请.*审批/]
+      : relation === "contract"
+        ? [/合同/, /协议/, /补充协议/]
+        : relation === "purchase_order"
+          ? [/订单/, /供应商/, /采购/]
+          : relation === "domestic_pr"
+            ? [/PR/, /需求/, /用途/, /说明/]
+            : [];
+
+  for (const pattern of relationPatterns) {
+    const matched = candidates.find((item) => pattern.test(item.key) || pattern.test(item.value));
+    if (matched?.value) {
+      return matched.value;
+    }
+  }
+
+  const descriptive = candidates.find((item) => /[\u4e00-\u9fa5]/.test(item.value) && item.value.length >= 6);
+  return descriptive?.value || candidates[0]?.value || "";
 }
 
 function relationFromContext(context) {

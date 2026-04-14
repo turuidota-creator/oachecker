@@ -20,6 +20,8 @@
     "",
     "未生成",
     "未提取",
+    "未明确",
+    "未提供",
     "待提取",
     "待核对",
     "待进入合同页读取",
@@ -27,6 +29,40 @@
     "无",
     "未知"
   ]);
+
+  const PANEL_UI_STORAGE_KEY = "oa-finance-rebuild-detail-panel-ui-v1";
+  const PANEL_SECTION_ORDER = ["overview", "related", "contract", "debug"];
+  const DEFAULT_OPEN_SECTIONS = ["overview"];
+  const ROOT_LEFT_PADDING = 24;
+  const ROOT_RIGHT = 24;
+  const ROOT_BOTTOM = 24;
+  const ROOT_MIN_TOP = 16;
+  const DEFAULT_PANEL_TOP = 72;
+  const DEFAULT_PANEL_WIDTH = 500;
+  const MIN_PANEL_WIDTH = 380;
+  const MAX_PANEL_WIDTH = 700;
+  const MIN_PANEL_HEIGHT = 320;
+  const PANEL_RAIL_WIDTH = 76;
+  const PANEL_WORKSPACE_GAP = 0;
+
+  const PANEL_SECTIONS = {
+    overview: {
+      label: "主核对",
+      summaryWhenEmpty: "默认展开"
+    },
+    related: {
+      label: "关联单据",
+      summaryWhenEmpty: "采集后加载"
+    },
+    contract: {
+      label: "合同",
+      summaryWhenEmpty: "采集后加载"
+    },
+    debug: {
+      label: "调试",
+      summaryWhenEmpty: "采集后加载"
+    }
+  };
 
   const state = {
     buildTag: "",
@@ -36,11 +72,20 @@
     isRunning: false,
     progressItems: [],
     progressCollapsed: false,
-    debugCollapsed: true,
-    llmPreviewCollapsed: true
+    panelWidth: DEFAULT_PANEL_WIDTH,
+    panelTop: DEFAULT_PANEL_TOP,
+    openSections: new Set(DEFAULT_OPEN_SECTIONS),
+    uiLoaded: false,
+    isDragging: false,
+    isResizing: false
   };
 
-  const root = document.createElement("aside");
+  const runtime = {
+    saveTimer: null,
+    rootEventsBound: false
+  };
+
+  const root = document.createElement("div");
   root.id = "oa-finance-rebuild-root";
   document.body.appendChild(root);
 
@@ -50,6 +95,290 @@
       .replaceAll("<", "&lt;")
       .replaceAll(">", "&gt;")
       .replaceAll('"', "&quot;");
+  }
+
+  function cleanText(value) {
+    return String(value || "").replace(/\s+/g, " ").trim();
+  }
+
+  function resolveEventElement(target) {
+    if (target instanceof Element) {
+      return target;
+    }
+    return target?.parentElement || null;
+  }
+
+  function sendRuntimeMessage(message) {
+    return new Promise((resolve, reject) => {
+      chrome.runtime.sendMessage(message, (response) => {
+        const runtimeError = chrome.runtime.lastError;
+        if (runtimeError) {
+          reject(new Error(runtimeError.message || "扩展通信失败"));
+          return;
+        }
+        resolve(response || null);
+      });
+    });
+  }
+
+  function extractProcessCodeFromUrl() {
+    try {
+      const url = new URL(window.location.href);
+      const fromQuery = cleanText(url.searchParams.get("processCode"));
+      if (fromQuery) {
+        return fromQuery;
+      }
+      const matched = `${url.pathname} ${url.search}`.match(/[A-Z]{2,8}-\d{8,}/i);
+      return matched ? matched[0].toUpperCase() : "";
+    } catch (_error) {
+      return "";
+    }
+  }
+
+  function normalizeSectionKeys(values) {
+    return (Array.isArray(values) ? values : [])
+      .map((value) => cleanText(value))
+      .filter((value, index, array) => PANEL_SECTION_ORDER.includes(value) && array.indexOf(value) === index);
+  }
+
+  function getPanelMaxWidth() {
+    const availableWidth =
+      window.innerWidth - ROOT_LEFT_PADDING - ROOT_RIGHT - PANEL_RAIL_WIDTH - PANEL_WORKSPACE_GAP;
+    return Math.max(280, Math.min(MAX_PANEL_WIDTH, availableWidth));
+  }
+
+  function clampPanelWidth(value) {
+    const numeric = Number(value);
+    const resolved = Number.isFinite(numeric) ? numeric : DEFAULT_PANEL_WIDTH;
+    const maxWidth = getPanelMaxWidth();
+    const minWidth = Math.min(MIN_PANEL_WIDTH, maxWidth);
+    return Math.max(minWidth, Math.min(maxWidth, resolved));
+  }
+
+  function getPanelMaxTop() {
+    return Math.max(ROOT_MIN_TOP, window.innerHeight - ROOT_BOTTOM - MIN_PANEL_HEIGHT);
+  }
+
+  function clampPanelTop(value) {
+    const numeric = Number(value);
+    const resolved = Number.isFinite(numeric) ? numeric : DEFAULT_PANEL_TOP;
+    return Math.max(ROOT_MIN_TOP, Math.min(getPanelMaxTop(), resolved));
+  }
+
+  function clampPanelUiState() {
+    state.panelWidth = clampPanelWidth(state.panelWidth);
+    state.panelTop = clampPanelTop(state.panelTop);
+  }
+
+  function scheduleUiStatePersist() {
+    if (!state.uiLoaded) {
+      return;
+    }
+    if (runtime.saveTimer) {
+      clearTimeout(runtime.saveTimer);
+    }
+    runtime.saveTimer = setTimeout(() => {
+      runtime.saveTimer = null;
+      chrome.storage.local.set(
+        {
+          [PANEL_UI_STORAGE_KEY]: {
+            version: 1,
+            width: state.panelWidth,
+            top: state.panelTop,
+            openSections: Array.from(state.openSections)
+          }
+        },
+        () => {
+          void chrome.runtime.lastError;
+        }
+      );
+    }, 120);
+  }
+
+  function loadUiState() {
+    try {
+      chrome.storage.local.get(PANEL_UI_STORAGE_KEY, (payload) => {
+        const saved = payload?.[PANEL_UI_STORAGE_KEY];
+        if (saved && typeof saved === "object") {
+          if (Object.prototype.hasOwnProperty.call(saved, "width")) {
+            state.panelWidth = saved.width;
+          }
+          if (Object.prototype.hasOwnProperty.call(saved, "top")) {
+            state.panelTop = saved.top;
+          }
+          if (Array.isArray(saved.openSections)) {
+            state.openSections = new Set(normalizeSectionKeys(saved.openSections));
+          }
+        }
+        clampPanelUiState();
+        state.uiLoaded = true;
+        render();
+      });
+    } catch (_error) {
+      state.uiLoaded = true;
+      render();
+    }
+  }
+
+  function isRailOnly() {
+    return state.openSections.size === 0;
+  }
+
+  function isSectionOpen(sectionKey) {
+    return state.openSections.has(sectionKey);
+  }
+
+  function toggleSection(sectionKey) {
+    if (!PANEL_SECTION_ORDER.includes(sectionKey)) {
+      return;
+    }
+    if (state.openSections.has(sectionKey)) {
+      state.openSections.delete(sectionKey);
+    } else {
+      state.openSections.add(sectionKey);
+    }
+    scheduleUiStatePersist();
+    render();
+  }
+
+  function collapseAllSections() {
+    if (state.openSections.size === 0) {
+      return;
+    }
+    state.openSections = new Set();
+    scheduleUiStatePersist();
+    render();
+  }
+
+  function applyPanelLayout() {
+    clampPanelUiState();
+    root.style.top = `${state.panelTop}px`;
+    root.style.bottom = isRailOnly() ? "auto" : `${ROOT_BOTTOM}px`;
+    root.style.setProperty("--oa-finance-rebuild-panel-width", `${state.panelWidth}px`);
+    root.classList.toggle("is-rail-only", isRailOnly());
+    root.classList.toggle("is-dragging", state.isDragging);
+    root.classList.toggle("is-resizing", state.isResizing);
+  }
+
+  function setInteractionMode(isActive, cursor) {
+    document.body.style.userSelect = isActive ? "none" : "";
+    document.body.style.cursor = isActive ? cursor : "";
+  }
+
+  function startPanelDrag(event, handle) {
+    if (state.isResizing) {
+      return;
+    }
+    if (event.button !== 0 && event.pointerType !== "touch") {
+      return;
+    }
+    const startY = event.clientY;
+    const startTop = state.panelTop;
+    state.isDragging = true;
+    applyPanelLayout();
+    setInteractionMode(true, "ns-resize");
+    handle.setPointerCapture?.(event.pointerId);
+    event.preventDefault();
+
+    const handleMove = (moveEvent) => {
+      if (moveEvent.pointerId !== event.pointerId) {
+        return;
+      }
+      state.panelTop = clampPanelTop(startTop + (moveEvent.clientY - startY));
+      applyPanelLayout();
+    };
+
+    const finish = (finishEvent) => {
+      if (finishEvent.pointerId !== event.pointerId) {
+        return;
+      }
+      handle.removeEventListener("pointermove", handleMove);
+      handle.removeEventListener("pointerup", finish);
+      handle.removeEventListener("pointercancel", finish);
+      state.isDragging = false;
+      applyPanelLayout();
+      setInteractionMode(false, "");
+      scheduleUiStatePersist();
+    };
+
+    handle.addEventListener("pointermove", handleMove);
+    handle.addEventListener("pointerup", finish);
+    handle.addEventListener("pointercancel", finish);
+  }
+
+  function startPanelResize(event, handle) {
+    if (state.isDragging) {
+      return;
+    }
+    if (event.button !== 0 && event.pointerType !== "touch") {
+      return;
+    }
+    const startX = event.clientX;
+    const startWidth = state.panelWidth;
+    state.isResizing = true;
+    applyPanelLayout();
+    setInteractionMode(true, "ew-resize");
+    handle.setPointerCapture?.(event.pointerId);
+    event.preventDefault();
+
+    const handleMove = (moveEvent) => {
+      if (moveEvent.pointerId !== event.pointerId) {
+        return;
+      }
+      state.panelWidth = clampPanelWidth(startWidth - (moveEvent.clientX - startX));
+      applyPanelLayout();
+    };
+
+    const finish = (finishEvent) => {
+      if (finishEvent.pointerId !== event.pointerId) {
+        return;
+      }
+      handle.removeEventListener("pointermove", handleMove);
+      handle.removeEventListener("pointerup", finish);
+      handle.removeEventListener("pointercancel", finish);
+      state.isResizing = false;
+      applyPanelLayout();
+      setInteractionMode(false, "");
+      scheduleUiStatePersist();
+    };
+
+    handle.addEventListener("pointermove", handleMove);
+    handle.addEventListener("pointerup", finish);
+    handle.addEventListener("pointercancel", finish);
+  }
+
+  function applyAnalysisResult(result, statusText) {
+    state.analysis = result || null;
+    state.errorText = "";
+    state.isRunning = false;
+    state.statusText = statusText;
+    state.progressCollapsed = true;
+    root.dataset.analysisJson = JSON.stringify(state.analysis);
+    render();
+  }
+
+  async function tryLoadCachedAnalysis() {
+    const processCode = extractProcessCodeFromUrl();
+    if (!processCode || state.analysis) {
+      return;
+    }
+    try {
+      const response = await sendRuntimeMessage({
+        type: "oa-finance-rebuild-get-cache",
+        processCode
+      });
+      if (!response?.ok || !response.entry?.result) {
+        return;
+      }
+      state.progressItems = [];
+      rememberProgress({
+        text: "读取缓存",
+        detail: "已载入最近一次自动审核结果"
+      });
+      applyAnalysisResult(response.entry.result, "已载入缓存");
+    } catch (_error) {
+      // Ignore cache read failures and keep manual analysis available.
+    }
   }
 
   function hasMeaningfulText(value) {
@@ -88,6 +417,241 @@
     `);
   }
 
+  function escapeRegExp(value) {
+    return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  }
+
+  function renderHighlightedText(text, keywords) {
+    const source = String(text || "");
+    const terms = Array.from(new Set((keywords || []).map((item) => cleanText(item)).filter(Boolean)))
+      .sort((left, right) => right.length - left.length)
+      .slice(0, 8);
+    if (!source) {
+      return "";
+    }
+    if (terms.length === 0) {
+      return escapeHtml(source);
+    }
+
+    const pattern = new RegExp(terms.map((item) => escapeRegExp(item)).join("|"), "gi");
+    let cursor = 0;
+    let html = "";
+
+    for (const match of source.matchAll(pattern)) {
+      const index = match.index || 0;
+      html += escapeHtml(source.slice(cursor, index));
+      html += `<mark class="oa-finance-rebuild-mark">${escapeHtml(match[0])}</mark>`;
+      cursor = index + match[0].length;
+    }
+
+    html += escapeHtml(source.slice(cursor));
+    return html;
+  }
+
+  function splitClauseContext(text) {
+    const parts = String(text || "")
+      .split(/[。；;\n]/)
+      .map((item) => cleanText(item))
+      .filter(Boolean);
+
+    if (parts.length >= 3) {
+      return [
+        { label: "上一条", text: parts[0] },
+        { label: "当前条", text: parts[1] },
+        { label: "下一条", text: parts.slice(2).join("；") }
+      ];
+    }
+
+    if (parts.length === 2) {
+      return [
+        { label: "相关前文", text: parts[0] },
+        { label: "当前条", text: parts[1] }
+      ];
+    }
+
+    if (parts.length === 1) {
+      return [{ label: "当前条", text: parts[0] }];
+    }
+
+    return [];
+  }
+
+  function formatClauseScore(score) {
+    const numeric = Number(score);
+    return Number.isFinite(numeric) ? `得分 ${numeric}` : "";
+  }
+
+  function formatClausePage(pageLabel) {
+    const text = cleanText(pageLabel);
+    return text ? `页码 ${text}` : "";
+  }
+
+  function formatClauseRank(clauseId, index) {
+    const matched = cleanText(clauseId).match(/(\d+)/);
+    const order = matched ? Number(matched[1]) : index + 1;
+    return `候选 ${order}`;
+  }
+
+  function renderClauseTagList(keywords, restrictionFlags) {
+    const tags = [
+      ...(Array.isArray(keywords) ? keywords.slice(0, 5) : []),
+      ...(Array.isArray(restrictionFlags) ? restrictionFlags.map((item) => `提醒：${item}`) : [])
+    ]
+      .map((item) => cleanText(item))
+      .filter(Boolean);
+
+    if (tags.length === 0) {
+      return "";
+    }
+
+    return `
+      <div class="oa-finance-rebuild-clause-tags">
+        ${tags.map((item) => `<span class="oa-finance-rebuild-clause-tag">${escapeHtml(item)}</span>`).join("")}
+      </div>
+    `;
+  }
+
+  function renderContractEvidenceCard(item, index) {
+    if (!item) {
+      return "";
+    }
+
+    const title = cleanText(item.title) || formatClauseRank(item.clauseId, index);
+    const rank = formatClauseRank(item.clauseId, index);
+    const meta = [formatClauseScore(item.score), formatClausePage(item.pageLabel)].filter(Boolean).join(" · ");
+    const contextRows = splitClauseContext(item.text);
+    const excerpt = contextRows.find((row) => row.label === "当前条")?.text || cleanText(item.text);
+    const sourceName = usefulSourceName(item.sourceName);
+    const clickableClass = item.sourceUrl ? "is-clickable" : "";
+    const sourceAttrs = item.sourceUrl
+      ? `data-source-url="${escapeHtml(item.sourceUrl)}" tabindex="0" role="button"`
+      : "";
+
+    return `
+      <article class="oa-finance-rebuild-clause ${clickableClass}" ${sourceAttrs}>
+        <div class="oa-finance-rebuild-clause-head">
+          <div>
+            <span class="oa-finance-rebuild-clause-rank">${escapeHtml(rank)}</span>
+            <strong>${escapeHtml(title)}</strong>
+          </div>
+          <span>${escapeHtml(meta || "证据条款")}</span>
+        </div>
+        <p>${renderHighlightedText(excerpt, item.matchedKeywords)}</p>
+        ${renderClauseTagList(item.matchedKeywords, item.restrictionFlags)}
+        <details class="oa-finance-rebuild-clause-context">
+          <summary>展开上下文</summary>
+          <div class="oa-finance-rebuild-clause-context-body">
+            ${
+              contextRows.length > 0
+                ? contextRows
+                    .map(
+                      (row) => `
+                        <div class="oa-finance-rebuild-clause-context-row">
+                          <span>${escapeHtml(row.label)}</span>
+                          <strong>${renderHighlightedText(row.text, item.matchedKeywords)}</strong>
+                        </div>
+                      `
+                    )
+                    .join("")
+                : `<div class="oa-finance-rebuild-clause-context-row"><strong>${renderHighlightedText(item.text, item.matchedKeywords)}</strong></div>`
+            }
+          </div>
+        </details>
+        <div class="oa-finance-rebuild-clause-footer">
+          ${sourceName ? `<span>${escapeHtml(sourceName)}</span>` : "<span>合同原文</span>"}
+          ${
+            item.sourceUrl
+              ? `<a href="${escapeHtml(item.sourceUrl)}" target="_blank" rel="noreferrer">打开原文</a>`
+              : ""
+          }
+        </div>
+      </article>
+    `;
+  }
+
+  function renderContractEvidenceTheme(title, items, emptyText) {
+    const candidates = refineContractEvidenceItems(title, items);
+    return `
+      <div class="oa-finance-rebuild-contract-theme">
+        <div class="oa-finance-rebuild-contract-theme-title">${escapeHtml(title)}</div>
+        ${
+          candidates.length > 0
+            ? `<div class="oa-finance-rebuild-clause-list">${candidates.map((item, index) => renderContractEvidenceCard(item, index)).join("")}</div>`
+            : `<p class="oa-finance-rebuild-empty">${escapeHtml(emptyText)}</p>`
+        }
+      </div>
+    `;
+  }
+
+  function refineContractEvidenceItems(title, items) {
+    const candidates = Array.isArray(items) ? items.filter(Boolean) : [];
+    const isTermTheme = /合同期|期限/.test(title);
+    const pattern = isTermTheme
+      ? /期限|有效期|届满|到期|自动续展|自动延长|续签|顺延|一年一签|起|至|止/
+      : /付款|支付|结算|发票|开票|验收|工作日|自然日|次月|月结|电汇|预付|尾款/;
+
+    const filtered = candidates.filter((item) => {
+      const haystack = [item.title, item.text, ...(Array.isArray(item.matchedKeywords) ? item.matchedKeywords : [])]
+        .map((value) => cleanText(value))
+        .join(" ");
+      return pattern.test(haystack);
+    });
+
+    return (filtered.length > 0 ? filtered : candidates).slice(0, isTermTheme ? 4 : 5);
+  }
+
+  function buildKvRows(items) {
+    const rows = [];
+    for (const item of items || []) {
+      if (!item || !item.label) {
+        continue;
+      }
+      pushKvRow(rows, item.label, item.value);
+    }
+    return rows;
+  }
+
+  function renderContractOverviewTheme(title, items, emptyText) {
+    const rows = buildKvRows(items);
+    return `
+      <div class="oa-finance-rebuild-contract-theme oa-finance-rebuild-contract-summary-theme">
+        <div class="oa-finance-rebuild-contract-theme-title">${escapeHtml(title)}</div>
+        ${rows.length > 0 ? rows.join("") : `<p class="oa-finance-rebuild-empty">${escapeHtml(emptyText)}</p>`}
+      </div>
+    `;
+  }
+
+  function formatContractPeriod(start, end) {
+    const left = cleanText(start);
+    const right = cleanText(end);
+    if (left && right) {
+      return `${left} ~ ${right}`;
+    }
+    return left || right || "";
+  }
+
+  function extractInvoiceGoodsType(summary) {
+    const source = [summary?.taxRate, summary?.invoiceRequirement]
+      .map((value) => cleanText(value))
+      .filter(Boolean)
+      .join("；");
+    if (!source) {
+      return "";
+    }
+
+    const pair = source.match(/\*([^*]+)\*\s*\*([^*]+)\*/);
+    if (pair) {
+      return cleanText(`${pair[1]} / ${pair[2]}`);
+    }
+
+    const direct =
+      source.match(/开票内容[：:]\s*([^；;。]+)/)?.[1] ||
+      source.match(/(?:发票|专票|普票)[^；;。]*?(现代服务|技术服务费|服务费|维护费|广告服务费|软件服务费|咨询服务费)/)?.[1] ||
+      "";
+
+    return cleanText(direct).replace(/\s*\*+\s*/g, " ").trim();
+  }
+
   function summarizeDisplayText(value, maxLength = 140) {
     const text = String(value || "").replace(/\s+/g, " ").trim();
     if (!text) {
@@ -97,7 +661,11 @@
   }
 
   function usefulSourceName(value) {
-    const text = String(value || "").trim();
+    const text = String(value || "")
+      .replaceAll("闄勪欢", "附件")
+      .replaceAll("琛ㄥ崟", "表单")
+      .replaceAll("鍚堝悓椤", "合同页")
+      .trim();
     if (!text) {
       return "";
     }
@@ -277,28 +845,55 @@
     const sourceUrl = hasContractPage
       ? contract.sourceUrl || contractRef.sourceUrl || ""
       : contractRef.sourceUrl || contract.sourceUrl || "";
-    const rows = [];
+    const contractTypes = Array.isArray(summary.detectedContractTypes) ? summary.detectedContractTypes.filter(Boolean) : [];
+    const contractHints = [
+      ...(Array.isArray(summary.conflictHints) ? summary.conflictHints : []),
+      ...(Array.isArray(summary.restrictionHints) ? summary.restrictionHints : [])
+    ].filter(Boolean);
+    const paymentEvidence = Array.isArray(summary.paymentClauseEvidence) ? summary.paymentClauseEvidence.filter(Boolean).slice(0, 5) : [];
+    const termEvidence = Array.isArray(summary.termClauseEvidence) ? summary.termClauseEvidence.filter(Boolean).slice(0, 4) : [];
+    const invoiceGoodsType = extractInvoiceGoodsType(summary);
+    const paymentOverview = [
+      { label: "付款方式", value: summary.paymentMode },
+      { label: "付款条款摘要", value: summary.paymentTermsSummary || contractRef.paymentTerms },
+      { label: "验收条件", value: summary.acceptanceRequirement },
+      { label: "付款时限", value: summary.paymentDeadline },
+      { label: "分期安排", value: summary.installments },
+      { label: "金额上限", value: summary.capAmount },
+      { label: "账户变更要求", value: summary.accountChangeRequirement }
+    ];
+    const termOverview = [
+      { label: "合同期间", value: formatContractPeriod(contractRef.effectiveStart, contractRef.effectiveEnd) },
+      { label: "识别类型", value: contractTypes.join("、") },
+      { label: "条款提醒", value: contractHints.slice(0, 3).join("；") }
+    ];
+    const invoiceOverview = [
+      { label: "发票条件", value: summary.invoiceRequirement },
+      { label: "税率", value: summary.taxRate },
+      { label: "发票货物类型", value: invoiceGoodsType }
+    ];
+    const metaRows = buildKvRows([
+      { label: "合同来源", value: sourceName },
+      { label: "错误信息", value: summary.errorText }
+    ]);
 
-    pushKvRow(rows, "合同来源", sourceName);
-    pushKvRow(rows, "付款方式", summary.paymentMode);
-    pushKvRow(rows, "付款条款摘要", summary.paymentTermsSummary || contractRef.paymentTerms);
-    pushKvRow(rows, "验收条件", summary.acceptanceRequirement);
-    pushKvRow(rows, "发票条件", summary.invoiceRequirement);
-    pushKvRow(rows, "税率", summary.taxRate);
-    pushKvRow(rows, "付款时限", summary.paymentDeadline);
-    pushKvRow(rows, "分期安排", summary.installments);
-    pushKvRow(rows, "金额上限", summary.capAmount);
-    pushKvRow(rows, "账户变更要求", summary.accountChangeRequirement);
-    pushKvRow(rows, "错误信息", summary.errorText);
-
-    if (!rows.length && !sourceUrl) {
+    if (metaRows.length === 0 && !sourceUrl && paymentEvidence.length === 0 && termEvidence.length === 0) {
       return "";
     }
 
     return `
       <section class="oa-finance-rebuild-section">
         <div class="oa-finance-rebuild-section-title">合同摘要</div>
-        ${rows.join("")}
+        <div class="oa-finance-rebuild-contract-overview">
+          ${renderContractOverviewTheme("付款条件", paymentOverview, "暂未提取到明确付款条件。")}
+          ${renderContractOverviewTheme("合同期间", termOverview, "暂未提取到明确合同期间。")}
+          ${renderContractOverviewTheme("发票相关", invoiceOverview, "暂未提取到明确发票信息。")}
+        </div>
+        ${metaRows.length > 0 ? `<div class="oa-finance-rebuild-contract-meta">${metaRows.join("")}</div>` : ""}
+        <div class="oa-finance-rebuild-contract-evidence">
+          ${renderContractEvidenceTheme("付款条件", paymentEvidence, "暂未筛到高可信付款条款候选。")}
+          ${renderContractEvidenceTheme("合同期间", termEvidence, "暂未筛到高可信期限条款候选。")}
+        </div>
         ${
           sourceUrl
             ? `<div class="oa-finance-rebuild-link-row"><a href="${escapeHtml(sourceUrl)}" target="_blank" rel="noreferrer">打开合同来源</a></div>`
@@ -337,10 +932,13 @@
     }
 
     if (doc.kind === "acceptance") {
+      if (hasMeaningfulText(doc.fields?.mailSubject)) {
+        pushKvRow(rows, "邮件标题", summarizeDisplayText(doc.fields?.mailSubject, 180));
+      }
       if (Array.isArray(doc.attachmentNames) && doc.attachmentNames.length > 0) {
         pushKvRow(rows, "附件", summarizeDisplayText(doc.attachmentNames.join("、"), 180));
-      } else {
-        pushKvRow(rows, "附件", "已进入验收页，但暂未提取到附件");
+      } else if (!hasMeaningfulText(doc.fields?.mailSubject)) {
+        pushKvRow(rows, "邮件标题", "已进入验收页，但暂未提取到邮件标题");
       }
     }
 
@@ -510,15 +1108,138 @@
     if (!evidenceHtml && !pageSummaryHtml) {
       return "";
     }
+    return `<div class="oa-finance-rebuild-debug-body">${pageSummaryHtml}${evidenceHtml}</div>`;
+  }
 
+  function renderPlaceholderCard(text) {
     return `
-      <section class="oa-finance-rebuild-section">
-        <button class="oa-finance-rebuild-progress-toggle oa-finance-rebuild-debug-toggle" type="button" aria-expanded="${state.debugCollapsed ? "false" : "true"}">
-          <span class="oa-finance-rebuild-section-title">调试信息</span>
-          <span class="oa-finance-rebuild-progress-summary">${state.debugCollapsed ? "默认收起" : "已展开"}</span>
-          <span class="oa-finance-rebuild-progress-arrow ${state.debugCollapsed ? "" : "is-open"}">▾</span>
+      <div class="oa-finance-rebuild-panel-card">
+        <p class="oa-finance-rebuild-empty">${escapeHtml(text)}</p>
+      </div>
+    `;
+  }
+
+  function countRelatedDocuments(analysis) {
+    const related = analysis?.relatedDocuments || {};
+    let count = 0;
+    count += Array.isArray(related.domesticPrItems) ? related.domesticPrItems.length : related.domesticPr ? 1 : 0;
+    count += related.purchaseOrder ? 1 : 0;
+    count += Array.isArray(related.acceptanceItems) ? related.acceptanceItems.length : related.acceptance ? 1 : 0;
+    return count;
+  }
+
+  function getSectionSummary(sectionKey, analysis) {
+    if (sectionKey === "overview") {
+      if (state.isRunning) {
+        return "分析进行中";
+      }
+      if (state.analysis) {
+        return "主核对与诊断";
+      }
+      return PANEL_SECTIONS.overview.summaryWhenEmpty;
+    }
+
+    if (!analysis) {
+      return PANEL_SECTIONS[sectionKey]?.summaryWhenEmpty || "";
+    }
+
+    if (sectionKey === "related") {
+      const count = countRelatedDocuments(analysis);
+      return count > 0 ? `${count} 项关联单据` : "暂无关联单据";
+    }
+
+    if (sectionKey === "contract") {
+      return analysis.contractSummary ? "摘要与条款证据" : "暂无合同摘要";
+    }
+
+    if (sectionKey === "debug") {
+      return "页面来源与证据池";
+    }
+
+    return "";
+  }
+
+  function renderSectionContent(sectionKey, analysis, verificationHtml) {
+    if (sectionKey === "overview") {
+      return `
+        ${renderProgressSection()}
+        <section class="oa-finance-rebuild-section">
+          <div class="oa-finance-rebuild-section-title">三项主核对</div>
+          <div class="oa-finance-rebuild-results">
+            ${verificationHtml || "<p class='oa-finance-rebuild-empty'>点击“开始采集”后，这里会显示金额、收款公司、收款账号三项主核对。</p>"}
+          </div>
+        </section>
+        ${renderErrorSection()}
+      `;
+    }
+
+    if (sectionKey === "related") {
+      return analysis
+        ? renderRelatedDocumentsSection(analysis) || renderPlaceholderCard("暂未提取到可展示的关联单据。")
+        : renderPlaceholderCard("采集后会显示国内 PR、采购订单和验收单摘要。");
+    }
+
+    if (sectionKey === "contract") {
+      if (!analysis) {
+        return renderPlaceholderCard("采集后会显示合同摘要、条款证据与来源链接。");
+      }
+      return renderContractSummarySection(analysis) || renderPlaceholderCard("暂未提取到可展示的合同摘要或条款证据。");
+    }
+
+    if (sectionKey === "debug") {
+      if (!analysis) {
+        return renderPlaceholderCard("采集后会显示页面来源与证据池。");
+      }
+      return renderDebugSection(analysis) || renderPlaceholderCard("暂无可展示的调试信息。");
+    }
+
+    return "";
+  }
+
+  function renderRailButton(sectionKey, analysis) {
+    const section = PANEL_SECTIONS[sectionKey];
+    const isOpen = isSectionOpen(sectionKey);
+    const summary = getSectionSummary(sectionKey, analysis);
+    return `
+        <button
+          class="oa-finance-rebuild-rail-btn ${isOpen ? "is-open" : ""}"
+          type="button"
+          data-section-toggle="${escapeHtml(sectionKey)}"
+        aria-pressed="${isOpen ? "true" : "false"}"
+        title="${escapeHtml(`${section.label}：${summary}`)}"
+      >
+        <span class="oa-finance-rebuild-rail-btn-label">${escapeHtml(section.label)}</span>
+      </button>
+    `;
+  }
+
+  function renderPanelSection(sectionKey, analysis, verificationHtml) {
+    const section = PANEL_SECTIONS[sectionKey];
+    const isOpen = isSectionOpen(sectionKey);
+    const bodyId = `oa-finance-rebuild-section-${sectionKey}`;
+    const summary = getSectionSummary(sectionKey, analysis);
+    return `
+      <section class="oa-finance-rebuild-panel-section ${isOpen ? "" : "is-collapsed"}" data-panel-section="${escapeHtml(sectionKey)}">
+        <button
+          class="oa-finance-rebuild-panel-section-toggle"
+          type="button"
+          data-section-toggle="${escapeHtml(sectionKey)}"
+          aria-expanded="${isOpen ? "true" : "false"}"
+          aria-controls="${escapeHtml(bodyId)}"
+        >
+          <span class="oa-finance-rebuild-panel-section-copy">
+            <span class="oa-finance-rebuild-section-title">${escapeHtml(section.label)}</span>
+          </span>
+          <span class="oa-finance-rebuild-panel-section-summary">${escapeHtml(summary)}</span>
+          <span class="oa-finance-rebuild-progress-arrow ${isOpen ? "is-open" : ""}">▾</span>
         </button>
-        ${state.debugCollapsed ? "" : `<div class="oa-finance-rebuild-debug-body">${evidenceHtml}${pageSummaryHtml}</div>`}
+        ${
+          isOpen
+            ? `<div class="oa-finance-rebuild-panel-section-body" id="${escapeHtml(bodyId)}">
+                ${renderSectionContent(sectionKey, analysis, verificationHtml)}
+              </div>`
+            : ""
+        }
       </section>
     `;
   }
@@ -530,79 +1251,169 @@
     }
   }
 
-  function bindInteractions() {
-    root.querySelector(".oa-finance-rebuild-run")?.addEventListener("click", handleRun);
+  function handleRootClick(event) {
+    const eventEl = resolveEventElement(event.target);
+    if (!eventEl || !root.contains(eventEl)) {
+      return;
+    }
 
-    root.querySelector(".oa-finance-rebuild-main-progress-toggle")?.addEventListener("click", () => {
-      if (state.isRunning) {
-        return;
+    const runButton = eventEl.closest(".oa-finance-rebuild-run");
+    if (runButton) {
+      runAnalysisNow();
+      return;
+    }
+
+    const collapseAllButton = eventEl.closest(".oa-finance-rebuild-collapse-all");
+    if (collapseAllButton) {
+      collapseAllSections();
+      return;
+    }
+
+    const progressToggle = eventEl.closest(".oa-finance-rebuild-progress-toggle");
+    if (progressToggle) {
+      if (!state.isRunning) {
+        state.progressCollapsed = !state.progressCollapsed;
+        render();
       }
-      state.progressCollapsed = !state.progressCollapsed;
-      render();
-    });
+      return;
+    }
 
-    root.querySelector(".oa-finance-rebuild-debug-toggle")?.addEventListener("click", () => {
-      state.debugCollapsed = !state.debugCollapsed;
-      render();
-    });
+    const sectionToggle = eventEl.closest("[data-section-toggle]");
+    if (sectionToggle) {
+      toggleSection(sectionToggle.getAttribute("data-section-toggle") || "");
+      return;
+    }
 
-    root.querySelector(".oa-finance-rebuild-llm-toggle")?.addEventListener("click", () => {
-      state.llmPreviewCollapsed = !state.llmPreviewCollapsed;
-      render();
-    });
+    const sourceEl = eventEl.closest(".oa-finance-rebuild-result[data-source-url], .oa-finance-rebuild-clause[data-source-url]");
+    if (sourceEl && !eventEl.closest("a, button, summary")) {
+      openSourceFromElement(sourceEl);
+    }
+  }
 
-    root.querySelectorAll(".oa-finance-rebuild-result[data-source-url], .oa-finance-rebuild-clause[data-source-url]").forEach((element) => {
-      element.addEventListener("click", () => openSourceFromElement(element));
-      element.addEventListener("keydown", (event) => {
-        if (event.key !== "Enter" && event.key !== " ") {
-          return;
-        }
-        event.preventDefault();
-        openSourceFromElement(element);
-      });
-    });
+  function handleRootKeydown(event) {
+    const eventEl = resolveEventElement(event.target);
+    if (!eventEl || !root.contains(eventEl)) {
+      return;
+    }
+
+    if (event.key === "Escape") {
+      collapseAllSections();
+      return;
+    }
+
+    const sourceEl = eventEl.closest(".oa-finance-rebuild-result[data-source-url], .oa-finance-rebuild-clause[data-source-url]");
+    if (!sourceEl || (event.key !== "Enter" && event.key !== " ")) {
+      return;
+    }
+    if (eventEl.closest("a, button, summary")) {
+      return;
+    }
+    event.preventDefault();
+    openSourceFromElement(sourceEl);
+  }
+
+  function handleRootPointerDown(event) {
+    const eventEl = resolveEventElement(event.target);
+    if (!eventEl || !root.contains(eventEl)) {
+      return;
+    }
+
+    const resizeHandle = eventEl.closest(".oa-finance-rebuild-resize-handle");
+    if (resizeHandle) {
+      startPanelResize(event, resizeHandle);
+      return;
+    }
+
+    const dragHandle = eventEl.closest(".oa-finance-rebuild-drag-handle");
+    if (dragHandle) {
+      startPanelDrag(event, dragHandle);
+    }
+  }
+
+  function handleViewportResize() {
+    const previousWidth = state.panelWidth;
+    const previousTop = state.panelTop;
+    clampPanelUiState();
+    applyPanelLayout();
+    if (previousWidth !== state.panelWidth || previousTop !== state.panelTop) {
+      scheduleUiStatePersist();
+    }
+  }
+
+  function bindRootEvents() {
+    if (runtime.rootEventsBound) {
+      return;
+    }
+    root.addEventListener("click", handleRootClick);
+    root.addEventListener("keydown", handleRootKeydown);
+    root.addEventListener("pointerdown", handleRootPointerDown);
+    window.addEventListener("resize", handleViewportResize);
+    runtime.rootEventsBound = true;
   }
 
   function render() {
     const analysis = state.analysis;
     const verificationHtml = (analysis?.verificationItems || []).map((item) => renderVerificationItem(item)).join("");
+    const openCount = state.openSections.size;
+    const railButtonsHtml = PANEL_SECTION_ORDER.map((sectionKey) => renderRailButton(sectionKey, analysis)).join("");
+
+    if (isRailOnly()) {
+      root.innerHTML = `
+        <div class="oa-finance-rebuild-workspace oa-finance-rebuild-workspace-compact">
+          <div class="oa-finance-rebuild-rail-dock">
+            <button class="oa-finance-rebuild-rail-dock-grip oa-finance-rebuild-drag-handle" type="button" title="拖动面板位置" aria-label="拖动面板位置">•••</button>
+            <div class="oa-finance-rebuild-compact-nav" aria-label="详情区块快捷入口">
+              ${railButtonsHtml}
+            </div>
+          </div>
+        </div>
+      `;
+
+      applyPanelLayout();
+      return;
+    }
 
     root.innerHTML = `
-      <div class="oa-finance-rebuild-card">
-        <div class="oa-finance-rebuild-head">
-          <div>
-            <div class="oa-finance-rebuild-eyebrow">OA 付款审核</div>
-            <h1>重构版</h1>
+      <div class="oa-finance-rebuild-workspace">
+        <div class="oa-finance-rebuild-workbench">
+          <div class="oa-finance-rebuild-resize-handle" aria-hidden="true"></div>
+          <div class="oa-finance-rebuild-rail" aria-label="详情区块快捷入口">
+            ${railButtonsHtml}
           </div>
-          <div class="oa-finance-rebuild-badge">${escapeHtml(state.statusText)}</div>
-        </div>
-        <div class="oa-finance-rebuild-toolbar">
-          <button class="oa-finance-rebuild-run" type="button" ${state.isRunning ? "disabled" : ""}>
-            ${state.isRunning ? "分析中..." : "开始采集"}
-          </button>
-          <span class="oa-finance-rebuild-build">${escapeHtml(state.buildTag || "未连接")}</span>
-        </div>
-        <div class="oa-finance-rebuild-body">
-          ${renderProgressSection()}
-          <section class="oa-finance-rebuild-section">
-            <div class="oa-finance-rebuild-section-title">三项主核对</div>
-            <div class="oa-finance-rebuild-results">
-              ${verificationHtml || "<p class='oa-finance-rebuild-empty'>点击“开始采集”后，这里会显示金额、收款公司、收款账号三项主核对。</p>"}
+          <div class="oa-finance-rebuild-panel-shell" aria-hidden="${isRailOnly() ? "true" : "false"}">
+            <div class="oa-finance-rebuild-card">
+              <div class="oa-finance-rebuild-head">
+                <div class="oa-finance-rebuild-head-main">
+                  <div class="oa-finance-rebuild-head-copy">
+                    <div class="oa-finance-rebuild-eyebrow">OA 付款审核</div>
+                    <h1>重构版</h1>
+                  </div>
+                </div>
+                <div class="oa-finance-rebuild-head-side">
+                  <button class="oa-finance-rebuild-drag-handle" type="button" title="拖动面板位置">拖动</button>
+                  <div class="oa-finance-rebuild-badge">${escapeHtml(state.statusText)}</div>
+                  <button class="oa-finance-rebuild-collapse-all" type="button" ${openCount === 0 ? "disabled" : ""}>全部收起</button>
+                </div>
+              </div>
+              <div class="oa-finance-rebuild-toolbar">
+                <button class="oa-finance-rebuild-run" type="button" ${state.isRunning ? "disabled" : ""}>
+                  ${state.isRunning ? "分析中..." : "开始采集"}
+                </button>
+                <span class="oa-finance-rebuild-build">${escapeHtml(state.buildTag || "未连接")}</span>
+              </div>
+              <div class="oa-finance-rebuild-body">
+                ${PANEL_SECTION_ORDER.map((sectionKey) => renderPanelSection(sectionKey, analysis, verificationHtml)).join("")}
+              </div>
             </div>
-          </section>
-          ${analysis ? renderRelatedDocumentsSection(analysis) : ""}
-          ${renderErrorSection()}
-          ${analysis ? renderContractSummarySection(analysis) : ""}
-          ${analysis ? renderContractStatusSection(analysis) : ""}
-          ${analysis ? renderDebugSection(analysis) : ""}
+          </div>
         </div>
       </div>
     `;
 
-    bindInteractions();
+    applyPanelLayout();
   }
 
-  function handleRun() {
+  function runAnalysisNow() {
     const snapshot = collector.collectPageSnapshot();
     state.isRunning = true;
     state.analysis = null;
@@ -610,8 +1421,7 @@
     state.statusText = "准备开始";
     state.progressItems = [];
     state.progressCollapsed = false;
-    state.debugCollapsed = true;
-    state.llmPreviewCollapsed = true;
+    delete root.dataset.analysisJson;
     rememberProgress({ text: "准备开始", detail: "正在采集当前页面基础信息" });
     render();
 
@@ -619,26 +1429,25 @@
       state.isRunning = false;
 
       if (!chrome.runtime.lastError && response?.ok && response.result) {
-        state.analysis = response.result;
-        state.statusText = "已分析";
-        state.errorText = "";
-        rememberProgress({ text: "分析完成", detail: "已生成三项主核对、关联单据和合同参考信息" });
-      } else {
-        state.analysis = evidence.createPhaseOneAnalysis(snapshot, state.buildTag);
-        state.statusText = "已采集";
-        state.errorText =
-          chrome.runtime.lastError?.message ||
-          response?.error ||
-          "后台分析失败，当前仅展示页面采集结果。";
-        rememberProgress({ text: "分析失败", detail: state.errorText });
+        rememberProgress({ text: "分析完成", detail: "已生成主核对、关联摘要和合同参考信息" });
+        applyAnalysisResult(response.result, "已分析");
+        return;
       }
 
+      state.analysis = evidence.createPhaseOneAnalysis(snapshot, state.buildTag);
+      state.statusText = "已采集";
+      state.errorText =
+        chrome.runtime.lastError?.message ||
+        response?.error ||
+        "后台分析失败，当前仅展示页面采集结果。";
+      rememberProgress({ text: "分析失败", detail: state.errorText });
       state.progressCollapsed = true;
-      state.llmPreviewCollapsed = true;
       root.dataset.analysisJson = JSON.stringify(state.analysis);
       render();
     });
   }
+
+  bindRootEvents();
 
   chrome.runtime.onMessage.addListener((message) => {
     if (message?.type !== "oa-finance-rebuild-progress") {
@@ -658,4 +1467,9 @@
     }
     render();
   });
+  render();
+  loadUiState();
+  setTimeout(() => {
+    void tryLoadCachedAnalysis();
+  }, 0);
 })();

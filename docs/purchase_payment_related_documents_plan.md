@@ -25,9 +25,9 @@
 
 研究产物：
 
-- [tmp_purchase_finished_list_from_response.json](C:/Users/turui/Documents/Playground_oa_finance_rebuild/tmp_purchase_finished_list_from_response.json)
-- [tmp_five_done_purchase_payment_details_api.json](C:/Users/turui/Documents/Playground_oa_finance_rebuild/tmp_five_done_purchase_payment_details_api.json)
-- [tmp_five_done_related_details_api.json](C:/Users/turui/Documents/Playground_oa_finance_rebuild/tmp_five_done_related_details_api.json)
+- `tmp_purchase_finished_list_from_response.json`
+- `tmp_five_done_purchase_payment_details_api.json`
+- `tmp_five_done_related_details_api.json`
 
 ## 研究结论
 
@@ -381,13 +381,13 @@
 ### 1. 先从付款单 `flowFormData` 提关系
 不要先靠 DOM 链接抓。
 
-建议在 [detail.js](C:/Users/turui/Documents/Playground_oa_finance_rebuild/oa_finance_audit_rebuild_extension/bg/detail.js) 新增或整理：
+建议在 [detail.js](C:/Users/turui/Documents/OA_Payment_Audit_Rebuild_Project/oa_finance_audit_rebuild_extension/bg/detail.js) 新增或整理：
 
 - `extractPaymentRelationRows(detail)`
 - `normalizePaymentRelationRow(row, relationType)`
 
 ### 2. 国内PR走“展示提取”而不是“规则判断”
-建议在 [analyzer.js](C:/Users/turui/Documents/Playground_oa_finance_rebuild/oa_finance_audit_rebuild_extension/bg/analyzer.js) 中，将 PR 分析定位为：
+建议在 [analyzer.js](C:/Users/turui/Documents/OA_Payment_Audit_Rebuild_Project/oa_finance_audit_rebuild_extension/bg/analyzer.js) 中，将 PR 分析定位为：
 
 - 抓到详情页
 - 提取 `部门 / 项目 / 用途 / PR金额`

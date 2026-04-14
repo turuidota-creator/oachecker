@@ -83,7 +83,7 @@
 
 具体规则见：
 
-- [invoice_detection_rules.md](C:/Users/turui/Documents/Playground_oa_finance_rebuild/invoice_detection_rules.md)
+- [invoice_detection_rules.md](C:/Users/turui/Documents/OA_Payment_Audit_Rebuild_Project/docs/invoice_detection_rules.md)
 
 ## 5. 模块划分
 
@@ -91,7 +91,7 @@
 
 文件：
 
-- [page/collector.js](C:/Users/turui/Documents/Playground_oa_finance_rebuild/oa_finance_audit_rebuild_extension/page/collector.js)
+- [page/collector.js](C:/Users/turui/Documents/OA_Payment_Audit_Rebuild_Project/oa_finance_audit_rebuild_extension/page/collector.js)
 
 职责：
 
@@ -108,7 +108,7 @@
 
 文件：
 
-- [bg/detail.js](C:/Users/turui/Documents/Playground_oa_finance_rebuild/oa_finance_audit_rebuild_extension/bg/detail.js)
+- [bg/detail.js](C:/Users/turui/Documents/OA_Payment_Audit_Rebuild_Project/oa_finance_audit_rebuild_extension/bg/detail.js)
 
 职责：
 
@@ -126,7 +126,7 @@
 
 文件：
 
-- [bg/io.js](C:/Users/turui/Documents/Playground_oa_finance_rebuild/oa_finance_audit_rebuild_extension/bg/io.js)
+- [bg/io.js](C:/Users/turui/Documents/OA_Payment_Audit_Rebuild_Project/oa_finance_audit_rebuild_extension/bg/io.js)
 
 职责：
 
@@ -142,7 +142,7 @@
 
 文件：
 
-- [bg/extract.js](C:/Users/turui/Documents/Playground_oa_finance_rebuild/oa_finance_audit_rebuild_extension/bg/extract.js)
+- [bg/extract.js](C:/Users/turui/Documents/OA_Payment_Audit_Rebuild_Project/oa_finance_audit_rebuild_extension/bg/extract.js)
 
 职责：
 
@@ -160,7 +160,7 @@
 
 文件：
 
-- [bg/common.js](C:/Users/turui/Documents/Playground_oa_finance_rebuild/oa_finance_audit_rebuild_extension/bg/common.js)
+- [bg/common.js](C:/Users/turui/Documents/OA_Payment_Audit_Rebuild_Project/oa_finance_audit_rebuild_extension/bg/common.js)
 
 职责：
 
@@ -178,7 +178,7 @@
 
 文件：
 
-- [bg/analyzer.js](C:/Users/turui/Documents/Playground_oa_finance_rebuild/oa_finance_audit_rebuild_extension/bg/analyzer.js)
+- [bg/analyzer.js](C:/Users/turui/Documents/OA_Payment_Audit_Rebuild_Project/oa_finance_audit_rebuild_extension/bg/analyzer.js)
 
 职责：
 
@@ -194,33 +194,29 @@
 - 已接入合同摘要 MVP
 - 当前重点是继续补强“合同附件读全”“付款条件提取”和“更安全的外发边界”
 
-### 5.7 合同摘要与脱敏层
+### 5.7 合同摘要与条款提取层
 
 文件：
 
-- [bg/contract_terms.js](C:/Users/turui/Documents/Playground_oa_finance_rebuild/oa_finance_audit_rebuild_extension/bg/contract_terms.js)
-- [bg/contract_llm.js](C:/Users/turui/Documents/Playground_oa_finance_rebuild/oa_finance_audit_rebuild_extension/bg/contract_llm.js)
+- [bg/contract_terms.js](C:/Users/turui/Documents/OA_Payment_Audit_Rebuild_Project/oa_finance_audit_rebuild_extension/bg/contract_terms.js)
 
 职责：
 
 - 本地筛付款相关候选条款
 - 本地提取轻量合同摘要
-- 对外发条款做缩范围与脱敏
-- 调用外部模型生成展示摘要
-- 把脱敏 token 在本地还原成前端展示值
+- 输出付款条件、合同期限等可展示结果
 
 当前状态：
 
-- MVP 已接通
-- 现在是“脱敏后条款片段外发”
-- 不是最终保密方案
+- 当前只保留本地规则链路
+- 外部模型分支已停用并清理
 
 ### 5.8 前端展示层
 
 文件：
 
-- [content.js](C:/Users/turui/Documents/Playground_oa_finance_rebuild/oa_finance_audit_rebuild_extension/content.js)
-- [styles.css](C:/Users/turui/Documents/Playground_oa_finance_rebuild/oa_finance_audit_rebuild_extension/styles.css)
+- [content.js](C:/Users/turui/Documents/OA_Payment_Audit_Rebuild_Project/oa_finance_audit_rebuild_extension/content.js)
+- [styles.css](C:/Users/turui/Documents/OA_Payment_Audit_Rebuild_Project/oa_finance_audit_rebuild_extension/styles.css)
 
 职责：
 
@@ -275,7 +271,7 @@
 
 文件：
 
-- [test_rebuild_single_case.py](C:/Users/turui/Documents/Playground_oa_finance_rebuild/test_rebuild_single_case.py)
+- [test_rebuild_single_case.py](C:/Users/turui/Documents/OA_Payment_Audit_Rebuild_Project/scripts/test_rebuild_single_case.py)
 
 ### 6.5 合同摘要 MVP
 
@@ -283,22 +279,10 @@
 
 1. 本地从合同页 / 合同附件里筛付款相关候选条款
 2. 候选条款优先收缩成“付款关键词句子窗口”
-3. 发送给模型前会做脱敏
-4. 前端会显示：
+3. 前端会显示：
    - 摘要状态
-   - 大模型发送状态
-   - 发送说明
-   - 发送预览（脱敏后，默认收起）
-
-当前模型：
-
-- `Qwen/Qwen2.5-32B-Instruct`
-- 接口：`https://api.siliconflow.cn/v1/chat/completions`
-
-当前保密级别判断：
-
-- 适合内部试跑
-- 不适合定义成最终严格保密方案
+   - 合同处理状态
+   - 条款证据与摘要结果
 
 ## 7. 当前未完成项
 
@@ -337,17 +321,17 @@
 
 - 保持轻量，不打算把验收做成复杂语义判断
 
-### 7.4 合同摘要外发安全
+### 7.4 合同摘要本地化稳定性
 
 现状：
 
-- 已经从“直接发大段原文”明显收紧
-- 但当前仍然会发送“脱敏后的条款片段”
+- 外部模型分支已停用
+- 当前合同摘要完全走本地规则链路
 
 下一步：
 
-- 逐步过渡到“只外发结构化 facts，不外发原始条款文本”
-- 到那一步，外部模型只做展示润色，不再看到合同原句
+- 继续提高条款召回与摘要稳定性
+- 继续减少无关段落误入候选池
 
 ## 8. 验收标准
 

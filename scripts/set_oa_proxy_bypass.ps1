@@ -20,6 +20,11 @@ $requiredItems = @(
   "<local>"
 )
 
+$requiredDirectRules = @(
+  ".cyou-inc.com direct",
+  "ai.cy.com direct"
+)
+
 $merged = [System.Collections.Generic.List[string]]::new()
 foreach ($item in @($existingItems + $requiredItems)) {
   if (-not $item) {
@@ -32,6 +37,70 @@ foreach ($item in @($existingItems + $requiredItems)) {
 
 $proxyOverride = $merged -join ";"
 Set-ItemProperty -Path $regPath -Name ProxyOverride -Value $proxyOverride
+
+function Get-SsrRuleFiles {
+  $ruleFiles = [System.Collections.Generic.List[string]]::new()
+  $candidateDirs = [System.Collections.Generic.List[string]]::new()
+
+  Get-Process | Where-Object { $_.ProcessName -like 'ShadowsocksR-dotnet*' -and $_.Path } | ForEach-Object {
+    $dir = Split-Path -Parent $_.Path
+    foreach ($candidateDir in @($dir, (Split-Path -Parent $dir))) {
+      if (-not $candidateDir) {
+        continue
+      }
+      if (-not (Test-Path $candidateDir)) {
+        continue
+      }
+      if (-not $candidateDirs.Contains($candidateDir)) {
+        $candidateDirs.Add($candidateDir)
+      }
+    }
+  }
+
+  foreach ($dir in $candidateDirs) {
+    $rulePath = Join-Path $dir "user.rule"
+    if ((Test-Path $rulePath) -and (-not $ruleFiles.Contains($rulePath))) {
+      $ruleFiles.Add($rulePath)
+    }
+  }
+
+  return $ruleFiles
+}
+
+function Update-SsrUserRule {
+  param(
+    [string]$RulePath
+  )
+
+  $existingLines = @()
+  if (Test-Path $RulePath) {
+    $existingLines = Get-Content $RulePath
+  }
+
+  $missingRules = @()
+  foreach ($rule in $requiredDirectRules) {
+    if (-not ($existingLines | Where-Object { $_.Trim() -eq $rule })) {
+      $missingRules += $rule
+    }
+  }
+
+  if (-not $missingRules) {
+    Write-Host "SSR rule file already contains OA direct rules: $RulePath"
+    return
+  }
+
+  Add-Content -Path $RulePath -Value ""
+  Add-Content -Path $RulePath -Value "# OA internal direct rules"
+  foreach ($rule in $missingRules) {
+    Add-Content -Path $RulePath -Value $rule
+  }
+
+  Write-Host "Updated SSR user.rule: $RulePath"
+}
+
+foreach ($rulePath in Get-SsrRuleFiles) {
+  Update-SsrUserRule -RulePath $rulePath
+}
 
 Add-Type @"
 using System;

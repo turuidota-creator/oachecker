@@ -25,6 +25,8 @@
     rowStates: new Map(),
     requestMap: new Map(),
     rowMetaCache: new Map(),
+    cacheHydratedCodes: new Set(),
+    cacheLoadingCodes: new Set(),
     batchRunning: false,
     refreshTimer: null,
     observer: null,
@@ -33,6 +35,24 @@
     popoverCode: "",
     activeTableEl: null
   };
+
+  function isManagedUiNode(node) {
+    if (!node || node.nodeType !== Node.ELEMENT_NODE) {
+      return false;
+    }
+    return !!node.closest(`.oa-finance-auto-review-popover, .oa-finance-auto-review-toolbar, .oa-finance-auto-review-cell, [${AUTO_REVIEW_COL_ATTR}]`);
+  }
+
+  function shouldIgnoreMutation(record) {
+    const target = record?.target;
+    if (isManagedUiNode(target)) {
+      return true;
+    }
+    const added = Array.from(record?.addedNodes || []);
+    const removed = Array.from(record?.removedNodes || []);
+    const touchedNodes = [...added, ...removed].filter((node) => node?.nodeType === Node.ELEMENT_NODE);
+    return touchedNodes.length > 0 && touchedNodes.every((node) => isManagedUiNode(node));
+  }
 
   function escapeHtml(value) {
     return String(value || "")
@@ -44,6 +64,16 @@
 
   function cleanText(value) {
     return String(value || "").replace(/\s+/g, " ").trim();
+  }
+
+  function firstNonEmpty(...values) {
+    for (const value of values) {
+      const normalized = cleanText(value);
+      if (normalized) {
+        return normalized;
+      }
+    }
+    return "";
   }
 
   function debounceRefresh() {
@@ -180,6 +210,55 @@
   function createRequestId(processCode) {
     const suffix = Math.random().toString(16).slice(2, 8);
     return `${processCode}-${Date.now()}-${suffix}`;
+  }
+
+  function applyCachedEntryToRow(processCode, entry) {
+    if (!entry?.result) {
+      return;
+    }
+    const current = ensureRowState(processCode);
+    if (current.requestId) {
+      return;
+    }
+    patchRowState(processCode, {
+      status: mapOverallStatus(entry.result?.overallStatus, ""),
+      result: entry.result,
+      errorText: "",
+      detailUrl: cleanText(current.detailUrl || entry.detailUrl || ""),
+      updatedAt: entry.cachedAt ? new Date(entry.cachedAt).toISOString() : current.updatedAt
+    });
+  }
+
+  async function hydrateRowsFromCache(processCodes) {
+    const pendingCodes = Array.from(new Set((processCodes || []).map((item) => cleanText(item)).filter(Boolean))).filter((code) => {
+      if (state.cacheHydratedCodes.has(code) || state.cacheLoadingCodes.has(code)) {
+        return false;
+      }
+      state.cacheLoadingCodes.add(code);
+      return true;
+    });
+    if (pendingCodes.length === 0) {
+      return;
+    }
+
+    try {
+      const response = await sendRuntimeMessage({
+        type: "oa-finance-rebuild-get-cache-bulk",
+        processCodes: pendingCodes
+      });
+      if (response?.ok && Array.isArray(response.entries)) {
+        for (const entry of response.entries) {
+          applyCachedEntryToRow(cleanText(entry?.processCode), entry);
+        }
+      }
+    } catch (_error) {
+      // Ignore cache hydration failures and keep the table interactive.
+    } finally {
+      for (const code of pendingCodes) {
+        state.cacheLoadingCodes.delete(code);
+        state.cacheHydratedCodes.add(code);
+      }
+    }
   }
 
   function mapOverallStatus(overallStatus, errorText) {
@@ -437,7 +516,7 @@
   function renderStatusButton(processCode) {
     const rowState = ensureRowState(processCode);
     const meta = statusMetaOf(processCode);
-    const canOpen = !!rowState.result || !!rowState.errorText;
+    const canOpen = !!rowState.result || !!rowState.errorText || finishedStatus(rowState.status);
     const titleText = rowState.errorText || rowState.progressText || meta.label;
     const buttonLabel =
       rowState.status === "reading" || rowState.status === "analyzing" ? formatRunningLabel(rowState) : meta.label;
@@ -455,6 +534,26 @@
     `;
   }
 
+  async function handleTriggerActivate(processCode, triggerEl, event = null) {
+    if (event) {
+      event.preventDefault();
+      event.stopPropagation();
+    }
+    const normalized = cleanText(processCode).toUpperCase();
+    if (!normalized) {
+      return;
+    }
+    const rowState = ensureRowState(normalized);
+    if (rowState.status === "reading" || rowState.status === "analyzing") {
+      return;
+    }
+    if (finishedStatus(rowState.status) || rowState.result || rowState.errorText) {
+      await openPopoverWhenReady(normalized, triggerEl);
+      return;
+    }
+    void auditProcessCode(normalized);
+  }
+
   function ensureBodyCell(rowEl, processCode, bodyTable) {
     ensureAuditColgroup(bodyTable);
     let cell = rowEl.querySelector(`td[${AUTO_REVIEW_COL_ATTR}]`);
@@ -467,6 +566,12 @@
     cell.style.width = AUTO_REVIEW_WIDTH;
     cell.style.minWidth = AUTO_REVIEW_WIDTH;
     cell.innerHTML = `<div class="cell oa-finance-auto-review-cell-inner">${renderStatusButton(processCode)}</div>`;
+    const triggerEl = cell.querySelector(".oa-finance-auto-review-trigger");
+    if (triggerEl) {
+      triggerEl.onclick = (event) => {
+        void handleTriggerActivate(processCode, triggerEl, event);
+      };
+    }
   }
 
   function formatStatusText(status) {
@@ -565,17 +670,65 @@
       return "";
     }
     const title = prettifySourceName(sourceName, url) || label;
-    return `<a class="oa-finance-auto-review-inline-link" href="${escapeHtml(url)}" target="_blank" rel="noreferrer">${escapeHtml(
-      label
-    )}</a><span class="oa-finance-auto-review-inline-hint">${escapeHtml(title)}</span>`;
+    return `<a class="oa-finance-auto-review-inline-link" href="${escapeHtml(url)}" target="_blank" rel="noreferrer" title="${escapeHtml(
+      title
+    )}" aria-label="${escapeHtml(title)}">${escapeHtml(label)}</a>`;
   }
 
-  function joinMeaningfulTexts(values, limit = 3) {
+  function joinMeaningfulTexts(values, limit = 3, separator = "；") {
     return (values || [])
       .map((item) => cleanText(item))
       .filter(Boolean)
       .slice(0, limit)
-      .join("；");
+      .join(separator);
+  }
+
+  function renderValueBlock(text, lines = 3) {
+    const cleaned = cleanText(text);
+    if (!cleaned) {
+      return "";
+    }
+    if (cleaned.length <= 96) {
+      return `<div class="oa-finance-auto-review-related-text">${escapeHtml(cleaned)}</div>`;
+    }
+    return renderExpandableText(cleaned, lines);
+  }
+
+  function renderRelatedCard(title, contentHtml, actionsHtml = "") {
+    if (!contentHtml && !actionsHtml) {
+      return "";
+    }
+    return `
+      <div class="oa-finance-auto-review-related-card">
+        <div class="oa-finance-auto-review-related-head">
+          <strong>${escapeHtml(title)}</strong>
+        </div>
+        <div class="oa-finance-auto-review-related-body">${contentHtml || ""}</div>
+        ${actionsHtml ? `<div class="oa-finance-auto-review-inline-actions">${actionsHtml}</div>` : ""}
+      </div>
+    `;
+  }
+
+  function renderExpandableText(text, lines = 4) {
+    const cleaned = cleanText(text);
+    if (!cleaned) {
+      return "";
+    }
+    if (cleaned.length <= 120) {
+      return `<div class="oa-finance-auto-review-related-text">${escapeHtml(cleaned)}</div>`;
+    }
+    return `
+      <div class="oa-finance-auto-review-expandable-wrap">
+        <div class="oa-finance-auto-review-related-text is-clamped" style="-webkit-line-clamp:${Number(lines) || 4};">${escapeHtml(cleaned)}</div>
+        <details class="oa-finance-auto-review-expandable">
+          <summary>
+            <span class="oa-finance-auto-review-expand-closed">展开</span>
+            <span class="oa-finance-auto-review-expand-open">收起</span>
+          </summary>
+          <div class="oa-finance-auto-review-related-text is-full">${escapeHtml(cleaned)}</div>
+        </details>
+      </div>
+    `;
   }
 
   function renderVerificationSummary(result) {
@@ -592,13 +745,15 @@
           return `
           <div class="oa-finance-auto-review-check">
             <div class="oa-finance-auto-review-check-head">
-              <strong>${escapeHtml(label)}</strong>
-              <span class="oa-finance-auto-review-mini-pill is-${escapeHtml(item?.status || "warn")}">${escapeHtml(
-                formatStatusText(item?.status)
-              )}</span>
+              <div class="oa-finance-auto-review-check-title">${escapeHtml(label)}</div>
+              <div class="oa-finance-auto-review-check-actions">
+                ${sourceAction || ""}
+                <span class="oa-finance-auto-review-mini-pill is-${escapeHtml(item?.status || "warn")}">${escapeHtml(
+                  formatStatusText(item?.status)
+                )}</span>
+              </div>
             </div>
             <div class="oa-finance-auto-review-check-text">${escapeHtml(statement)}</div>
-            ${sourceAction ? `<div class="oa-finance-auto-review-inline-actions">${sourceAction}</div>` : ""}
           </div>
         `;
         }
@@ -618,17 +773,19 @@
     const domesticText = domesticItems
       .map((item, index) => {
         const summary = cleanText(item?.fields?.requirementSummary || item?.summary);
-        return summary ? `PR ${index + 1}: ${summary}` : "";
+        return summary
+          ? `
+            <div class="oa-finance-auto-review-pr-block">
+              <div class="oa-finance-auto-review-pr-title">PR ${index + 1}</div>
+              ${renderExpandableText(summary, 4)}
+            </div>
+          `
+          : "";
       })
       .filter(Boolean)
-      .join("；");
+      .join("");
     if (domesticText) {
-      blocks.push(`
-        <div class="oa-finance-auto-review-related-item">
-          <strong>国内PR</strong>
-          <div>${escapeHtml(domesticText)}</div>
-        </div>
-      `);
+      blocks.push(renderRelatedCard("国内PR", domesticText));
     }
 
     const purchaseOrder = related.purchaseOrder;
@@ -643,21 +800,15 @@
         2
       );
       const description = cleanText(purchaseOrder.fields?.description);
-      blocks.push(`
-        <div class="oa-finance-auto-review-related-item">
-          <strong>采购订单</strong>
-          <div title="${escapeHtml(description || "未提取到订单内容描述")}">${escapeHtml(compactText || "已读取采购订单")}</div>
-          ${
-            purchaseOrder.sourceUrl
-              ? `<div class="oa-finance-auto-review-inline-actions">${renderSourceAction(
-                  purchaseOrder.sourceName,
-                  purchaseOrder.sourceUrl,
-                  "打开订单"
-                )}</div>`
-              : ""
-          }
-        </div>
-      `);
+      blocks.push(
+        renderRelatedCard(
+          "采购订单",
+          `<div class="oa-finance-auto-review-related-summary" title="${escapeHtml(
+            description || "未提取到订单内容描述"
+          )}">${escapeHtml(compactText || "已读取采购订单")}</div>`,
+          purchaseOrder.sourceUrl ? renderSourceAction(purchaseOrder.sourceName, purchaseOrder.sourceUrl, "打开订单") : ""
+        )
+      );
     }
 
     const acceptanceItems = Array.isArray(related.acceptanceItems)
@@ -666,16 +817,18 @@
         ? [related.acceptance]
         : [];
     const acceptanceText = acceptanceItems
-      .map((item) => joinMeaningfulTexts(item?.attachmentNames || item?.previewItems?.map((preview) => preview?.name), 4))
+      .map((item) =>
+        firstNonEmpty(
+          item?.fields?.mailSubject,
+          joinMeaningfulTexts(item?.attachmentNames, 4),
+          joinMeaningfulTexts(item?.mailAttachmentNames, 4),
+          joinMeaningfulTexts(item?.previewItems?.map((preview) => preview?.name), 4)
+        )
+      )
       .filter(Boolean)
       .join("；");
     if (acceptanceText) {
-      blocks.push(`
-        <div class="oa-finance-auto-review-related-item">
-          <strong>验收单</strong>
-          <div>${escapeHtml(acceptanceText)}</div>
-        </div>
-      `);
+      blocks.push(renderRelatedCard("验收单", renderValueBlock(acceptanceText, 3)));
     }
 
     const contractSource = cleanText(result?.contractReference?.sourceName);
@@ -683,22 +836,27 @@
     const contractSummary = cleanText(
       result?.contractSummary?.paymentTermsSummary || result?.contractReference?.paymentTerms
     );
-    if (contractSource || contractSummary || contractSourceUrl) {
-      blocks.push(`
-        <div class="oa-finance-auto-review-related-item">
-          <strong>合同摘要</strong>
-          <div>${escapeHtml(contractSummary || "已读取合同信息")}</div>
-          ${
-            contractSourceUrl
-              ? `<div class="oa-finance-auto-review-inline-actions">${renderSourceAction(
-                  contractSource,
-                  contractSourceUrl,
-                  "打开合同来源"
-                )}</div>`
-              : ""
-          }
-        </div>
-      `);
+    const contractPeriod = joinMeaningfulTexts(
+      [
+        cleanText(result?.contractReference?.effectiveStart),
+        cleanText(result?.contractReference?.effectiveEnd)
+      ],
+      2,
+      " ~ "
+    );
+    const contractText =
+      contractSummary ||
+      (contractPeriod ? `合同期间：${contractPeriod}` : "") ||
+      (contractSource ? `合同来源：${contractSource}` : "") ||
+      (contractSourceUrl ? "已读取合同信息" : "");
+    if (contractSource || contractText || contractSourceUrl) {
+      blocks.push(
+        renderRelatedCard(
+          "付款条件",
+          renderValueBlock(contractText || "已读取合同信息", 3),
+          contractSourceUrl ? renderSourceAction(contractSource, contractSourceUrl, "打开合同来源") : ""
+        )
+      );
     }
 
     if (blocks.length === 0) {
@@ -717,7 +875,8 @@
     if (rowState.errorText) {
       return `
         <div class="oa-finance-auto-review-popover-head">
-          <div>
+          <div class="oa-finance-auto-review-popover-title-wrap">
+            <div class="oa-finance-auto-review-popover-kicker">自动审核结果</div>
             <div class="oa-finance-auto-review-popover-code">${escapeHtml(processCode)}</div>
             <div class="oa-finance-auto-review-popover-status is-${meta.tone}">${escapeHtml(meta.label)}</div>
           </div>
@@ -734,7 +893,8 @@
     if (!result) {
       return `
         <div class="oa-finance-auto-review-popover-head">
-          <div>
+          <div class="oa-finance-auto-review-popover-title-wrap">
+            <div class="oa-finance-auto-review-popover-kicker">自动审核结果</div>
             <div class="oa-finance-auto-review-popover-code">${escapeHtml(processCode)}</div>
             <div class="oa-finance-auto-review-popover-status is-${meta.tone}">${escapeHtml(meta.label)}</div>
           </div>
@@ -748,7 +908,8 @@
 
     return `
       <div class="oa-finance-auto-review-popover-head">
-        <div>
+        <div class="oa-finance-auto-review-popover-title-wrap">
+          <div class="oa-finance-auto-review-popover-kicker">自动审核结果</div>
           <div class="oa-finance-auto-review-popover-code">${escapeHtml(processCode)}</div>
           <div class="oa-finance-auto-review-popover-status is-${meta.tone}">${escapeHtml(meta.label)}</div>
         </div>
@@ -785,13 +946,21 @@
     state.popoverCode = "";
   }
 
+  function finishedStatus(status) {
+    return status === "pass" || status === "warn" || status === "fail" || status === "error";
+  }
+
   function showPopover(processCode, anchorEl) {
     const popover = ensurePopover();
     popover.innerHTML = renderPopoverBody(processCode);
     popover.hidden = false;
     state.popoverCode = processCode;
 
-    const anchorRect = anchorEl.getBoundingClientRect();
+    const liveAnchor =
+      anchorEl && anchorEl.isConnected ? anchorEl : findTriggerByProcessCode(processCode) || anchorEl || null;
+    const anchorRect = liveAnchor
+      ? liveAnchor.getBoundingClientRect()
+      : { left: window.innerWidth - 180, top: 120 };
     const popoverRect = popover.getBoundingClientRect();
     const preferredLeft = anchorRect.left - popoverRect.width - 14;
     const fallbackLeft = window.innerWidth - popoverRect.width - 24;
@@ -807,6 +976,39 @@
 
   function openPopover(processCode, anchorEl) {
     showPopover(processCode, anchorEl);
+  }
+
+  async function openPopoverWhenReady(processCode, anchorEl) {
+    const current = ensureRowState(processCode);
+    if (current.result || current.errorText) {
+      openPopover(processCode, anchorEl);
+      return;
+    }
+
+    await hydrateRowsFromCache([processCode]);
+    const afterCache = ensureRowState(processCode);
+    if (afterCache.result || afterCache.errorText) {
+      openPopover(processCode, anchorEl);
+      return;
+    }
+
+    if (finishedStatus(afterCache.status)) {
+      patchRowState(processCode, {
+        status: "error",
+        errorText: "审核状态已完成，但未取到可展示的结果，请重试一次。"
+      });
+      openPopover(processCode, anchorEl);
+    }
+  }
+
+  function resolveEventElement(target) {
+    if (!target) {
+      return null;
+    }
+    if (target.nodeType === Node.ELEMENT_NODE) {
+      return target;
+    }
+    return target.parentElement || null;
   }
 
   async function auditProcessCode(processCode) {
@@ -914,21 +1116,26 @@
 
   function ensureToolbar(context) {
     let toolbar = context.wrapper.querySelector(".oa-finance-auto-review-toolbar");
+    const toolbarInnerHtml = `
+      <div class="oa-finance-auto-review-toolbar-copy">
+        <strong>自动审核</strong>
+        <span class="oa-finance-auto-review-toolbar-note"></span>
+      </div>
+      <button type="button" class="oa-finance-auto-review-toolbar-btn"></button>
+    `;
     if (!toolbar) {
       toolbar = document.createElement("div");
       toolbar.className = "oa-finance-auto-review-toolbar";
-      toolbar.innerHTML = `
-        <div class="oa-finance-auto-review-toolbar-copy">
-          <strong>自动审核</strong>
-          <span class="oa-finance-auto-review-toolbar-note"></span>
-        </div>
-        <button type="button" class="oa-finance-auto-review-toolbar-btn"></button>
-      `;
+      toolbar.innerHTML = toolbarInnerHtml;
       context.tableEl.parentElement?.insertBefore(toolbar, context.tableEl);
     }
-
-    const noteEl = toolbar.querySelector(".oa-finance-auto-review-toolbar-note");
-    const buttonEl = toolbar.querySelector(".oa-finance-auto-review-toolbar-btn");
+    let noteEl = toolbar.querySelector(".oa-finance-auto-review-toolbar-note");
+    let buttonEl = toolbar.querySelector(".oa-finance-auto-review-toolbar-btn");
+    if (!noteEl || !buttonEl) {
+      toolbar.innerHTML = toolbarInnerHtml;
+      noteEl = toolbar.querySelector(".oa-finance-auto-review-toolbar-note");
+      buttonEl = toolbar.querySelector(".oa-finance-auto-review-toolbar-btn");
+    }
     const processCodes = context.rowInfos.map((item) => item.processCode);
     if (noteEl) {
       noteEl.textContent = `当前页 ${processCodes.length} 条付款单`;
@@ -965,6 +1172,7 @@
     ensureToolbar(context);
     ensureHeaderCell(context.headerTable);
     context.rowInfos.forEach((item) => ensureBodyCell(item.rowEl, item.processCode, context.bodyTable));
+    void hydrateRowsFromCache(context.rowInfos.map((item) => item.processCode));
     if (state.popover && !state.popover.hidden && state.popoverCode) {
       const anchor = findTriggerByProcessCode(state.popoverCode);
       if (anchor) {
@@ -976,9 +1184,7 @@
   }
 
   function findTriggerByProcessCode(processCode) {
-    return document.querySelector(
-      `.oa-finance-auto-review-trigger[data-process-code="${CSS.escape(processCode)}"]`
-    );
+    return document.querySelector(`.oa-finance-auto-review-trigger[data-process-code="${CSS.escape(processCode)}"]`);
   }
 
   function handleProgressMessage(message) {
@@ -1004,31 +1210,19 @@
   }
 
   function handleDocumentClick(event) {
-    const trigger = event.target.closest(".oa-finance-auto-review-trigger");
-    if (trigger) {
-      event.preventDefault();
-      event.stopPropagation();
-      const processCode = cleanText(trigger.dataset.processCode).toUpperCase();
-      const rowState = ensureRowState(processCode);
-      if (rowState.status === "reading" || rowState.status === "analyzing") {
-        return;
-      }
-      if (rowState.result || rowState.errorText) {
-        openPopover(processCode, trigger);
-        return;
-      }
-      void auditProcessCode(processCode);
-      return;
-    }
-
-    if (state.popover && !state.popover.hidden && !event.target.closest(".oa-finance-auto-review-popover")) {
+    const eventEl = resolveEventElement(event.target);
+    if (state.popover && !state.popover.hidden && !eventEl?.closest?.(".oa-finance-auto-review-popover")) {
       hidePopover();
     }
   }
 
   function mount() {
     debounceRefresh();
-    state.observer = new MutationObserver(() => {
+    state.observer = new MutationObserver((records) => {
+      const meaningful = (records || []).some((record) => !shouldIgnoreMutation(record));
+      if (!meaningful) {
+        return;
+      }
       debounceRefresh();
     });
     state.observer.observe(document.body, {
