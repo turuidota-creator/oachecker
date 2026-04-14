@@ -19,6 +19,60 @@ const ANCHOR_TAG_RE = /<a[^>]+href=["'](?<url>https?:\/\/[^"']+)["'][^>]*>(?<lab
 const PROCESS_LINK_RE =
   /(?:(?:https?:\/\/(?:oa|workflow)\.cyou-inc\.com)?\/workflow\/process\/(?:detail\/\d+(?:\?[^"'\\s<>]*)?|history\/detail\/\d+\/monitor(?:\?[^"'\\s<>]*)?|history\/detail\/\d+\/link\/\d+(?:\?[^"'\\s<>]*)?)|(?:https?:\/\/workflow\.cyou-inc\.com)?\/workflow\/request\/ViewRequest\.jsp\?[^"'\\s<>]*requestid=\d+[^"'\\s<>]*)/gi;
 
+const INVOICE_TYPE_FIELD_RE =
+  /(?:invoice.*type|invoiceType|bill.*type|tax.*invoice|fplx|fpzl|kplx|pjlx|pjzl|zslx|发票.*类|票据.*类|票种|票类|专票|普票)/i;
+
+function decodeMaybeUriComponent(value) {
+  const text = cleanText(value || "");
+  if (!text || !/%[0-9a-f]{2}/i.test(text)) {
+    return text;
+  }
+  try {
+    return decodeURIComponent(text);
+  } catch (_error) {
+    return text;
+  }
+}
+
+function collectInvoiceTypeCandidates(row) {
+  const candidates = [];
+  const push = (value) => {
+    const text = cleanText(value || "");
+    if (!text || text.length > 80 || candidates.includes(text)) {
+      return;
+    }
+    candidates.push(text);
+  };
+
+  push(row?.invoiceTypeName);
+  push(row?.invoiceType);
+  push(row?.fplxmc);
+  push(row?.fplx);
+  push(row?.fpzl);
+  push(row?.zslx);
+  push(row?.kplx);
+  push(row?.billType);
+  push(row?.billTypeName);
+  push(row?.invoiceKind);
+  push(row?.invoiceKindName);
+
+  if (!row || typeof row !== "object") {
+    return candidates;
+  }
+
+  for (const [key, value] of Object.entries(row)) {
+    if (!INVOICE_TYPE_FIELD_RE.test(String(key || ""))) {
+      continue;
+    }
+    if (Array.isArray(value) || (value && typeof value === "object")) {
+      continue;
+    }
+    push(value);
+  }
+
+  return candidates;
+}
+
 export function parseProcessRef(url, relation) {
   const normalized = normalizeUrl(url, BASE_URL);
   if (!normalized) return null;
@@ -71,6 +125,43 @@ export function parseProcessRef(url, relation) {
   return null;
 }
 
+export async function resolveProcessCodeRef(processCode, relation, baseUrl = BASE_URL) {
+  const normalizedCode = cleanText(processCode || "").toUpperCase();
+  if (!normalizedCode) {
+    return null;
+  }
+
+  const payload = await fetchJson(
+    `${baseUrl}/cyouNeiOaServer/flowable/instance/instanceIdByProcessCode?processCode=${encodeURIComponent(normalizedCode)}`
+  );
+  if (payload.code !== 200) {
+    throw new Error(payload.msg || "流程编号反查失败");
+  }
+
+  const data = payload.data || {};
+  const instanceId = firstNonEmpty(data.instanceId, data.procInsId, data.id);
+  if (!instanceId) {
+    return null;
+  }
+
+  const fromHistory = Boolean(data.fromHistory);
+  const detailUrl = fromHistory
+    ? `${baseUrl}/workflow/process/history/detail/${instanceId}/monitor?processCode=${encodeURIComponent(normalizedCode)}`
+    : `${baseUrl}/workflow/process/detail/${instanceId}?processCode=${encodeURIComponent(normalizedCode)}`;
+  const ref = parseProcessRef(detailUrl, relation);
+  if (!ref) {
+    return null;
+  }
+
+  return {
+    ...ref,
+    processCode: normalizedCode,
+    fromHistory,
+    titleHint: decodeMaybeUriComponent(firstNonEmpty(data.title, data.processTitle)),
+    resolvedFromProcessCode: true
+  };
+}
+
 export async function fetchFlowableDetail(ref, baseUrl) {
   const params = new URLSearchParams({ procInsId: ref.detailId });
   if (ref.sourceInstId) params.set("sourceInstId", ref.sourceInstId);
@@ -92,9 +183,12 @@ export async function buildFlowableInvoiceEvidenceList(detail, baseUrl) {
     const amount = firstNonEmpty(row?.hsje, row?.wtjhsje, row?.bcsyhsje, row?.fpmoney);
     const tax = firstNonEmpty(row?.se, row?.yxdkse);
     const accountNo = firstNonEmpty(row?.bankAccount, row?.accountNo);
+    const invoiceTypeCandidates = collectInvoiceTypeCandidates(row);
+    const invoiceTypeRaw = firstNonEmpty(...invoiceTypeCandidates);
     const sourceName = invoiceNo ? `付款页发票明细：${invoiceNo}` : "付款页发票明细";
     const sourceText = [
       invoiceNo ? `发票号码：${invoiceNo}` : "",
+      invoiceTypeRaw ? `发票类型：${invoiceTypeRaw}` : "",
       supplier ? `销售方：${supplier}` : "",
       buyer ? `购买方：${buyer}` : "",
       amount ? `价税合计：${amount}` : "",
@@ -115,10 +209,12 @@ export async function buildFlowableInvoiceEvidenceList(detail, baseUrl) {
       supplier,
       buyer,
       amount,
-      tax,
-      accountNo,
-      sourceName,
-      sourceText,
+        tax,
+        accountNo,
+        invoiceTypeCandidates,
+        invoiceTypeRaw,
+        sourceName,
+        sourceText,
       sourceUrl,
       attachment: sourceUrl
         ? {
@@ -175,15 +271,20 @@ export function extractFlowableFacts(detail) {
     invoiceTotal: firstNonEmpty(flow.kaipiaojine, flow.hsje),
     invoiceSupplier: firstNonEmpty(invoiceRefs[0]?.gysmc, flow.NAMEOFSUPPLIER, flow.COLLECTIONSUPPLIERNAME),
     invoiceAccountNo: firstNonEmpty(invoiceRefs[0]?.bankAccount, invoiceRefs[0]?.accountNo, flow.bankNo),
-    invoiceRefs: invoiceRefs.map((row) => ({
-      invoiceId: Number(row?.invoiceId || 0),
-      invoiceNo: firstNonEmpty(row?.fphm, row?.fplink),
-      supplier: firstNonEmpty(row?.gysmc),
-      buyer: firstNonEmpty(row?.gfmc),
-      amount: firstNonEmpty(row?.hsje, row?.wtjhsje, row?.bcsyhsje, row?.fpmoney),
-      tax: firstNonEmpty(row?.se, row?.yxdkse),
-      accountNo: firstNonEmpty(row?.bankAccount, row?.accountNo)
-    }))
+    invoiceRefs: invoiceRefs.map((row) => {
+      const invoiceTypeCandidates = collectInvoiceTypeCandidates(row);
+      return {
+        invoiceId: Number(row?.invoiceId || 0),
+        invoiceNo: firstNonEmpty(row?.fphm, row?.fplink),
+        invoiceTypeCandidates,
+        invoiceTypeRaw: firstNonEmpty(...invoiceTypeCandidates),
+        supplier: firstNonEmpty(row?.gysmc),
+        buyer: firstNonEmpty(row?.gfmc),
+        amount: firstNonEmpty(row?.hsje, row?.wtjhsje, row?.bcsyhsje, row?.fpmoney),
+        tax: firstNonEmpty(row?.se, row?.yxdkse),
+        accountNo: firstNonEmpty(row?.bankAccount, row?.accountNo)
+      };
+    })
   };
 }
 
@@ -435,7 +536,8 @@ function pickRefTitleHint(rowHints, relation) {
 }
 
 function relationFromContext(context) {
-  const text = String(context || "");
+  const rawText = String(context || "");
+  const text = `${rawText} ${decodeMaybeUriComponent(rawText)}`;
   if (/合同|htlink|cght|采购合同/i.test(text)) return "contract";
   if (/验收|到货|ysdlink|zlys/i.test(text)) return "acceptance";
   if (/国内\s*PR|PR单号|GNPR|prlink/i.test(text)) return "domestic_pr";

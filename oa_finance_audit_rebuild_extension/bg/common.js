@@ -14,6 +14,43 @@ export function cleanText(value) {
     .trim();
 }
 
+function normalizeFullWidthNumericChars(value) {
+  return String(value || "")
+    .replace(/[０-９]/g, (char) => String.fromCharCode(char.charCodeAt(0) - 0xff10 + 0x30))
+    .replace(/[．。｡]/g, ".")
+    .replace(/[，、]/g, ",")
+    .replace(/[（]/g, "(")
+    .replace(/[）]/g, ")")
+    .replace(/[—–−]/g, "-");
+}
+
+function normalizeOcrNumericSource(value) {
+  return String(value || "")
+    .replace(/[\uFF10-\uFF19]/g, (char) => String.fromCharCode(char.charCodeAt(0) - 0xff10 + 0x30))
+    .replace(/[\uFF0E\u3002\uFE52\uFF61]/g, ".")
+    .replace(/[\uFF0C\u3001\uFE50]/g, ",")
+    .replace(/\uFF08/g, "(")
+    .replace(/\uFF09/g, ")")
+    .replace(/[\uFF0D\u2013\u2014\u2015\u2212]/g, "-");
+}
+
+function normalizeOcrNumberishText(value) {
+  let text = cleanText(normalizeOcrNumericSource(value));
+  const replacements = [
+    { pattern: /\b[Oo](?=\d)|(?<=\d)[Oo]\b|(?<=\d)[Oo](?=[\d.,-])/g, value: "0" },
+    { pattern: /\b[Iil|](?=\d)|(?<=\d)[Iil|]\b|(?<=\d)[Iil|](?=[\d.,-])/g, value: "1" },
+    { pattern: /\b[Ss](?=\d)|(?<=\d)[Ss]\b|(?<=\d)[Ss](?=[\d.,-])/g, value: "5" }
+  ];
+  for (const rule of replacements) {
+    text = text.replace(rule.pattern, rule.value);
+  }
+  return text;
+}
+
+function normalizeOcrAccountText(value) {
+  return normalizeOcrNumericSource(value).replace(/[Oo]/g, "0").replace(/[Iil|]/g, "1").replace(/[Ss]/g, "5");
+}
+
 export function normalizeCompareText(value) {
   return cleanText(value)
     .toLowerCase()
@@ -22,12 +59,25 @@ export function normalizeCompareText(value) {
 }
 
 export function normalizeAccount(value) {
-  return cleanText(value).replace(/[^\d]/g, "");
+  return cleanText(normalizeOcrAccountText(value)).replace(/[^\d]/g, "");
 }
 
 export function parseAmount(value) {
-  const match = cleanText(value).replaceAll(",", "").match(/-?\d+(?:\.\d+)?/);
+  const normalized = normalizeOcrNumberishText(value)
+    .replaceAll(",", "")
+    .replace(/[¥￥]/g, "")
+    .replace(/[元圆整]/g, "")
+    .replace(/\s+/g, "");
+  const normalizedMatch = normalized.match(/-?\d+(?:\.\d+)?/);
+  return normalizedMatch ? Number.parseFloat(normalizedMatch[0]) : 0;
+/*
+  const match = normalizeOcrNumberishText(value)
+    .replaceAll(",", "")
+    .replace(/[¥￥]/g, "")
+    .replace(/\s+/g, "")
+    .match(/-?\d+(?:\.\d+)?/);
   return match ? Number.parseFloat(match[0]) : 0;
+*/
 }
 
 export function formatAmount(value) {
@@ -60,7 +110,7 @@ export function isLikelyBankAccount(value) {
   const text = cleanText(value);
   if (!text || text.includes("@")) return false;
   const digits = normalizeAccount(text);
-  return digits.length >= 8;
+  return digits.length >= 6;
 }
 
 export function firstLikelyBankAccount(...values) {
@@ -175,12 +225,13 @@ function findNumericSnippet(text, target) {
   return "";
 }
 
-export function makeEvidence(sourceName, sourceUrl, matchedValue, snippet) {
+export function makeEvidence(sourceName, sourceUrl, matchedValue, snippet, extra = {}) {
   return {
     sourceName,
     sourceUrl,
     matchedValue,
-    snippet: cleanText(snippet)
+    snippet: cleanText(snippet),
+    ...(extra && typeof extra === "object" ? extra : {})
   };
 }
 
@@ -208,6 +259,71 @@ export function companyMatchesPayment(text, payeeCompany) {
 export function accountMatchesPayment(text, payeeAccount) {
   const target = normalizeAccount(payeeAccount);
   return target && target.length >= 6 ? normalizeAccount(text).includes(target) : false;
+}
+
+export function normalizeInvoiceSubtypeLabel(value) {
+  const text = cleanText(value || "");
+  if (!text) {
+    return "";
+  }
+
+  const matched = [];
+  if (
+    /(?:电子发票\s*[（(]?\s*)?增值税专用发票/.test(text) ||
+    /增值税\s*专用\s*发票/.test(text) ||
+    /专票/.test(text)
+  ) {
+    matched.push("增值税专用发票");
+  }
+  if (
+    /(?:电子发票\s*[（(]?\s*)?(?:增值税)?普通发票/.test(text) ||
+    /增值税\s*普通\s*发票/.test(text) ||
+    /普票/.test(text)
+  ) {
+    matched.push("增值税普通发票");
+  }
+
+  const labels = [...new Set(matched)];
+  return labels.length === 1 ? labels[0] : "";
+}
+
+export function normalizePageInvoiceLabel(value) {
+  const text = cleanText(value || "");
+  if (!text) {
+    return "";
+  }
+
+  const matched = [];
+  if (/暂未取得发票|未取得发票/.test(text)) {
+    matched.push("暂未取得发票");
+  }
+  if (/其他票据|收据|非税票据|\binvoice\b/i.test(text)) {
+    matched.push("其他票据");
+  }
+  if (/增值税发票/.test(text)) {
+    matched.push("增值税发票");
+  }
+
+  const labels = [...new Set(matched)];
+  return labels.length === 1 ? labels[0] : "";
+}
+
+export function pickFirstNormalizedValue(values, normalizer) {
+  for (const value of Array.isArray(values) ? values : []) {
+    const raw = cleanText(value || "");
+    if (!raw) {
+      continue;
+    }
+    const label = typeof normalizer === "function" ? normalizer(raw) : "";
+    if (label) {
+      return { raw, label };
+    }
+  }
+  return { raw: "", label: "" };
+}
+
+export function isInvoiceTypePass(invoiceSubtypeLabel, pageInvoiceLabel) {
+  return invoiceSubtypeLabel === "增值税专用发票" && pageInvoiceLabel === "增值税发票";
 }
 
 export function classifyAttachmentRole(item) {

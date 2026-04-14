@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "OA 付款审核重构版",
+  "name": "OA 付款审核",
   "version": "0.1.0",
-  "description": "从零重构的财务付款审核插件骨架。",
+  "description": "财务付款审核插件。",
   "permissions": [
     "storage",
     "tabs",
@@ -13,7 +13,8 @@
     "https://oa.cyou-inc.com/*",
     "http://10.1.41.11:8081/*",
     "http://10.1.9.119:2212/*",
-    "http://sea.cyou-inc.com:8084/*"
+    "http://sea.cyou-inc.com:8084/*",
+    "https://invoice-cyou-com-1251125656.cos.ap-beijing.myqcloud.com/*"
   ],
   "background": {
     "service_worker": "background.js",

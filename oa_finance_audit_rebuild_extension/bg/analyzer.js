@@ -1,4 +1,4 @@
-﻿import {
+import {
   accountMatchesPayment,
   attachmentPreScanPriority,
   amountMatchesPayment,
@@ -16,10 +16,14 @@
   firstNonEmpty,
   firstNonEmptyDate,
   formatAmount,
+  isInvoiceTypePass,
   makeEvidence,
   normalizeCompareText,
   normalizeError,
+  normalizeInvoiceSubtypeLabel,
+  normalizePageInvoiceLabel,
   parseAmount,
+  pickFirstNormalizedValue,
   rolePriority,
   scoreAttachment,
   snippetAround,
@@ -37,17 +41,21 @@ import {
   fetchFlowableDetail,
   fetchHistoryDetail,
   findHistoryField,
-  parseProcessRef
+  parseProcessRef,
+  resolveProcessCodeRef
 } from "./detail.js";
-import { buildContractClauseCandidates } from "./contract_terms.js";
+import { buildContractClauseCandidates, deriveLocalContractSummary } from "./contract_terms.js";
 import { buildContractSummaryProviderMeta, generateContractSummary } from "./contract_summary_provider.js";
 import { extractMailEvidenceFromAttachment, extractReferenceTextsFromAttachment } from "./extract.js";
+import { initOcrBridge, releaseOcrBridge } from "./ocr_bridge.js";
 
-export const BUILD_TAG = "rebuild-phase5-local-summary-2026-04-14";
+export const BUILD_TAG = "rebuild-phase5-ocr-bridge-2026-04-14";
 
 const GENERIC_PROCESS_CODE_RE = /\b[A-Z]{2,10}-\d{8,}\b/i;
 const DOMESTIC_PR_CODE_RE = /\bGNPR-\d{8,}\b/i;
 const PURCHASE_ORDER_CODE_RE = /\bCYNCDD-\d{8,}\b/i;
+const PR_PAYMENT_CODE_RE = /^GNTYYFK-\d{8,}$/i;
+const PURCHASE_PAYMENT_CODE_RE = /^DDFK-\d{8,}$/i;
 
 function reportProgress(onProgress, phase, text, detail = "") {
   if (typeof onProgress !== "function") {
@@ -68,26 +76,41 @@ function reportProgress(onProgress, phase, text, detail = "") {
 export async function analyzePageSnapshot(snapshot, tabId, onProgress = null) {
   const baseUrl = deriveBaseUrl(snapshot?.pageUrl);
   setRuntimeContext(baseUrl, tabId);
+  await initOcrBridge(tabId).catch(() => false);
+
+  try {
 
   reportProgress(onProgress, "payment-root", "正在读取付款单", "准备读取当前付款单详情和结构化字段");
 
   const rootRef = parseProcessRef(snapshot?.pageUrl || "", "payment");
   const rootDetail = rootRef?.mode === "flowable" ? await fetchFlowableDetail(rootRef, baseUrl) : null;
   const rootFacts = rootDetail ? extractFlowableFacts(rootDetail) : {};
-  const target = mergePaymentTarget(snapshot?.paymentTarget || {}, rootFacts);
+  const inlineDomesticPrRefs = await resolveInlineDomesticPrRefs(snapshot, baseUrl, onProgress);
+  const snapshotWithResolvedPr = inlineDomesticPrRefs.length > 0
+    ? {
+        ...snapshot,
+        relatedLinks: enrichRelatedLinks(snapshot?.relatedLinks || [], inlineDomesticPrRefs)
+      }
+    : snapshot;
+  const target = mergePaymentTarget(snapshotWithResolvedPr?.paymentTarget || {}, rootFacts);
+  const flowType = detectPaymentFlowType(snapshotWithResolvedPr, target);
   const structuredInvoiceSources = rootDetail
     ? await buildFlowableInvoiceEvidenceList(rootDetail, baseUrl).catch(() => [])
     : [];
   const enrichedSnapshot = rootDetail
     ? {
-        ...snapshot,
-        attachments: dedupeAttachments([...(snapshot?.attachments || []), ...buildFlowableAttachmentList(rootDetail)]),
-        relatedLinks: enrichRelatedLinks(snapshot?.relatedLinks || [], [
+        ...snapshotWithResolvedPr,
+        flowType,
+        attachments: dedupeAttachments([...(snapshotWithResolvedPr?.attachments || []), ...buildFlowableAttachmentList(rootDetail)]),
+        relatedLinks: enrichRelatedLinks(snapshotWithResolvedPr?.relatedLinks || [], [
           ...extractKnownRefs(rootDetail, rootRef?.detailId || ""),
           ...discoverProcessRefs(rootDetail, rootRef?.detailId || "")
         ])
       }
-    : snapshot;
+    : {
+        ...snapshotWithResolvedPr,
+        flowType
+      };
   const normalizedAttachments = normalizeAttachmentCandidates([
     ...structuredInvoiceSources.map((item) => item.attachment).filter(Boolean),
     ...(enrichedSnapshot?.attachments || [])
@@ -113,7 +136,7 @@ export async function analyzePageSnapshot(snapshot, tabId, onProgress = null) {
     structuredInvoices: structuredInvoiceSources
   });
   const structuredInvoiceMatches = analyzeStructuredInvoiceSources(structuredInvoiceSources, target);
-  const pageAttachmentAnalysis = await analyzeAttachmentList(
+  const pageAttachmentAnalysisTask = analyzeAttachmentList(
     [
       ...inventories.invoiceAttachments,
       ...inventories.bankChangeAttachments,
@@ -133,7 +156,52 @@ export async function analyzePageSnapshot(snapshot, tabId, onProgress = null) {
     "正在进入合同",
     inventories.contractLinks.length > 0 ? `已发现 ${inventories.contractLinks.length} 个合同入口` : "暂未发现明确的合同入口"
   );
-  const contractResult = await analyzeContractLinks(enrichedSnapshot?.relatedLinks || [], target, baseUrl, onProgress);
+  const contractResultTask = analyzeContractLinks(enrichedSnapshot?.relatedLinks || [], target, baseUrl, onProgress);
+  const [pageAttachmentAnalysis, contractResult] = await Promise.all([pageAttachmentAnalysisTask, contractResultTask]);
+  const invoiceStatusSignal =
+    flowType === "pr_payment"
+      ? findSnapshotSignal(enrichedSnapshot, [/暂未取得发票|未取得发票|发票后补|发票在附件|发票附件/i], "")
+      : "";
+  const contractStatusSignal =
+    flowType === "pr_payment"
+      ? findSnapshotSignal(enrichedSnapshot, [/充值无合同|无合同|暂未签订合同|无需合同|框架协议/i], "")
+      : "";
+  /* const missingDomesticPrDoc =
+    flowType === "pr_payment"
+      ? createMissingSourceDocument({
+          kind: "domestic_pr",
+          title: "国内PR",
+          statement: "当前付款单未提供可直接打开的国内PR入口，且页内也未提取到PR子表",
+          relationHints: invoiceStatusSignal ? [`发票说明：${invoiceStatusSignal}`] : [],
+          notes: ["仅展示，不自动判断", "有PR付款优先读取真实PR详情，其次回退页内PR子表"]
+        })
+      : null;
+  const missingPurchaseOrderDoc =
+    flowType === "pr_payment"
+      ? createMissingSourceDocument({
+          kind: "purchase_order",
+          title: "采购订单",
+          statement: "当前付款单未提供采购订单入口，有PR付款通常以页内PR或附件作为主要来源",
+          relationHints: invoiceStatusSignal ? [`发票说明：${invoiceStatusSignal}`] : [],
+          notes: ["仅展示，不自动判断"]
+        })
+      : null;
+  const missingAcceptanceDoc =
+    flowType === "pr_payment"
+      ? createMissingSourceDocument({
+          kind: "acceptance",
+          title: "验收单",
+          statement: "当前付款单未提供验收入口，请结合付款页附件或关联流程人工判断",
+          relationHints: invoiceStatusSignal ? [`发票说明：${invoiceStatusSignal}`] : [],
+          notes: ["仅展示，不自动判断"]
+        })
+      : null;
+
+  */
+  const { missingDomesticPrDoc, missingPurchaseOrderDoc, missingAcceptanceDoc } = buildPrPaymentMissingDocs(
+    flowType,
+    invoiceStatusSignal
+  );
 
   reportProgress(
     onProgress,
@@ -141,7 +209,13 @@ export async function analyzePageSnapshot(snapshot, tabId, onProgress = null) {
     "正在核对附件",
     inventories.acceptanceLinks.length > 0 ? `已发现 ${inventories.acceptanceLinks.length} 个验收入口` : "尚未发现明确验收入口"
   );
-  const acceptanceDocs = await analyzeAcceptanceMailLinksMulti(enrichedSnapshot?.relatedLinks || [], target, baseUrl, onProgress);
+  const acceptanceDocsTask = analyzeAcceptanceMailLinksMulti(
+    enrichedSnapshot?.relatedLinks || [],
+    target,
+    baseUrl,
+    onProgress,
+    { missingDocument: missingAcceptanceDoc }
+  );
 
   reportProgress(
     onProgress,
@@ -149,7 +223,16 @@ export async function analyzePageSnapshot(snapshot, tabId, onProgress = null) {
     "正在读取国内PR",
     inventories.domesticPrLinks.length > 0 ? `已发现 ${inventories.domesticPrLinks.length} 个国内PR入口` : "暂未发现明确的国内PR入口"
   );
-  const domesticPrDocs = await analyzeDomesticPrLinksMulti(enrichedSnapshot?.relatedLinks || [], target, baseUrl, onProgress);
+  const domesticPrDocsTask = analyzeDomesticPrLinksMulti(
+    enrichedSnapshot?.relatedLinks || [],
+    target,
+    baseUrl,
+    onProgress,
+    {
+      snapshot: enrichedSnapshot,
+      missingDocument: missingDomesticPrDoc
+    }
+  );
 
   reportProgress(
     onProgress,
@@ -157,24 +240,48 @@ export async function analyzePageSnapshot(snapshot, tabId, onProgress = null) {
     "正在读取采购订单",
     inventories.purchaseOrderLinks.length > 0 ? `已发现 ${inventories.purchaseOrderLinks.length} 个采购订单入口` : "暂未发现明确的采购订单入口"
   );
-  const purchaseOrderResult = await analyzePurchaseOrderLinks(enrichedSnapshot?.relatedLinks || [], target, baseUrl, onProgress);
+  const purchaseOrderResultTask = analyzePurchaseOrderLinks(
+    enrichedSnapshot?.relatedLinks || [],
+    target,
+    baseUrl,
+    onProgress,
+    { missingDocument: missingPurchaseOrderDoc }
+  );
+  const [acceptanceDocs, domesticPrDocs, purchaseOrderResult] = await Promise.all([
+    acceptanceDocsTask,
+    domesticPrDocsTask,
+    purchaseOrderResultTask
+  ]);
 
   const matches = {
     amount: structuredInvoiceMatches.amount || pageAttachmentAnalysis.matches.amount || contractResult.matches.amount || null,
     company: structuredInvoiceMatches.company || pageAttachmentAnalysis.matches.company || contractResult.matches.company || null,
     account: structuredInvoiceMatches.account || pageAttachmentAnalysis.matches.account || contractResult.matches.account || null
   };
+  const pageInvoiceContext = buildPageInvoiceContext(enrichedSnapshot);
+  const invoiceTypeCheck = buildInvoiceTypeCheck(
+    matches.amount,
+    pageInvoiceContext,
+    [structuredInvoiceMatches.amount, pageAttachmentAnalysis.matches.amount, contractResult.matches.amount]
+  );
 
   reportProgress(onProgress, "summary", "正在汇总核对结果", "验收入口、核对结果和合同参考信息");
 
   const verificationItems = [
-    buildAmountVerification(target, inventories, matches.amount),
+    buildAmountVerification(target, inventories, matches.amount, invoiceTypeCheck),
     buildCompanyVerification(target, inventories, matches.company),
     buildAccountVerification(target, inventories, matches.account)
   ];
 
   const attachmentOnlyContract = buildAttachmentOnlyContractResult(pageAttachmentAnalysis, inventories, target);
   const preferAttachmentOnlyContract = shouldPreferAttachmentOnlyContract(contractResult, attachmentOnlyContract);
+  const missingContractProcessing =
+    flowType === "pr_payment" && !contractResult?.ref && !hasUsableAttachmentOnlyContract(attachmentOnlyContract)
+      ? emptyContractProcessing(
+          "not_provided",
+          contractStatusSignal || "当前付款单未提供合同入口，合同可能仅存在于附件或当前业务无需合同"
+        )
+      : null;
   const effectiveContractFacts = preferAttachmentOnlyContract
     ? attachmentOnlyContract?.facts || {}
     : contractResult.ref
@@ -185,12 +292,13 @@ export async function analyzePageSnapshot(snapshot, tabId, onProgress = null) {
     : contractResult.ref
       ? contractResult.summary
       : attachmentOnlyContract?.summary || emptyContractSummary();
-  const effectiveContractProcessing = preferAttachmentOnlyContract
-    ? attachmentOnlyContract?.processing || emptyContractProcessing("not_found", "尚未发现明确的合同来源")
-    : contractResult.ref
-      ? contractResult.processing
-      : attachmentOnlyContract?.processing || emptyContractProcessing("not_found", "尚未发现明确的合同来源");
-  const effectiveContractResult = preferAttachmentOnlyContract
+  const effectiveContractProcessing = missingContractProcessing ||
+    (preferAttachmentOnlyContract
+      ? attachmentOnlyContract?.processing || emptyContractProcessing("not_found", "尚未发现明确的合同来源")
+      : contractResult.ref
+        ? contractResult.processing
+        : attachmentOnlyContract?.processing || emptyContractProcessing("not_found", "尚未发现明确的合同来源"));
+  const effectiveContractResult = missingContractProcessing
     ? {
         ...contractResult,
         ref: null,
@@ -198,14 +306,22 @@ export async function analyzePageSnapshot(snapshot, tabId, onProgress = null) {
         summary: effectiveContractSummary,
         processing: effectiveContractProcessing
       }
-    : contractResult.ref
-      ? contractResult
-      : {
+    : preferAttachmentOnlyContract
+      ? {
           ...contractResult,
+          ref: null,
           facts: effectiveContractFacts,
           summary: effectiveContractSummary,
           processing: effectiveContractProcessing
-        };
+        }
+      : contractResult.ref
+        ? contractResult
+        : {
+            ...contractResult,
+            facts: effectiveContractFacts,
+            summary: effectiveContractSummary,
+            processing: effectiveContractProcessing
+          };
 
   const relatedDocuments = {
     domesticPr: domesticPrDocs[0] || null,
@@ -237,12 +353,14 @@ export async function analyzePageSnapshot(snapshot, tabId, onProgress = null) {
       contractAttachmentCount: inventories.contractAttachments.length,
       bankChangeAttachmentCount: inventories.bankChangeAttachments.length,
       acceptanceAttachmentCount: inventories.acceptanceAttachments.length,
+      inlineDomesticPrCount: getInlineDomesticPrItems(enrichedSnapshot).length,
       domesticPrLinkCount: inventories.domesticPrLinks.length,
       purchaseOrderLinkCount: inventories.purchaseOrderLinks.length,
       contractLinkCount: inventories.contractLinks.length,
       acceptanceLinkCount: inventories.acceptanceLinks.length,
       otherLinkCount: inventories.relatedLinks.length
     },
+    invoiceTypeCheck,
     verificationItems,
     relatedDocuments,
     contractReference: {
@@ -268,6 +386,7 @@ export async function analyzePageSnapshot(snapshot, tabId, onProgress = null) {
     evidencePool: inventories,
     debug: {
       snapshot: enrichedSnapshot,
+      pageInvoiceContext,
       rootFacts,
       pageAttachmentAnalysis,
       domesticPrResult: domesticPrDocs,
@@ -277,11 +396,17 @@ export async function analyzePageSnapshot(snapshot, tabId, onProgress = null) {
       acceptanceResult: acceptanceDocs
     }
   };
+  } finally {
+    await releaseOcrBridge(tabId).catch(() => false);
+  }
 }
 
 function mergePaymentTarget(primary, fallback) {
+  const flowType = firstNonEmpty(primary.flowType, primary.paymentFlowType);
   return {
     ...primary,
+    flowType,
+    paymentFlowType: flowType,
     processCode: firstNonEmpty(primary.processCode, fallback.processCode),
     processTitle: firstNonEmpty(primary.processTitle, fallback.processTitle),
     paymentAmount: firstNonEmpty(primary.paymentAmount, fallback.paymentAmount, fallback.invoiceTotal),
@@ -334,17 +459,27 @@ function analyzeStructuredInvoiceSources(items, target) {
   const matches = { amount: null, company: null, account: null };
 
   for (const item of items || []) {
-    const sourceText = cleanText(item?.sourceText || "");
-    const sourceName = item?.sourceName || "浠樻椤靛彂绁ㄦ槑缁?";
-    const sourceUrl = item?.sourceUrl || "";
+      const sourceText = cleanText(item?.sourceText || "");
+      const sourceName = item?.sourceName || "付款页发票明细";
+      const sourceUrl = item?.sourceUrl || "";
+      const invoiceTypeMatch = pickFirstNormalizedValue(
+        [item?.invoiceTypeRaw, ...(Array.isArray(item?.invoiceTypeCandidates) ? item.invoiceTypeCandidates : []), sourceText, sourceName],
+        normalizeInvoiceSubtypeLabel
+      );
 
     if (!matches.amount && amountMatchesPayment(sourceText, target.paymentAmount)) {
       matches.amount = makeEvidence(
         sourceName,
         sourceUrl,
-        formatAmount(target.paymentAmount),
-        sourceText || `价税合计：${item?.amount || ""}`
-      );
+          formatAmount(target.paymentAmount),
+          sourceText || `价税合计：${item?.amount || ""}`,
+          {
+            invoiceTypeLabel: invoiceTypeMatch.label || "",
+            invoiceTypeRaw: invoiceTypeMatch.raw || cleanText(item?.invoiceTypeRaw || ""),
+            invoiceTypeCandidates: Array.isArray(item?.invoiceTypeCandidates) ? item.invoiceTypeCandidates : [],
+            evidenceRole: "invoice"
+          }
+        );
     }
 
     if (!matches.company && companyMatchesPayment(sourceText, target.payeeCompany)) {
@@ -383,8 +518,13 @@ function normalizeAttachmentCandidates(items) {
     const normalized = { ...item, name, url };
     if (looksLikeRealAttachment(name, url)) {
       const current = realByUrl.get(url);
-      if (!current || attachmentNameQuality(name) > attachmentNameQuality(current.name || "")) {
+      if (!current) {
         realByUrl.set(url, normalized);
+      } else if (attachmentNameQuality(name) > attachmentNameQuality(current.name || "")) {
+        const altNames = [...(current.altNames || []), current.name].filter(Boolean);
+        realByUrl.set(url, { ...normalized, altNames });
+      } else if (name && name.toLowerCase() !== String(current.name || "").toLowerCase()) {
+        current.altNames = [...(current.altNames || []), name];
       }
       if (name) {
         realNames.add(name.toLowerCase());
@@ -401,10 +541,12 @@ function normalizeAttachmentCandidates(items) {
   const placeholderSeen = new Set();
   for (const item of placeholders) {
     const key = item.name.toLowerCase();
-    if (realNames.has(key) || placeholderSeen.has(key)) {
+    const urlHint = cleanText(item.url || "");
+    const dedupeKey = urlHint ? `${key}|${urlHint}` : key;
+    if (realNames.has(key) || placeholderSeen.has(dedupeKey)) {
       continue;
     }
-    placeholderSeen.add(key);
+    placeholderSeen.add(dedupeKey);
     results.push(item);
   }
   return results;
@@ -445,12 +587,156 @@ function findFieldValuesFromPairs(pairs, ...labels) {
   return results;
 }
 
+function collectBodyFieldCandidates(bodyText, patterns) {
+  const source = cleanText(bodyText || "");
+  const results = [];
+  const seen = new Set();
+  if (!source) {
+    return results;
+  }
+
+  for (const pattern of patterns || []) {
+    if (!(pattern instanceof RegExp)) {
+      continue;
+    }
+    const flags = pattern.flags.includes("g") ? pattern.flags : `${pattern.flags}g`;
+    const matcher = new RegExp(pattern.source, flags);
+    for (const match of source.matchAll(matcher)) {
+      const value = cleanText(match?.[1] || match?.[0] || "");
+      if (!value || seen.has(value)) {
+        continue;
+      }
+      seen.add(value);
+      results.push(value);
+    }
+  }
+
+  return results;
+}
+
+function pickSingleFieldValue(values, predicate) {
+  for (const value of values || []) {
+    const text = cleanText(value || "");
+    if (!text) {
+      continue;
+    }
+    if (typeof predicate === "function" && !predicate(text)) {
+      continue;
+    }
+    return text;
+  }
+  return "";
+}
+
+function buildPageInvoiceContext(snapshot) {
+  const fieldPairs = snapshot?.fieldPairs || [];
+  const invoiceTypeValues = findFieldValuesFromPairs(fieldPairs, "发票类型");
+  const bodyPageInvoiceValues = collectBodyFieldCandidates(snapshot?.bodyText || "", [
+    /(?:发票类型|票据类型)[：:\s]{0,8}(增值税发票|其他票据|暂未取得发票)/i
+  ]);
+  const bodyInvoiceSubtypeValues = collectBodyFieldCandidates(snapshot?.bodyText || "", [
+    /(?:发票类型|票面类型)[：:\s]{0,8}(增值税专用发票|增值税普通发票|专票|普票)/i
+  ]);
+
+  const pageInvoice = pickFirstNormalizedValue(
+    [...invoiceTypeValues, ...bodyPageInvoiceValues],
+    normalizePageInvoiceLabel
+  );
+  const invoiceSubtype = pickFirstNormalizedValue(
+    [...invoiceTypeValues, ...bodyInvoiceSubtypeValues],
+    normalizeInvoiceSubtypeLabel
+  );
+  const linkedInvoiceCorrectness = pickSingleFieldValue(
+    findFieldValuesFromPairs(fieldPairs, "关联发票是否正确"),
+    (value) => /^(正确|不正确)$/.test(value)
+  );
+  const deductibleTaxAmount = pickSingleFieldValue(
+    findFieldValuesFromPairs(fieldPairs, "有效抵扣税额"),
+    (value) => /-?\d+(?:\.\d+)?/.test(value)
+  );
+
+  return {
+    pageInvoiceLabel: pageInvoice.label || "",
+    pageInvoiceRaw: pageInvoice.raw || "",
+    invoiceSubtypeLabel: invoiceSubtype.label || "",
+    invoiceSubtypeRaw: invoiceSubtype.raw || "",
+    linkedInvoiceCorrectness,
+    deductibleTaxAmount
+  };
+}
+
+function buildInvoiceTypeCheck(matched, pageInvoiceContext = {}, candidates = []) {
+  const invoiceEvidence = [matched, ...(Array.isArray(candidates) ? candidates : [])]
+    .filter(Boolean)
+    .find((item) =>
+      firstNonEmpty(
+        item?.invoiceTypeLabel,
+        normalizeInvoiceSubtypeLabel(item?.snippet || ""),
+        pickFirstNormalizedValue(item?.invoiceTypeCandidates || [], normalizeInvoiceSubtypeLabel).label
+      )
+    );
+  const invoiceTypeLabel = firstNonEmpty(
+    invoiceEvidence?.invoiceTypeLabel,
+    pickFirstNormalizedValue(invoiceEvidence?.invoiceTypeCandidates || [], normalizeInvoiceSubtypeLabel).label,
+    normalizeInvoiceSubtypeLabel(invoiceEvidence?.snippet || ""),
+    pageInvoiceContext?.invoiceSubtypeLabel,
+    normalizeInvoiceSubtypeLabel(matched?.snippet || "")
+  );
+  const pageInvoiceLabel = firstNonEmpty(pageInvoiceContext?.pageInvoiceLabel);
+  const status = matched && isInvoiceTypePass(invoiceTypeLabel, pageInvoiceLabel) ? "pass" : "warn";
+  const detailParts = [
+    `票面类型：${invoiceTypeLabel || "未识别"}`,
+    `页面显示：${pageInvoiceLabel || "未识别"}`
+  ];
+
+  if (pageInvoiceContext?.linkedInvoiceCorrectness) {
+    detailParts.push(`关联发票：${pageInvoiceContext.linkedInvoiceCorrectness}`);
+  }
+  if (pageInvoiceContext?.deductibleTaxAmount) {
+    detailParts.push(`有效抵扣税额：${pageInvoiceContext.deductibleTaxAmount}`);
+  }
+  if (matched?.snippet) {
+    detailParts.push(`命中来源：${matched.snippet}`);
+  }
+  if (invoiceEvidence?.sourceName && invoiceEvidence?.sourceName !== matched?.sourceName) {
+    detailParts.push(`票面补充来源：${invoiceEvidence.sourceName}`);
+  }
+
+    return {
+      invoiceTypeLabel: invoiceTypeLabel || "未识别",
+      invoiceTypeRaw: firstNonEmpty(
+        invoiceEvidence?.invoiceTypeRaw,
+        ...(Array.isArray(invoiceEvidence?.invoiceTypeCandidates) ? invoiceEvidence.invoiceTypeCandidates : []),
+        matched?.invoiceTypeRaw,
+        ...(Array.isArray(matched?.invoiceTypeCandidates) ? matched.invoiceTypeCandidates : []),
+        pageInvoiceContext?.invoiceSubtypeRaw
+      ),
+      pageInvoiceLabel: pageInvoiceLabel || "未识别",
+    pageInvoiceRaw: pageInvoiceContext?.pageInvoiceRaw || "",
+    linkedInvoiceCorrectness: pageInvoiceContext?.linkedInvoiceCorrectness || "",
+    deductibleTaxAmount: pageInvoiceContext?.deductibleTaxAmount || "",
+    status,
+    sourceName: matched?.sourceName || "",
+    sourceUrl: matched?.sourceUrl || "",
+    snippet: detailParts.join("；")
+  };
+}
+
+function buildRelatedLinkKey(link) {
+  const relation = cleanText(link?.relation || "related");
+  const ref = parseProcessRef(link?.url || "", relation);
+  if (ref?.detailId) {
+    return `${relation}|${ref.mode}|${ref.detailId}`;
+  }
+  return `${relation}|${cleanText(link?.url || "")}`;
+}
+
 function enrichRelatedLinks(existingLinks, refs) {
   const deduped = [];
   const seen = new Map();
 
   for (const item of existingLinks || []) {
-    const key = `${item.relation}|${item.url}`;
+    const key = buildRelatedLinkKey(item);
     if (seen.has(key)) {
       continue;
     }
@@ -465,7 +751,7 @@ function enrichRelatedLinks(existingLinks, refs) {
       url: ref.detailUrl,
       hintTexts: Array.isArray(ref.rowHints) ? ref.rowHints.map((item) => cleanText(item?.value || "")).filter(Boolean) : []
     };
-    const key = `${link.relation}|${link.url}`;
+    const key = buildRelatedLinkKey(link);
     if (seen.has(key)) {
       const existingIndex = seen.get(key);
       const existing = deduped[existingIndex] || {};
@@ -491,6 +777,7 @@ function createRelatedDocumentBase(input) {
     status: input.status || "warn",
     statusText: input.statusText || "",
     displayOnly: !!input.displayOnly,
+    sourceMode: input.sourceMode || "",
     sourceName: input.sourceName || "",
     sourceUrl: input.sourceUrl || "",
     statement: input.statement || "",
@@ -510,6 +797,7 @@ function buildContractRelatedDocument(contractResult, processing) {
   const facts = contractResult?.facts || {};
   const summary = contractResult?.summary || {};
   const attachmentNames = Array.isArray(processing?.attachmentNames) ? processing.attachmentNames : [];
+  const pageStatus = cleanText(processing?.pageStatus || "");
   const hasSource = !!(
     contractResult?.ref ||
     facts.sourceName ||
@@ -524,15 +812,26 @@ function buildContractRelatedDocument(contractResult, processing) {
     processing?.pageStatusText
   );
   const sourceUrl = firstNonEmpty(facts.sourceUrl, contractResult?.ref?.detailUrl);
+  const statusText = hasSource
+    ? pageStatus === "not_provided"
+      ? "未提供来源"
+      : "仅展示"
+    : "未找到";
+  const statement = pageStatus === "not_provided"
+    ? firstNonEmpty(processing?.pageStatusText, "当前付款单未提供合同来源")
+    : hasSource
+      ? "沿用现有合同逻辑，仅展示不自动判断"
+      : "尚未发现明确的合同来源";
   return createRelatedDocumentBase({
     kind: "contract",
     title: "合同",
     status: hasSource ? "info" : "warn",
-    statusText: hasSource ? "仅展示" : "未找到",
+    statusText,
     displayOnly: true,
+    sourceMode: contractResult?.ref ? "linked_detail" : "page_inline",
     sourceName,
     sourceUrl,
-    statement: hasSource ? "沿用现有合同逻辑，仅展示不自动判断" : "尚未发现明确的合同来源",
+    statement,
     fields: {
       pageStatusText: processing?.pageStatusText || "",
       effectiveStart: facts.effectiveStart || "",
@@ -1142,6 +1441,615 @@ function buildRelatedReadStatement(label, context) {
   return `暂未读取到${label}详情`;
 }
 
+function normalizeDomesticPrYear(value) {
+  const text = cleanText(value || "");
+  if (!text) {
+    return "";
+  }
+  if (isLikelyDomesticPrPeriodNoiseText(text)) {
+    return "";
+  }
+  const matched = text.match(/\b(20\d{2}|\d{2})\b/);
+  if (!matched) {
+    return "";
+  }
+  return matched[1].length === 2 ? `20${matched[1]}` : matched[1];
+}
+
+function mapDomesticPrQuarterToken(value) {
+  switch (String(value || "").trim()) {
+    case "1":
+    case "一":
+      return "1";
+    case "2":
+    case "二":
+      return "2";
+    case "3":
+    case "三":
+      return "3";
+    case "4":
+    case "四":
+      return "4";
+    default:
+      return "";
+  }
+}
+
+/* function buildPrPaymentMissingDocs(flowType, invoiceStatusSignal) {
+  if (flowType !== "pr_payment") {
+    return {
+      missingDomesticPrDoc: null,
+      missingPurchaseOrderDoc: null,
+      missingAcceptanceDoc: null
+    };
+  }
+
+  const relationHints = invoiceStatusSignal ? [`鍙戠エ璇存槑锛?{invoiceStatusSignal}`] : [];
+  return {
+    missingDomesticPrDoc: createMissingSourceDocument({
+      kind: "domestic_pr",
+      title: "鍥藉唴PR",
+      statement: "褰撳墠浠樻鍗曟湭鎻愪緵鍙洿鎺ユ墦寮€鐨勫浗鍐匬R鍏ュ彛锛屼笖椤靛唴涔熸湭鎻愬彇鍒癙R瀛愯〃",
+      relationHints,
+      notes: ["浠呭睍绀猴紝涓嶈嚜鍔ㄥ垽鏂?, "鏈塒R浠樻浼樺厛璇诲彇鐪熷疄PR璇︽儏锛屽叾娆″洖閫€椤靛唴PR瀛愯〃"]
+    }),
+    missingPurchaseOrderDoc: createMissingSourceDocument({
+      kind: "purchase_order",
+      title: "閲囪喘璁㈠崟",
+      statement: "褰撳墠浠樻鍗曟湭鎻愪緵閲囪喘璁㈠崟鍏ュ彛锛屾湁PR浠樻閫氬父浠ラ〉鍐匬R鎴栭檮浠朵綔涓轰富瑕佹潵婧?",
+      relationHints,
+      notes: ["浠呭睍绀猴紝涓嶈嚜鍔ㄥ垽鏂?]
+    }),
+    missingAcceptanceDoc: createMissingSourceDocument({
+      kind: "acceptance",
+      title: "楠屾敹鍗?",
+      statement: "褰撳墠浠樻鍗曟湭鎻愪緵楠屾敹鍏ュ彛锛岃缁撳悎浠樻椤甸檮浠舵垨鍏宠仈娴佺▼浜哄伐鍒ゆ柇",
+      relationHints,
+      notes: ["浠呭睍绀猴紝涓嶈嚜鍔ㄥ垽鏂?]
+    })
+  };
+}
+
+*/
+
+function buildPrPaymentMissingDocs(flowType, invoiceStatusSignal) {
+  if (flowType !== "pr_payment") {
+    return {
+      missingDomesticPrDoc: null,
+      missingPurchaseOrderDoc: null,
+      missingAcceptanceDoc: null
+    };
+  }
+
+  const relationHints = invoiceStatusSignal ? [`发票说明：${invoiceStatusSignal}`] : [];
+  return {
+    missingDomesticPrDoc: createMissingSourceDocument({
+      kind: "domestic_pr",
+      title: "国内PR",
+      statement: "当前付款单未提供可直接打开的国内PR入口，且页内也未提取到PR子表",
+      relationHints,
+      notes: ["仅展示，不自动判断", "有PR付款优先读取真实PR详情，其次回退页内PR子表"]
+    }),
+    missingPurchaseOrderDoc: createMissingSourceDocument({
+      kind: "purchase_order",
+      title: "采购订单",
+      statement: "当前付款单未提供采购订单入口，有PR付款通常以页内PR或附件作为主要来源",
+      relationHints,
+      notes: ["仅展示，不自动判断"]
+    }),
+    missingAcceptanceDoc: createMissingSourceDocument({
+      kind: "acceptance",
+      title: "验收单",
+      statement: "当前付款单未提供验收入口，请结合付款页附件或关联流程人工判断",
+      relationHints,
+      notes: ["仅展示，不自动判断"]
+    })
+  };
+}
+
+function detectPaymentFlowType(snapshot, target) {
+  const explicitType = cleanText(snapshot?.flowType || target?.flowType || target?.paymentFlowType || "");
+  if (explicitType) {
+    return explicitType;
+  }
+
+  const processCode = cleanText(
+    snapshot?.paymentTarget?.processCode ||
+    target?.processCode ||
+    snapshot?.processCode ||
+    ""
+  ).toUpperCase();
+  if (PR_PAYMENT_CODE_RE.test(processCode)) {
+    return "pr_payment";
+  }
+  if (PURCHASE_PAYMENT_CODE_RE.test(processCode)) {
+    return "purchase_payment";
+  }
+  return "payment";
+}
+
+function normalizeInlineDomesticPrItem(item) {
+  if (!item || typeof item !== "object") {
+    return null;
+  }
+  const normalized = {
+    processCode: cleanText(item.processCode || "").toUpperCase(),
+    relatedTitle: cleanText(item.relatedTitle || item.relatedFlowTitle || item.requirementSummary || ""),
+    prStatus: cleanText(item.prStatus || ""),
+    prAmount: cleanText(item.prAmount || ""),
+    prPendingAmount: cleanText(item.prPendingAmount || ""),
+    prCurrentSubmitAmount: cleanText(item.prCurrentSubmitAmount || ""),
+    costDept: cleanText(item.costDept || ""),
+    costPurpose: cleanText(item.costPurpose || item.purposeText || ""),
+    rowLabel: cleanText(item.rowLabel || "")
+  };
+  return normalized.processCode ||
+    normalized.relatedTitle ||
+    normalized.prStatus ||
+    normalized.prAmount ||
+    normalized.prPendingAmount ||
+    normalized.prCurrentSubmitAmount ||
+    normalized.costDept ||
+    normalized.costPurpose
+    ? normalized
+    : null;
+}
+
+function getInlineDomesticPrItems(snapshot) {
+  return (Array.isArray(snapshot?.inlineRelations?.domesticPr) ? snapshot.inlineRelations.domesticPr : [])
+    .map((item) => normalizeInlineDomesticPrItem(item))
+    .filter(Boolean);
+}
+
+function buildInlinePrRowHints(item) {
+  const hints = [];
+  const pushHint = (key, value) => {
+    const text = cleanText(value || "");
+    if (!text) {
+      return;
+    }
+    hints.push({ key, value: text });
+  };
+
+  pushHint("PR单号", item?.processCode);
+  pushHint("相关流程", item?.relatedTitle);
+  pushHint("PR状态", item?.prStatus);
+  pushHint("PR总额", item?.prAmount);
+  pushHint("PR未提交付款金额", item?.prPendingAmount);
+  pushHint("PR本次提交金额", item?.prCurrentSubmitAmount);
+  pushHint("费用归属部门", item?.costDept);
+  pushHint("费用归属说明", item?.costPurpose);
+  return hints;
+}
+
+async function resolveInlineDomesticPrRefs(snapshot, baseUrl, onProgress) {
+  const inlineItems = getInlineDomesticPrItems(snapshot);
+  const refs = [];
+  const seenCodes = new Set();
+
+  for (const item of inlineItems) {
+    if (!item.processCode || seenCodes.has(item.processCode)) {
+      continue;
+    }
+    seenCodes.add(item.processCode);
+
+    reportProgress(onProgress, "domestic-pr-resolve", "正在反查国内PR流程", item.processCode);
+    try {
+      const ref = await resolveProcessCodeRef(item.processCode, "domestic_pr", baseUrl);
+      if (!ref) {
+        continue;
+      }
+      refs.push({
+        ...ref,
+        titleHint: firstNonEmpty(item.relatedTitle, ref.titleHint, item.processCode),
+        rowHints: buildInlinePrRowHints(item)
+      });
+    } catch (_error) {
+      // Keep the inline PR item as a fallback display source.
+    }
+  }
+
+  return refs;
+}
+
+function findMatchingInlineDomesticPrItem(inlineItems, ...candidates) {
+  const items = Array.isArray(inlineItems) ? inlineItems : [];
+  const normalizedCandidates = candidates.map((item) => cleanText(item || "").toUpperCase()).filter(Boolean);
+  if (normalizedCandidates.length > 0) {
+    const matchedByCode = items.find((item) => normalizedCandidates.includes(cleanText(item?.processCode || "").toUpperCase()));
+    if (matchedByCode) {
+      return matchedByCode;
+    }
+  }
+
+  const titleCandidates = candidates.map((item) => cleanText(item || "")).filter(Boolean);
+  return items.find((item) => {
+    const relatedTitle = cleanText(item?.relatedTitle || "");
+    return relatedTitle && titleCandidates.some((candidate) => candidate.includes(relatedTitle) || relatedTitle.includes(candidate));
+  }) || null;
+}
+
+function mergeDomesticPrFields(baseFields, inlineItem) {
+  if (!inlineItem) {
+    return {
+      ...baseFields,
+      relatedTitle: cleanText(baseFields?.relatedTitle || ""),
+      prStatus: cleanText(baseFields?.prStatus || ""),
+      prPendingAmount: cleanText(baseFields?.prPendingAmount || ""),
+      prCurrentSubmitAmount: cleanText(baseFields?.prCurrentSubmitAmount || ""),
+      costPurpose: cleanText(baseFields?.costPurpose || baseFields?.purposeText || "")
+    };
+  }
+
+  const merged = {
+    ...baseFields,
+    processCode: firstNonEmpty(baseFields?.processCode, inlineItem.processCode),
+    relatedTitle: firstNonEmpty(baseFields?.relatedTitle, inlineItem.relatedTitle),
+    prStatus: firstNonEmpty(baseFields?.prStatus, inlineItem.prStatus),
+    prAmount: firstNonEmpty(baseFields?.prAmount, inlineItem.prAmount),
+    prPendingAmount: firstNonEmpty(baseFields?.prPendingAmount, inlineItem.prPendingAmount),
+    prCurrentSubmitAmount: firstNonEmpty(baseFields?.prCurrentSubmitAmount, inlineItem.prCurrentSubmitAmount),
+    costDept: firstNonEmpty(baseFields?.costDept, inlineItem.costDept),
+    costPurpose: firstNonEmpty(baseFields?.costPurpose, baseFields?.purposeText, inlineItem.costPurpose),
+    requirementSummary: firstNonEmpty(
+      baseFields?.requirementSummary,
+      inlineItem.relatedTitle,
+      inlineItem.costPurpose,
+      baseFields?.purposeText
+    )
+  };
+  merged.purposeText = firstNonEmpty(merged.purposeText, merged.costPurpose);
+  return merged;
+}
+
+function hasStandaloneInlineDomesticPrSignal(fields) {
+  const normalizedFields = fields || {};
+  if (cleanText(normalizedFields.processCode || "") || cleanText(normalizedFields.relatedTitle || "")) {
+    return true;
+  }
+  if (
+    cleanText(normalizedFields.prAmount || "") ||
+    cleanText(normalizedFields.prPendingAmount || "") ||
+    cleanText(normalizedFields.prCurrentSubmitAmount || "") ||
+    cleanText(normalizedFields.prStatus || "")
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function shouldKeepInlineDomesticPrDoc(doc, hasLinkedDocs = false) {
+  const fields = doc?.fields || {};
+  if (hasStandaloneInlineDomesticPrSignal(fields)) {
+    return true;
+  }
+  if (hasLinkedDocs) {
+    return false;
+  }
+  return !!(cleanText(fields.costPurpose || fields.purposeText || "") && cleanText(fields.costDept || ""));
+}
+
+function buildInlineDomesticPrDoc(item, itemLabel = "") {
+  const inlineItem = normalizeInlineDomesticPrItem(item);
+  if (!inlineItem) {
+    return null;
+  }
+  const fields = mergeDomesticPrFields({}, inlineItem);
+
+  return createRelatedDocumentBase({
+    kind: "domestic_pr",
+    title: "国内PR",
+    itemLabel,
+    status: "info",
+    statusText: "页内展示",
+    displayOnly: true,
+    sourceMode: "page_inline",
+    sourceName: firstNonEmpty(inlineItem.relatedTitle, inlineItem.processCode, "当前付款单PR子表"),
+    sourceUrl: "",
+    statement: "当前付款单未提供可直接打开的国内PR入口，以下内容来自付款页PR子表",
+    fields,
+    relationHints: [
+      inlineItem.prStatus ? `PR状态：${inlineItem.prStatus}` : "",
+      inlineItem.prPendingAmount ? `PR未提交付款金额：${inlineItem.prPendingAmount}` : "",
+      inlineItem.prCurrentSubmitAmount ? `PR本次提交金额：${inlineItem.prCurrentSubmitAmount}` : ""
+    ].filter(Boolean),
+    notes: ["仅展示，不自动判断", "来源：当前付款单页内PR子表"]
+  });
+}
+
+function countDomesticPrHeaderLikeFields(fields) {
+  const values = [
+    fields?.relatedTitle,
+    fields?.prStatus,
+    fields?.prAmount,
+    fields?.costDept,
+    fields?.costProject
+  ];
+  return values.filter((value) =>
+    /^(?:PR分类|PR状态|PR总额|PR金额|PR在途未付款金额|PR未提交付款金额|PR本次提交金额|相关流程|费用归属部门|费用归属项目|费用归属说明)$/.test(
+      cleanText(value || "")
+    )
+  ).length;
+}
+
+function shouldKeepDomesticPrDoc(doc, hasLinkedDocs = false) {
+  if (!doc) {
+    return false;
+  }
+  if (doc.sourceMode === "page_inline") {
+    return shouldKeepInlineDomesticPrDoc(doc, hasLinkedDocs);
+  }
+  if (doc.sourceMode === "linked_detail") {
+    const processCode = cleanText(doc?.fields?.processCode || "").toUpperCase();
+    if (processCode) {
+      return true;
+    }
+    return countDomesticPrHeaderLikeFields(doc?.fields || {}) < 2;
+  }
+  return true;
+}
+
+function finalizeDomesticPrDocs(docs) {
+  const deduped = [];
+  const seenProcessCodes = new Set();
+
+  for (const doc of docs || []) {
+    const processCode = cleanText(doc?.fields?.processCode || "").toUpperCase();
+    if (processCode) {
+      if (seenProcessCodes.has(processCode)) {
+        continue;
+      }
+      seenProcessCodes.add(processCode);
+    }
+    deduped.push(doc);
+  }
+
+  return deduped.map((doc, index) => ({
+    ...doc,
+    itemLabel: deduped.length > 1 ? `PR ${index + 1}` : ""
+  }));
+}
+
+function createMissingSourceDocument(input) {
+  return createRelatedDocumentBase({
+    kind: input.kind,
+    title: input.title,
+    itemLabel: input.itemLabel || "",
+    status: input.status || "info",
+    statusText: input.statusText || "未提供来源",
+    displayOnly: true,
+    sourceMode: input.sourceMode || "page_inline",
+    sourceName: input.sourceName || "",
+    sourceUrl: input.sourceUrl || "",
+    statement: input.statement || "",
+    relationHints: Array.isArray(input.relationHints) ? input.relationHints : [],
+    notes: Array.isArray(input.notes) ? input.notes : ["仅展示，不自动判断"]
+  });
+}
+
+function findSnapshotSignal(snapshot, patterns, fallback = "") {
+  const entries = [];
+  for (const pair of snapshot?.fieldPairs || []) {
+    entries.push(`${cleanText(pair?.label || "")}：${cleanText(pair?.value || "")}`);
+  }
+  if (snapshot?.bodyText) {
+    entries.push(cleanText(snapshot.bodyText));
+  }
+
+  for (const entry of entries) {
+    if (!entry) {
+      continue;
+    }
+    for (const pattern of patterns || []) {
+      const matched = entry.match(pattern);
+      if (matched?.[0]) {
+        return snippetAround(entry, matched[0]) || entry;
+      }
+    }
+  }
+
+  return fallback;
+}
+
+function normalizeDomesticPrQuarter(value) {
+  const text = cleanText(value || "");
+  if (!text) {
+    return "";
+  }
+  if (isLikelyDomesticPrPeriodNoiseText(text)) {
+    return "";
+  }
+  const upper = text.toUpperCase();
+  const qMatch = upper.match(/^Q([1-4])$/) || upper.match(/\bQ\s*([1-4])\b/);
+  if (qMatch) {
+    return qMatch[1];
+  }
+  if (/^[1-4]$/.test(upper)) {
+    return upper;
+  }
+  const cnMatch = upper.match(/第?\s*([一二三四1234])\s*季(?:度)?/);
+  if (cnMatch) {
+    return mapDomesticPrQuarterToken(cnMatch[1]);
+  }
+  if (/^[一二三四]$/.test(upper)) {
+    return mapDomesticPrQuarterToken(upper);
+  }
+  return "";
+}
+
+function isLikelyDomesticPrPeriodNoiseText(value) {
+  const text = cleanText(value || "");
+  if (!text) {
+    return false;
+  }
+  const compact = text.toUpperCase().replace(/\s+/g, "");
+  const years = [...new Set(compact.match(/20\d{2}/g) || [])];
+  const quarters = [...new Set(compact.match(/Q[1-4]/g) || [])];
+  if (years.length > 1 || quarters.length > 1) {
+    return true;
+  }
+  return /(?:20\d{2}){2,}/.test(compact) && /(?:Q[1-4]){2,}/.test(compact);
+}
+
+function buildDomesticPrPeriodMeta(yearValue, quarterValue, rawText = "") {
+  const year = normalizeDomesticPrYear(yearValue);
+  const quarter = normalizeDomesticPrQuarter(quarterValue);
+  const raw = cleanText(rawText || "");
+  return {
+    costYear: year,
+    costQuarter: quarter ? `Q${quarter}` : "",
+    costPeriodText: year && quarter ? `${year} / Q${quarter}` : raw,
+    costPeriodShort: year && quarter ? `${year.slice(-2)}Q${quarter}` : ""
+  };
+}
+
+function parseDomesticPrPeriodMeta(value) {
+  const text = cleanText(value || "");
+  if (!text) {
+    return buildDomesticPrPeriodMeta("", "", "");
+  }
+  if (isLikelyDomesticPrPeriodNoiseText(text)) {
+    return buildDomesticPrPeriodMeta("", "", "");
+  }
+
+  const patterns = [
+    /(20\d{2}|\d{2})\s*(?:年|[\/\-.])?\s*Q\s*([1-4])/i,
+    /(20\d{2}|\d{2})Q([1-4])/i,
+    /(20\d{2}|\d{2})\s*(?:年|[\/\-.])?\s*第?\s*([一二三四1234])\s*季(?:度)?/i,
+    /(20\d{2}|\d{2})\s*(?:年|[\/\-.])?\s*([1-4])\s*季(?:度)?/i
+  ];
+
+  for (const pattern of patterns) {
+    const matched = text.match(pattern);
+    if (matched) {
+      return buildDomesticPrPeriodMeta(matched[1], matched[2], text);
+    }
+  }
+
+  return buildDomesticPrPeriodMeta(text, text, text);
+}
+
+function pickDomesticPrPeriodCandidate(candidates = []) {
+  for (const candidate of candidates || []) {
+    const text = cleanText(candidate || "");
+    if (!text || isLikelyDomesticPrPeriodNoiseText(text)) {
+      continue;
+    }
+    const parsed = parseDomesticPrPeriodMeta(text);
+    if (parsed.costPeriodShort) {
+      return {
+        raw: text,
+        meta: parsed
+      };
+    }
+  }
+  return null;
+}
+
+function pickDomesticPrScalarCandidate(candidates = [], normalizer) {
+  for (const candidate of candidates || []) {
+    const text = cleanText(candidate || "");
+    if (!text || isLikelyDomesticPrPeriodNoiseText(text)) {
+      continue;
+    }
+    if (typeof normalizer === "function" && !normalizer(text)) {
+      continue;
+    }
+    return text;
+  }
+  return "";
+}
+
+async function extractDomesticPrPeriodFields(context, prLink, fields = {}) {
+  const combinedCandidates = await extractProcessFieldCandidatesWithFallback(
+    context,
+    ["费用发生年度", "费用发生期间", "费用期间", "发生期间"],
+    ["费用发生年度", "费用发生期间", "费用期间", "发生期间", "expensePeriod", "costPeriod", "occurPeriod"],
+    12
+  );
+  const yearCandidates = await extractProcessFieldCandidatesWithFallback(
+    context,
+    ["费用发生年度", "费用年度", "发生年度"],
+    ["费用发生年度", "费用年度", "发生年度", "expenseYear", "costYear", "occurYear"],
+    12
+  );
+  const quarterCandidates = await extractProcessFieldCandidatesWithFallback(
+    context,
+    ["费用发生季度", "费用季度", "发生季度", "季度"],
+    ["费用发生季度", "费用季度", "发生季度", "季度", "expenseQuarter", "costQuarter", "occurQuarter"],
+    12
+  );
+  const combinedMatch = pickDomesticPrPeriodCandidate(combinedCandidates);
+  const combinedText = combinedMatch?.raw || "";
+  const yearText = pickDomesticPrScalarCandidate(yearCandidates, normalizeDomesticPrYear);
+  const quarterText = pickDomesticPrScalarCandidate(quarterCandidates, normalizeDomesticPrQuarter);
+
+  let periodMeta = combinedMatch?.meta || buildDomesticPrPeriodMeta(yearText, quarterText, combinedText);
+  if (!periodMeta.costPeriodShort) {
+    const fallbackSources = [
+      ...combinedCandidates,
+      ...yearCandidates,
+      ...quarterCandidates,
+      combinedText,
+      `${yearText} ${quarterText}`.trim(),
+      fields?.purposeText,
+      fields?.requirementSummary,
+      prLink?.title,
+      ...(Array.isArray(prLink?.hintTexts) ? prLink.hintTexts : [])
+    ].filter(Boolean);
+
+    for (const source of fallbackSources) {
+      if (isLikelyDomesticPrPeriodNoiseText(source)) {
+        continue;
+      }
+      const parsed = parseDomesticPrPeriodMeta(source);
+      if (parsed.costPeriodShort) {
+        periodMeta = parsed;
+        break;
+      }
+    }
+  }
+
+  return periodMeta;
+}
+
+async function buildDomesticPrFields(context, prLink) {
+  const fields = {
+    processCode: await extractRelatedProcessCodeWithFallback(context, ["PR单号", "流程编号", "单号", "相关流程", "PR选择"], {
+      keyHints: ["PR单号", "流程编号", "单号", "相关流程", "PR选择", "processCode", "prCode", "prNo", "prnumber"],
+      preferredPattern: DOMESTIC_PR_CODE_RE
+    }),
+    relatedTitle: await extractProcessFieldWithFallback(context, ["相关流程", "PR标题", "PR名称", "流程标题", "标题"]),
+    prStatus: await extractProcessFieldWithFallback(context, ["PR状态", "状态"]),
+    costDept: await extractProcessFieldWithFallback(context, ["费用归属部门", "归属部门", "所属部门"]),
+    costProject: await extractProcessFieldWithFallback(context, ["费用归属项目", "归属项目", "所属项目"]),
+    purposeText: await extractProcessFieldWithFallback(context, ["订单用途说明", "用途说明", "费用用途说明", "申请事由", "采购用途"]),
+    costPurpose: await extractProcessFieldWithFallback(context, ["费用归属说明", "费用用途说明", "用途说明", "申请事由"]),
+    prAmount: await extractProcessFieldWithFallback(context, ["PR金额", "PR总额", "PR申请金额", "申请金额", "金额"]),
+    prPendingAmount: await extractProcessFieldWithFallback(context, ["PR未提交付款金额", "待提单金额", "剩余可提金额"]),
+    prCurrentSubmitAmount: await extractProcessFieldWithFallback(context, ["PR本次提交金额", "本次提交金额", "本次付款金额"]),
+    requirementSummary: await buildRequirementSummaryWithFallback(context)
+  };
+
+  if (!fields.requirementSummary && context.pageSnapshot) {
+    fields.requirementSummary = buildGenericSubformSummary(context.pageSnapshot);
+  }
+  if (!fields.purposeText && context.pageSnapshot) {
+    fields.purposeText = buildGenericSubformSummary(context.pageSnapshot, 2, 4);
+  }
+  if (!fields.costPurpose) {
+    fields.costPurpose = fields.purposeText;
+  }
+  if (!fields.requirementSummary) {
+    fields.requirementSummary = firstNonEmpty(fields.relatedTitle, fields.costPurpose);
+  }
+
+  return {
+    ...fields,
+    ...(await extractDomesticPrPeriodFields(context, prLink, fields))
+  };
+}
+
 async function analyzeDomesticPrLinks(relatedLinks, target, baseUrl, onProgress) {
   const prLink = pickRelatedLink(relatedLinks, "domestic_pr");
   if (!prLink) {
@@ -1191,19 +2099,7 @@ async function analyzeDomesticPrLinks(relatedLinks, target, baseUrl, onProgress)
     });
   }
 
-  const fields = {
-    processCode: await extractRelatedProcessCodeWithFallback(context, ["PR单号", "流程编号", "单号", "相关流程", "PR选择"], {
-      keyHints: ["PR单号", "流程编号", "单号", "相关流程", "PR选择", "processCode", "prCode", "prNo", "prnumber"],
-      preferredPattern: DOMESTIC_PR_CODE_RE
-    }),
-    costDept: await extractProcessFieldWithFallback(context, ["费用归属部门", "归属部门", "所属部门"]),
-    costProject: await extractProcessFieldWithFallback(context, ["费用归属项目", "归属项目", "所属项目"]),
-    purposeText: await extractProcessFieldWithFallback(context, ["订单用途说明", "用途说明", "费用用途说明", "申请事由", "采购用途"]),
-    prAmount: await extractProcessFieldWithFallback(context, ["PR金额", "PR总额", "PR申请金额", "申请金额", "金额"])
-  };
-  if (!fields.purposeText && context.pageSnapshot) {
-    fields.purposeText = buildGenericSubformSummary(context.pageSnapshot, 2, 4);
-  }
+  const fields = await buildDomesticPrFields(context, prLink);
 
   return createRelatedDocumentBase({
     kind: "domestic_pr",
@@ -1219,20 +2115,29 @@ async function analyzeDomesticPrLinks(relatedLinks, target, baseUrl, onProgress)
   });
 }
 
-async function analyzeDomesticPrLinksMulti(relatedLinks, target, baseUrl, onProgress) {
+async function analyzeDomesticPrLinksMulti(relatedLinks, target, baseUrl, onProgress, options = {}) {
+  const inlineItems = getInlineDomesticPrItems(options?.snapshot);
+  const inlineDocs = [];
+  const consumedInlineCodes = new Set();
   const prLinks = pickRelatedLinks(relatedLinks, "domestic_pr");
   if (prLinks.length === 0) {
-    return [
-      createRelatedDocumentBase({
-        kind: "domestic_pr",
-        title: "国内PR",
-        status: "warn",
-        statusText: "未找到",
-        displayOnly: true,
-        statement: "尚未发现明确的国内PR来源",
-        notes: ["仅展示，不自动判断"]
-      })
-    ];
+    if (inlineItems.length > 0) {
+      const standaloneDocs = inlineItems
+        .map((item, index) => buildInlineDomesticPrDoc(item, inlineItems.length > 1 ? `PR ${index + 1}` : ""))
+        .filter((doc) => shouldKeepDomesticPrDoc(doc, false));
+      if (standaloneDocs.length > 0) {
+        return finalizeDomesticPrDocs(standaloneDocs);
+      }
+    }
+    return [options?.missingDocument || createRelatedDocumentBase({
+      kind: "domestic_pr",
+      title: "国内PR",
+      status: "warn",
+      statusText: "未找到",
+      displayOnly: true,
+      statement: "尚未发现明确的国内PR来源",
+      notes: ["仅展示，不自动判断"]
+    })];
   }
 
   const docs = [];
@@ -1282,22 +2187,16 @@ async function analyzeDomesticPrLinksMulti(relatedLinks, target, baseUrl, onProg
       continue;
     }
 
-    const fields = {
-      processCode: await extractRelatedProcessCodeWithFallback(context, ["PR单号", "流程编号", "单号", "相关流程", "PR选择"], {
-        keyHints: ["PR单号", "流程编号", "单号", "相关流程", "PR选择", "processCode", "prCode", "prNo", "prnumber"],
-        preferredPattern: DOMESTIC_PR_CODE_RE
-      }),
-      costDept: await extractProcessFieldWithFallback(context, ["费用归属部门", "归属部门", "所属部门"]),
-      costProject: await extractProcessFieldWithFallback(context, ["费用归属项目", "归属项目", "所属项目"]),
-      purposeText: await extractProcessFieldWithFallback(context, ["订单用途说明", "用途说明", "费用用途说明", "申请事由", "采购用途"]),
-      prAmount: await extractProcessFieldWithFallback(context, ["PR金额", "PR总额", "PR申请金额", "申请金额", "金额"]),
-      requirementSummary: await buildRequirementSummaryWithFallback(context)
-    };
-    if (!fields.requirementSummary && context.pageSnapshot) {
-      fields.requirementSummary = buildGenericSubformSummary(context.pageSnapshot);
-    }
-    if (!fields.purposeText && context.pageSnapshot) {
-      fields.purposeText = buildGenericSubformSummary(context.pageSnapshot, 2, 4);
+    const fields = await buildDomesticPrFields(context, prLink);
+    const inlineItem = findMatchingInlineDomesticPrItem(
+      inlineItems,
+      fields.processCode,
+      prLink.title,
+      ...(Array.isArray(prLink?.hintTexts) ? prLink.hintTexts : [])
+    );
+    const mergedFields = mergeDomesticPrFields(fields, inlineItem);
+    if (inlineItem?.processCode) {
+      consumedInlineCodes.add(inlineItem.processCode);
     }
 
     docs.push(
@@ -1308,16 +2207,48 @@ async function analyzeDomesticPrLinksMulti(relatedLinks, target, baseUrl, onProg
         status: "info",
         statusText: "仅展示",
         displayOnly: true,
-        sourceName: normalizeRelatedSourceName(context.pageSnapshot, prLink.title, ref, fields.processCode),
+        sourceMode: "linked_detail",
+        sourceName: normalizeRelatedSourceName(context.pageSnapshot, prLink.title, ref, mergedFields.relatedTitle, mergedFields.processCode),
         sourceUrl: ref.detailUrl,
         statement: buildRelatedReadStatement("国内PR", context),
-        fields,
-        notes: ["仅展示，不自动判断", "PR金额仅作系统默认展示，不参与规则计算"]
+        fields: mergedFields,
+        relationHints: [
+          mergedFields.prStatus ? `PR状态：${mergedFields.prStatus}` : "",
+          mergedFields.prPendingAmount ? `PR未提交付款金额：${mergedFields.prPendingAmount}` : "",
+          mergedFields.prCurrentSubmitAmount ? `PR本次提交金额：${mergedFields.prCurrentSubmitAmount}` : ""
+        ].filter(Boolean),
+        notes: ["仅展示，不自动判断", "国内PR详情优先来自真实流程，页内PR子表只作为补充字段"]
       })
     );
   }
 
-  return docs;
+  for (const item of inlineItems) {
+    if (item.processCode && consumedInlineCodes.has(item.processCode)) {
+      continue;
+    }
+    const doc = buildInlineDomesticPrDoc(item, prLinks.length + inlineDocs.length + docs.length > 1 ? `PR ${docs.length + inlineDocs.length + 1}` : "");
+    if (doc && shouldKeepDomesticPrDoc(doc, docs.length > 0)) {
+      inlineDocs.push(doc);
+    }
+  }
+
+  const allDocs = finalizeDomesticPrDocs(
+    [...docs, ...inlineDocs].filter((doc) => shouldKeepDomesticPrDoc(doc, docs.length > 0))
+  );
+
+  if (allDocs.length === 0) {
+    return [options?.missingDocument || createRelatedDocumentBase({
+      kind: "domestic_pr",
+      title: "国内PR",
+      status: "warn",
+      statusText: "未找到",
+      displayOnly: true,
+      statement: "尚未发现明确的国内PR来源",
+      notes: ["仅展示，不自动判断"]
+    })];
+  }
+
+  return allDocs;
 }
 
 function createOrderCheck(key, label, status, statement) {
@@ -1352,10 +2283,10 @@ function pickPreferredCompanyCandidate(candidates, preferredCompany = "") {
   return cleanedCandidates[0];
 }
 
-async function analyzePurchaseOrderLinks(relatedLinks, target, baseUrl, onProgress) {
+async function analyzePurchaseOrderLinks(relatedLinks, target, baseUrl, onProgress, options = {}) {
   const orderLink = pickRelatedLink(relatedLinks, "purchase_order");
   if (!orderLink) {
-    return createRelatedDocumentBase({
+    return options?.missingDocument || createRelatedDocumentBase({
       kind: "purchase_order",
       title: "采购订单",
       status: "warn",
@@ -1441,7 +2372,7 @@ async function analyzePurchaseOrderLinks(relatedLinks, target, baseUrl, onProgre
   } else if (paymentAmount <= orderAmount + 0.01) {
     checks.push(createOrderCheck("payment_not_exceed_order_amount", "付款金额不超过订单金额", "pass", "付款金额未超过订单金额"));
   } else {
-    checks.push(createOrderCheck("payment_not_exceed_order_amount", "付款金额不超过订单金额", "fail", "浠樻閲戦瓒呰繃璁㈠崟閲戦"));
+    checks.push(createOrderCheck("payment_not_exceed_order_amount", "付款金额不超过订单金额", "fail", "付款金额超过订单金额"));
   }
 
   const hasFail = checks.some((item) => item.status === "fail");
@@ -1634,11 +2565,11 @@ async function extractAcceptanceAttachmentPreviews(attachments) {
   return previews;
 }
 
-async function analyzeAcceptanceMailLinksMulti(relatedLinks, target, baseUrl, onProgress) {
+async function analyzeAcceptanceMailLinksMulti(relatedLinks, target, baseUrl, onProgress, options = {}) {
   const acceptanceLinks = pickRelatedLinks(relatedLinks, "acceptance");
   if (acceptanceLinks.length === 0) {
     return [
-      createRelatedDocumentBase({
+      options?.missingDocument || createRelatedDocumentBase({
         kind: "acceptance",
         title: "验收单",
         status: "warn",
@@ -1887,21 +2818,21 @@ async function analyzeContractDetail(ref, attachments, baseFacts, target, source
   const pageSnapshotFallback = buildContractSnapshotFallback(pageSnapshot, ref?.detailUrl || "", sourceLabelPrefix);
   const matches = {
     amount: amountMatchesPayment(facts.paymentTerms || "", target.paymentAmount)
-      ? makeEvidence(`${sourceLabelPrefix}琛ㄥ崟`, ref.detailUrl, formatAmount(target.paymentAmount), facts.paymentTerms || "")
+      ? makeEvidence(`${sourceLabelPrefix}表单`, ref.detailUrl, formatAmount(target.paymentAmount), facts.paymentTerms || "")
       : null,
     company:
       companyMatchesPayment(facts.counterpartyCompany || "", target.payeeCompany) ||
       companyMatchesPayment(facts.paymentTerms || "", target.payeeCompany)
-        ? makeEvidence(`${sourceLabelPrefix}琛ㄥ崟`, ref.detailUrl, target.payeeCompany || "", facts.counterpartyCompany || facts.paymentTerms || "")
+        ? makeEvidence(`${sourceLabelPrefix}表单`, ref.detailUrl, target.payeeCompany || "", facts.counterpartyCompany || facts.paymentTerms || "")
         : null,
     account:
       accountMatchesPayment(facts.contractAccountNo || "", target.payeeAccount) ||
       accountMatchesPayment(facts.paymentTerms || "", target.payeeAccount)
-        ? makeEvidence(`${sourceLabelPrefix}琛ㄥ崟`, ref.detailUrl, target.payeeAccount || "", facts.contractAccountNo || facts.paymentTerms || "")
+        ? makeEvidence(`${sourceLabelPrefix}表单`, ref.detailUrl, target.payeeAccount || "", facts.contractAccountNo || facts.paymentTerms || "")
         : null
   };
 
-  const attachmentAnalysis = await analyzeAttachmentList(attachments || [], target, `${sourceLabelPrefix}闄勪欢`, onProgress, "contract-attachments");
+  const attachmentAnalysis = await analyzeAttachmentList(attachments || [], target, `${sourceLabelPrefix}附件`, onProgress, "contract-attachments");
 
   if (!facts.effectiveStart) facts.effectiveStart = pageSnapshotFallback.facts.effectiveStart || "";
   if (!facts.effectiveEnd) facts.effectiveEnd = pageSnapshotFallback.facts.effectiveEnd || "";
@@ -1919,7 +2850,7 @@ async function analyzeContractDetail(ref, attachments, baseFacts, target, source
   const candidateSources = [];
   if (facts.paymentTerms) {
     candidateSources.push({
-      sourceName: `${sourceLabelPrefix}琛ㄥ崟`,
+      sourceName: `${sourceLabelPrefix}表单`,
       sourceUrl: ref.detailUrl,
       text: facts.paymentTerms
     });
@@ -2109,6 +3040,7 @@ async function analyzeAttachmentList(attachments, target, sourceLabelPrefix, onP
           continue;
         }
         const detectedRole = detectAttachmentRole(attachment, text);
+        const looksLikeContractText = /合同|协议|甲方|乙方|签署日期|付款条件|付款方式|结算方式/i.test(text);
         const sourceName = `${sourceLabelPrefix}: ${attachment.name || "未命名附件"}`;
         referenceEntries.push({
           sourceName,
@@ -2118,7 +3050,7 @@ async function analyzeAttachmentList(attachments, target, sourceLabelPrefix, onP
           text
         });
 
-        if (!contractFacts.sourceName && /鍚堝悓|鍗忚/i.test(attachment.name || "")) {
+        if (!contractFacts.sourceName && (/(?:合同|协议)/i.test(attachment.name || "") || looksLikeContractText)) {
           const period = extractContractPeriod(text);
           const terms = extractPaymentTerms(text);
           if (period.start || period.end || terms) {
@@ -2131,11 +3063,25 @@ async function analyzeAttachmentList(attachments, target, sourceLabelPrefix, onP
         }
 
         if (amountMatchesPayment(text, target.paymentAmount)) {
+          const invoiceTypeMatch = pickFirstNormalizedValue(
+            [text, attachment?.name || "", attachment?.url || ""],
+            normalizeInvoiceSubtypeLabel
+          );
           considerEvidence(
             matches,
             matchMeta,
             "amount",
-            makeEvidence(sourceName, attachment.url || "", formatAmount(target.paymentAmount), snippetAround(text, String(target.paymentAmount || ""))),
+            makeEvidence(
+              sourceName,
+              attachment.url || "",
+              formatAmount(target.paymentAmount),
+              snippetAround(text, String(target.paymentAmount || "")),
+              {
+                invoiceTypeLabel: invoiceTypeMatch.label || "",
+                invoiceTypeRaw: invoiceTypeMatch.raw || "",
+                evidenceRole: detectedRole?.role || "other"
+              }
+            ),
             detectedRole,
             attachment
           );
@@ -2447,7 +3393,7 @@ function considerEvidence(matches, matchMeta, key, evidence, detectedRole, attac
   }
 }
 
-function buildAmountVerification(target, inventories, matched) {
+function buildAmountVerification(target, inventories, matched, invoiceTypeCheck) {
   if (!target.paymentAmount) {
     return createVerificationItem(
       "amount",
@@ -2462,15 +3408,19 @@ function buildAmountVerification(target, inventories, matched) {
   }
 
   if (matched) {
+    const invoiceTypePass = invoiceTypeCheck?.status === "pass";
+    const statement = invoiceTypePass
+      ? `已在${matched.sourceName}中找到相同金额，且票面为增值税专用发票、页面显示为增值税发票`
+      : `已在${matched.sourceName}中找到相同金额，但请确认发票类型`;
     return createVerificationItem(
       "amount",
       "金额一致",
-      "pass",
-      `已在${matched.sourceName}中找到相同金额`,
+      invoiceTypePass ? "pass" : "warn",
+      statement,
       matched.sourceName,
       matched.sourceUrl,
       matched.matchedValue,
-      matched.snippet
+      firstNonEmpty(invoiceTypeCheck?.snippet, matched.snippet)
     );
   }
 

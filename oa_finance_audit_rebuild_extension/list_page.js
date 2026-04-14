@@ -1,4 +1,4 @@
-﻿(() => {
+(() => {
   const SCRIPT_FLAG = "__oaFinanceAutoReviewListMounted__";
   if (globalThis[SCRIPT_FLAG]) {
     return;
@@ -6,7 +6,7 @@
   globalThis[SCRIPT_FLAG] = true;
 
   const PROGRESS_MESSAGE_TYPE = "oa-finance-rebuild-progress";
-  const PAYMENT_CODE_RE = /^DDFK-\d{8,}$/i;
+  const PAYMENT_CODE_RE = /^(?:DDFK|GNTYYFK)-\d{8,}$/i;
   const AUTO_REVIEW_COL_ATTR = "data-oa-finance-auto-review";
   const AUTO_REVIEW_WIDTH = "120px";
 
@@ -739,8 +739,8 @@
     return items
       .map(
         (item, index) => {
-          const label = formatVerificationLabel(item, index);
-          const statement = formatVerificationStatement(item, label);
+          const label = formatVerificationLabelMapped(item, index);
+          const statement = formatVerificationStatementMapped(item, label);
           const sourceAction = renderSourceAction(item?.sourceName, item?.sourceUrl, "打开证据");
           return `
           <div class="oa-finance-auto-review-check">
@@ -772,11 +772,28 @@
         : [];
     const domesticText = domesticItems
       .map((item, index) => {
-        const summary = cleanText(item?.fields?.requirementSummary || item?.summary);
+        const summary = cleanText(
+          item?.fields?.requirementSummary ||
+          item?.fields?.relatedTitle ||
+          item?.fields?.costPurpose ||
+          item?.fields?.purposeText ||
+          item?.summary
+        );
+        const meta = joinMeaningfulTexts(
+          [
+            cleanText(item?.fields?.processCode),
+            cleanText(item?.fields?.prCurrentSubmitAmount) ? `本次提交：${cleanText(item?.fields?.prCurrentSubmitAmount)}` : "",
+            cleanText(item?.fields?.prStatus) ? `状态：${cleanText(item?.fields?.prStatus)}` : ""
+          ],
+          3,
+          " ｜ "
+        );
+        const title = cleanText(item?.fields?.processCode) || `PR ${index + 1}`;
         return summary
           ? `
             <div class="oa-finance-auto-review-pr-block">
-              <div class="oa-finance-auto-review-pr-title">PR ${index + 1}</div>
+              <div class="oa-finance-auto-review-pr-title">${escapeHtml(title)}</div>
+              ${meta ? `<div class="oa-finance-auto-review-related-summary">${escapeHtml(meta)}</div>` : ""}
               ${renderExpandableText(summary, 4)}
             </div>
           `
@@ -1242,6 +1259,108 @@
     state.cleanupFns.push(() => chrome.runtime.onMessage.removeListener(handleProgressMessage));
     state.cleanupFns.push(() => document.removeEventListener("click", handleDocumentClick, true));
     state.cleanupFns.push(() => window.removeEventListener("resize", debounceRefresh));
+  }
+
+  /* const VERIFICATION_LABEL_MAP = {
+    amount: "閲戦涓€鑷?,
+    company: "鏀舵鍏徃鍚嶇О涓€鑷?,
+    account: "鏀舵璐﹀彿涓€鑷?
+  };
+  const VERIFICATION_STATEMENT_MAP = {
+    amount: {
+      pass: (value) => value ? `宸插懡涓竴鑷撮噾棰濓細${value}` : "宸插懡涓竴鑷撮噾棰?,
+      fail: () => "宸插彂鐜颁笉涓€鑷撮噾棰濓紝璇蜂汉宸ュ鏍?,
+      fallback: () => "鏆傛湭鎷垮埌鍙‘璁ょ殑涓€鑷撮噾棰濊瘉鎹?
+    },
+    company: {
+      pass: (value) => value ? `宸插懡涓竴鑷存敹娆惧叕鍙革細${value}` : "宸插懡涓竴鑷存敹娆惧叕鍙?,
+      fail: () => "宸插彂鐜颁笉涓€鑷存敹娆惧叕鍙革紝璇蜂汉宸ュ鏍?,
+      fallback: () => "鏆傛湭鎷垮埌鍙‘璁ょ殑涓€鑷存敹娆惧叕鍙歌瘉鎹?
+    },
+    account: {
+      pass: (value) => value ? `宸插懡涓竴鑷存敹娆捐处鍙凤細${value}` : "宸插懡涓竴鑷存敹娆捐处鍙?,
+      fail: () => "宸插彂鐜颁笉涓€鑷存敹娆捐处鍙凤紝璇蜂汉宸ュ鏍?,
+      fallback: () => "鏆傛湭鎷垮埌鍙‘璁ょ殑涓€鑷存敹娆捐处鍙疯瘉鎹?
+    }
+  };
+  const INDEX_FALLBACK_KEY = ["amount", "company", "account"];
+
+  function formatVerificationLabelMapped(item, index) {
+    const key = cleanText(item?.key);
+    return (
+      VERIFICATION_LABEL_MAP[key] ||
+      VERIFICATION_LABEL_MAP[INDEX_FALLBACK_KEY[index]] ||
+      cleanText(item?.label) ||
+      "鏍稿椤?"
+    );
+  }
+
+  function formatVerificationStatementMapped(item, label) {
+    const matchedValue = cleanText(item?.matchedValue);
+    const status = cleanText(item?.status);
+    const key = cleanText(item?.key) || INDEX_FALLBACK_KEY[Object.values(VERIFICATION_LABEL_MAP).indexOf(label)] || "";
+    const templates = VERIFICATION_STATEMENT_MAP[key];
+    if (templates) {
+      if (status === "pass") return templates.pass(matchedValue);
+      if (status === "fail") return templates.fail();
+    }
+    const statement = cleanText(item?.statement);
+    if (statement && !isLikelyBrokenText(statement)) {
+      return statement;
+    }
+    return templates?.fallback() || "鏆傛湭鐢熸垚璇存槑";
+  }
+
+  */
+
+  const VERIFICATION_LABEL_MAP_SAFE = {
+    amount: "金额一致",
+    company: "收款公司名称一致",
+    account: "收款账号一致"
+  };
+  const VERIFICATION_STATEMENT_MAP_SAFE = {
+    amount: {
+      pass: (value) => value ? `已命中一致金额：${value}` : "已命中一致金额",
+      fail: () => "已发现不一致金额，请人工复核",
+      fallback: () => "暂未拿到可确认的一致金额证据"
+    },
+    company: {
+      pass: (value) => value ? `已命中一致收款公司：${value}` : "已命中一致收款公司",
+      fail: () => "已发现不一致收款公司，请人工复核",
+      fallback: () => "暂未拿到可确认的一致收款公司证据"
+    },
+    account: {
+      pass: (value) => value ? `已命中一致收款账号：${value}` : "已命中一致收款账号",
+      fail: () => "已发现不一致收款账号，请人工复核",
+      fallback: () => "暂未拿到可确认的一致收款账号证据"
+    }
+  };
+  const INDEX_FALLBACK_KEY_SAFE = ["amount", "company", "account"];
+
+  function formatVerificationLabelMapped(item, index) {
+    const key = cleanText(item?.key);
+    return (
+      VERIFICATION_LABEL_MAP_SAFE[key] ||
+      VERIFICATION_LABEL_MAP_SAFE[INDEX_FALLBACK_KEY_SAFE[index]] ||
+      cleanText(item?.label) ||
+      "核对项"
+    );
+  }
+
+  function formatVerificationStatementMapped(item, label) {
+    const matchedValue = cleanText(item?.matchedValue);
+    const status = cleanText(item?.status);
+    const key = cleanText(item?.key) || INDEX_FALLBACK_KEY_SAFE[Object.values(VERIFICATION_LABEL_MAP_SAFE).indexOf(label)] || "";
+    const templates = VERIFICATION_STATEMENT_MAP_SAFE[key];
+    if (templates) {
+      if (status === "pass") return templates.pass(matchedValue);
+      if (status === "fail") return templates.fail();
+    }
+    const statement = cleanText(item?.statement);
+    if (statement && !isLikelyBrokenText(statement)) {
+      return statement;
+    }
+    return templates?.fallback() || "暂未生成说明";
   }
 
   mount();

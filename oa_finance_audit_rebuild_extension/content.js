@@ -38,7 +38,9 @@
   const ROOT_BOTTOM = 24;
   const ROOT_MIN_TOP = 16;
   const DEFAULT_PANEL_TOP = 72;
+  const DEFAULT_PANEL_RIGHT = ROOT_RIGHT;
   const DEFAULT_PANEL_WIDTH = 500;
+  const DEFAULT_PANEL_HEIGHT = 640;
   const MIN_PANEL_WIDTH = 380;
   const MAX_PANEL_WIDTH = 700;
   const MIN_PANEL_HEIGHT = 320;
@@ -70,10 +72,13 @@
     analysis: null,
     errorText: "",
     isRunning: false,
+    activeRequestId: "",
     progressItems: [],
     progressCollapsed: false,
     panelWidth: DEFAULT_PANEL_WIDTH,
     panelTop: DEFAULT_PANEL_TOP,
+    panelRight: DEFAULT_PANEL_RIGHT,
+    panelHeight: getDefaultPanelHeight(),
     openSections: new Set(DEFAULT_OPEN_SECTIONS),
     uiLoaded: false,
     isDragging: false,
@@ -121,6 +126,12 @@
     });
   }
 
+  function createRequestId(scope = "detail") {
+    const prefix = cleanText(scope || "detail").replace(/[^a-z0-9_-]+/gi, "-") || "detail";
+    const suffix = Math.random().toString(16).slice(2, 8);
+    return `${prefix}-${Date.now()}-${suffix}`;
+  }
+
   function extractProcessCodeFromUrl() {
     try {
       const url = new URL(window.location.href);
@@ -147,6 +158,10 @@
     return Math.max(280, Math.min(MAX_PANEL_WIDTH, availableWidth));
   }
 
+  function getPanelShellWidth(panelWidth = state.panelWidth, railOnly = isRailOnly()) {
+    return railOnly ? PANEL_RAIL_WIDTH : PANEL_RAIL_WIDTH + PANEL_WORKSPACE_GAP + clampPanelWidth(panelWidth);
+  }
+
   function clampPanelWidth(value) {
     const numeric = Number(value);
     const resolved = Number.isFinite(numeric) ? numeric : DEFAULT_PANEL_WIDTH;
@@ -155,19 +170,54 @@
     return Math.max(minWidth, Math.min(maxWidth, resolved));
   }
 
-  function getPanelMaxTop() {
-    return Math.max(ROOT_MIN_TOP, window.innerHeight - ROOT_BOTTOM - MIN_PANEL_HEIGHT);
+  function getDefaultPanelHeight() {
+    return Math.max(MIN_PANEL_HEIGHT, window.innerHeight - DEFAULT_PANEL_TOP - ROOT_BOTTOM);
   }
 
-  function clampPanelTop(value) {
+  function getPanelMaxRight(panelWidth = state.panelWidth, railOnly = isRailOnly()) {
+    return Math.max(ROOT_RIGHT, window.innerWidth - ROOT_LEFT_PADDING - getPanelShellWidth(panelWidth, railOnly));
+  }
+
+  function clampPanelRight(value, panelWidth = state.panelWidth, railOnly = isRailOnly()) {
+    const numeric = Number(value);
+    const resolved = Number.isFinite(numeric) ? numeric : DEFAULT_PANEL_RIGHT;
+    const maxRight = getPanelMaxRight(panelWidth, railOnly);
+    return Math.max(ROOT_RIGHT, Math.min(maxRight, resolved));
+  }
+
+  function getPanelMaxHeight(panelTop = state.panelTop) {
+    return Math.max(MIN_PANEL_HEIGHT, window.innerHeight - panelTop - ROOT_BOTTOM);
+  }
+
+  function clampPanelHeight(value, panelTop = state.panelTop) {
+    const numeric = Number(value);
+    const resolved = Number.isFinite(numeric) && numeric > 0 ? numeric : getDefaultPanelHeight();
+    const maxHeight = getPanelMaxHeight(panelTop);
+    return Math.max(MIN_PANEL_HEIGHT, Math.min(maxHeight, resolved));
+  }
+
+  function getPanelMaxTop(panelHeight = state.panelHeight) {
+    const effectiveHeight = isRailOnly()
+      ? Math.max(96, Math.ceil(root.getBoundingClientRect().height || 0))
+      : clampPanelHeight(panelHeight, ROOT_MIN_TOP);
+    return Math.max(ROOT_MIN_TOP, window.innerHeight - ROOT_BOTTOM - effectiveHeight);
+  }
+
+  function clampPanelTop(value, panelHeight = state.panelHeight) {
     const numeric = Number(value);
     const resolved = Number.isFinite(numeric) ? numeric : DEFAULT_PANEL_TOP;
-    return Math.max(ROOT_MIN_TOP, Math.min(getPanelMaxTop(), resolved));
+    return Math.max(ROOT_MIN_TOP, Math.min(getPanelMaxTop(panelHeight), resolved));
   }
 
   function clampPanelUiState() {
-    state.panelWidth = clampPanelWidth(state.panelWidth);
-    state.panelTop = clampPanelTop(state.panelTop);
+    const width = clampPanelWidth(state.panelWidth);
+    const right = clampPanelRight(state.panelRight, width);
+    const top = clampPanelTop(state.panelTop, state.panelHeight);
+    const height = clampPanelHeight(state.panelHeight, top);
+    state.panelWidth = width;
+    state.panelRight = right;
+    state.panelTop = clampPanelTop(top, height);
+    state.panelHeight = clampPanelHeight(height, state.panelTop);
   }
 
   function scheduleUiStatePersist() {
@@ -185,6 +235,8 @@
             version: 1,
             width: state.panelWidth,
             top: state.panelTop,
+            right: state.panelRight,
+            height: state.panelHeight,
             openSections: Array.from(state.openSections)
           }
         },
@@ -206,6 +258,12 @@
           if (Object.prototype.hasOwnProperty.call(saved, "top")) {
             state.panelTop = saved.top;
           }
+          if (Object.prototype.hasOwnProperty.call(saved, "right")) {
+            state.panelRight = saved.right;
+          }
+          if (Object.prototype.hasOwnProperty.call(saved, "height")) {
+            state.panelHeight = saved.height;
+          }
           if (Array.isArray(saved.openSections)) {
             state.openSections = new Set(normalizeSectionKeys(saved.openSections));
           }
@@ -222,6 +280,10 @@
 
   function isRailOnly() {
     return state.openSections.size === 0;
+  }
+
+  function isOverviewSolo() {
+    return state.openSections.size === 1 && state.openSections.has("overview");
   }
 
   function isSectionOpen(sectionKey) {
@@ -253,9 +315,12 @@
   function applyPanelLayout() {
     clampPanelUiState();
     root.style.top = `${state.panelTop}px`;
-    root.style.bottom = isRailOnly() ? "auto" : `${ROOT_BOTTOM}px`;
+    root.style.right = `${state.panelRight}px`;
+    root.style.bottom = "auto";
+    root.style.height = isRailOnly() ? "auto" : `${state.panelHeight}px`;
     root.style.setProperty("--oa-finance-rebuild-panel-width", `${state.panelWidth}px`);
     root.classList.toggle("is-rail-only", isRailOnly());
+    root.classList.toggle("is-overview-solo", isOverviewSolo() && !isRailOnly());
     root.classList.toggle("is-dragging", state.isDragging);
     root.classList.toggle("is-resizing", state.isResizing);
   }
@@ -272,11 +337,14 @@
     if (event.button !== 0 && event.pointerType !== "touch") {
       return;
     }
+    const startX = event.clientX;
     const startY = event.clientY;
+    const startRight = state.panelRight;
     const startTop = state.panelTop;
+    const startHeight = state.panelHeight;
     state.isDragging = true;
     applyPanelLayout();
-    setInteractionMode(true, "ns-resize");
+    setInteractionMode(true, "move");
     handle.setPointerCapture?.(event.pointerId);
     event.preventDefault();
 
@@ -284,7 +352,8 @@
       if (moveEvent.pointerId !== event.pointerId) {
         return;
       }
-      state.panelTop = clampPanelTop(startTop + (moveEvent.clientY - startY));
+      state.panelTop = clampPanelTop(startTop + (moveEvent.clientY - startY), startHeight);
+      state.panelRight = clampPanelRight(startRight - (moveEvent.clientX - startX), state.panelWidth);
       applyPanelLayout();
     };
 
@@ -325,7 +394,51 @@
       if (moveEvent.pointerId !== event.pointerId) {
         return;
       }
-      state.panelWidth = clampPanelWidth(startWidth - (moveEvent.clientX - startX));
+      const nextWidth = clampPanelWidth(startWidth - (moveEvent.clientX - startX));
+      state.panelWidth = nextWidth;
+      state.panelRight = clampPanelRight(state.panelRight, nextWidth);
+      applyPanelLayout();
+    };
+
+    const finish = (finishEvent) => {
+      if (finishEvent.pointerId !== event.pointerId) {
+        return;
+      }
+      handle.removeEventListener("pointermove", handleMove);
+      handle.removeEventListener("pointerup", finish);
+      handle.removeEventListener("pointercancel", finish);
+      state.isResizing = false;
+      applyPanelLayout();
+      setInteractionMode(false, "");
+      scheduleUiStatePersist();
+    };
+
+    handle.addEventListener("pointermove", handleMove);
+    handle.addEventListener("pointerup", finish);
+    handle.addEventListener("pointercancel", finish);
+  }
+
+  function startPanelResizeY(event, handle) {
+    if (state.isDragging) {
+      return;
+    }
+    if (event.button !== 0 && event.pointerType !== "touch") {
+      return;
+    }
+    const startY = event.clientY;
+    const startHeight = state.panelHeight;
+    const startTop = state.panelTop;
+    state.isResizing = true;
+    applyPanelLayout();
+    setInteractionMode(true, "ns-resize");
+    handle.setPointerCapture?.(event.pointerId);
+    event.preventDefault();
+
+    const handleMove = (moveEvent) => {
+      if (moveEvent.pointerId !== event.pointerId) {
+        return;
+      }
+      state.panelHeight = clampPanelHeight(startHeight + (moveEvent.clientY - startY), startTop);
       applyPanelLayout();
     };
 
@@ -693,8 +806,54 @@
     return STATUS_TEXT[check?.status] || check?.status || "预警";
   }
 
+  function normalizeDomesticPrQuarterDisplay(value) {
+    const text = cleanText(value).toUpperCase();
+    if (!text) {
+      return "";
+    }
+    if (/^Q[1-4]$/.test(text)) {
+      return text;
+    }
+    if (/^[1-4]$/.test(text)) {
+      return `Q${text}`;
+    }
+    return text;
+  }
+
+  function buildDomesticPrPeriodMeta(doc) {
+    const fields = doc?.fields || {};
+    const short = cleanText(fields.costPeriodShort);
+    const text = cleanText(fields.costPeriodText);
+    const year = cleanText(fields.costYear);
+    const quarter = normalizeDomesticPrQuarterDisplay(fields.costQuarter);
+
+    if (short) {
+      return {
+        short,
+        text: text || short
+      };
+    }
+
+    if (year && quarter) {
+      return {
+        short: `${year.slice(-2)}${quarter}`,
+        text: text || `${year} / ${quarter}`
+      };
+    }
+
+    return {
+      short: "",
+      text
+    };
+  }
+
   function getRelatedCardTitle(title, doc) {
-    return doc?.itemLabel || title;
+    const baseTitle = cleanText(doc?.fields?.processCode) || doc?.itemLabel || title;
+    if (doc?.kind !== "domestic_pr") {
+      return baseTitle;
+    }
+    const periodMeta = buildDomesticPrPeriodMeta(doc);
+    return periodMeta.short ? `${baseTitle} ${periodMeta.short}` : baseTitle;
   }
 
   function buildRelatedHoverLines(doc) {
@@ -704,11 +863,27 @@
 
     if (doc.kind === "domestic_pr") {
       const lines = [];
-      if (hasMeaningfulText(doc.fields?.requirementSummary)) {
-        lines.push(`需求描述：${doc.fields.requirementSummary}`);
+      const periodMeta = buildDomesticPrPeriodMeta(doc);
+      if (hasMeaningfulText(periodMeta.text || periodMeta.short)) {
+        lines.push(`费用期间：${periodMeta.text || periodMeta.short}`);
+      }
+      if (hasMeaningfulText(doc.fields?.relatedTitle)) {
+        lines.push(`相关流程：${doc.fields.relatedTitle}`);
+      }
+      if (hasMeaningfulText(doc.fields?.requirementSummary || doc.fields?.costPurpose || doc.fields?.purposeText)) {
+        lines.push(`需求描述：${doc.fields.requirementSummary || doc.fields?.costPurpose || doc.fields?.purposeText}`);
       }
       if (hasMeaningfulText(doc.fields?.processCode)) {
         lines.push(`PR单号：${doc.fields.processCode}`);
+      }
+      if (hasMeaningfulText(doc.fields?.prStatus)) {
+        lines.push(`PR状态：${doc.fields.prStatus}`);
+      }
+      if (hasMeaningfulText(doc.fields?.prCurrentSubmitAmount)) {
+        lines.push(`PR本次提交金额：${doc.fields.prCurrentSubmitAmount}`);
+      }
+      if (hasMeaningfulText(doc.fields?.prPendingAmount)) {
+        lines.push(`PR未提交付款金额：${doc.fields.prPendingAmount}`);
       }
       return lines;
     }
@@ -913,12 +1088,17 @@
     const cardTitle = getRelatedCardTitle(title, doc);
 
     if (doc.kind === "domestic_pr") {
-      if (hasMeaningfulText(doc.fields?.requirementSummary)) {
-        pushKvRow(rows, "需求描述", summarizeDisplayText(doc.fields?.requirementSummary, 180));
+      const periodMeta = buildDomesticPrPeriodMeta(doc);
+      pushKvRow(rows, "费用期间", periodMeta.text || periodMeta.short);
+      if (hasMeaningfulText(doc.fields?.requirementSummary || doc.fields?.relatedTitle || doc.fields?.costPurpose || doc.fields?.purposeText)) {
+        pushKvRow(rows, "需求描述", summarizeDisplayText(doc.fields?.requirementSummary || doc.fields?.relatedTitle || doc.fields?.costPurpose || doc.fields?.purposeText, 180));
       } else {
         pushKvRow(rows, "需求描述", "已进入国内PR页，但暂未提取到品牌、型号、规格、配置、技术要求或说明");
       }
       pushKvRow(rows, "PR单号", usefulSourceName(doc.fields?.processCode));
+      pushKvRow(rows, "PR状态", usefulSourceName(doc.fields?.prStatus));
+      pushKvRow(rows, "本次提交", usefulSourceName(doc.fields?.prCurrentSubmitAmount));
+      pushKvRow(rows, "费用归属部门", summarizeDisplayText(doc.fields?.costDept, 120));
     }
 
     if (doc.kind === "purchase_order") {
@@ -952,7 +1132,9 @@
           <div class="oa-finance-rebuild-section-title">${escapeHtml(cardTitle)}</div>
           <span class="oa-finance-rebuild-result-pill is-${relatedBadgeClass(doc.status)}">${escapeHtml(doc.statusText || "待处理")}</span>
         </div>
-        ${rows.join("") || "<p class='oa-finance-rebuild-empty'>暂无可展示信息</p>"}
+        <div class="oa-finance-rebuild-related-body">
+          ${rows.join("") || "<p class='oa-finance-rebuild-empty'>暂无可展示信息</p>"}
+        </div>
         ${hoverHtml}
         ${
           doc.sourceUrl
@@ -998,59 +1180,73 @@
   function renderPageSummary(analysis) {
     const summary = analysis.pageSummary || {};
     const target = analysis.paymentTarget || {};
+    const summaryItems = [
+      { label: "附件", value: summary.attachmentCount || 0 },
+      { label: "发票附件", value: summary.invoiceAttachmentCount || 0 },
+      { label: "国内PR链接", value: summary.domesticPrLinkCount || 0 },
+      { label: "采购订单链接", value: summary.purchaseOrderLinkCount || 0 },
+      { label: "合同来源", value: (summary.contractAttachmentCount || 0) + (summary.contractLinkCount || 0) },
+      { label: "账号附件", value: summary.bankChangeAttachmentCount || 0 },
+      { label: "验收来源", value: (summary.acceptanceAttachmentCount || 0) + (summary.acceptanceLinkCount || 0) },
+      { label: "其他链接", value: summary.otherLinkCount || 0 },
+      { label: "结构化发票", value: summary.invoiceStructuredCount || 0 }
+    ];
+    const targetItems = [
+      { label: "付款单号", value: target.processCode || "未识别" },
+      { label: "付款金额", value: models.formatAmount(target.paymentAmount) || "未识别" },
+      { label: "收款公司", value: target.payeeCompany || "未识别", wide: true },
+      { label: "收款账号", value: target.payeeAccount || "未识别", wide: true }
+    ];
     return `
-      <section class="oa-finance-rebuild-section">
-        <div class="oa-finance-rebuild-section-title">页面采集结果</div>
-        <div class="oa-finance-rebuild-grid">
-          <div class="oa-finance-rebuild-mini">
-            <span>附件</span>
-            <strong>${summary.attachmentCount || 0}</strong>
-          </div>
-          <div class="oa-finance-rebuild-mini">
-            <span>发票附件</span>
-            <strong>${summary.invoiceAttachmentCount || 0}</strong>
-          </div>
-          <div class="oa-finance-rebuild-mini">
-            <span>国内PR链接</span>
-            <strong>${summary.domesticPrLinkCount || 0}</strong>
-          </div>
+      <section class="oa-finance-rebuild-section oa-finance-rebuild-page-summary">
+        <div class="oa-finance-rebuild-page-summary-head">
+          <div class="oa-finance-rebuild-section-title">页面采集结果</div>
+          <span class="oa-finance-rebuild-page-summary-note">采集概览</span>
         </div>
-        <div class="oa-finance-rebuild-grid">
-          <div class="oa-finance-rebuild-mini">
-            <span>采购订单链接</span>
-            <strong>${summary.purchaseOrderLinkCount || 0}</strong>
-          </div>
-          <div class="oa-finance-rebuild-mini">
-            <span>合同来源</span>
-            <strong>${(summary.contractAttachmentCount || 0) + (summary.contractLinkCount || 0)}</strong>
-          </div>
-          <div class="oa-finance-rebuild-mini">
-            <span>账号附件</span>
-            <strong>${summary.bankChangeAttachmentCount || 0}</strong>
-          </div>
+        <div class="oa-finance-rebuild-page-summary-stats">
+          ${summaryItems
+            .map(
+              (item) => `
+                <div class="oa-finance-rebuild-mini">
+                  <span>${escapeHtml(item.label)}</span>
+                  <strong>${escapeHtml(String(item.value))}</strong>
+                </div>
+              `
+            )
+            .join("")}
         </div>
-        <div class="oa-finance-rebuild-grid">
-          <div class="oa-finance-rebuild-mini">
-            <span>验收来源</span>
-            <strong>${(summary.acceptanceAttachmentCount || 0) + (summary.acceptanceLinkCount || 0)}</strong>
+        <div class="oa-finance-rebuild-page-summary-target">
+          <div class="oa-finance-rebuild-page-summary-subtitle">当前付款单</div>
+          <div class="oa-finance-rebuild-page-summary-target-grid">
+            ${targetItems
+              .map((item) => {
+                const value =
+                  typeof item.value === "number" || hasMeaningfulText(item.value) ? String(item.value) : "未识别";
+                return `
+                  <div class="oa-finance-rebuild-target-item ${item.wide ? "is-wide" : ""}">
+                    <span>${escapeHtml(item.label)}</span>
+                    <strong title="${escapeHtml(value)}">${escapeHtml(value)}</strong>
+                  </div>
+                `;
+              })
+              .join("")}
           </div>
-          <div class="oa-finance-rebuild-mini">
-            <span>其他链接</span>
-            <strong>${summary.otherLinkCount || 0}</strong>
-          </div>
-          <div class="oa-finance-rebuild-mini">
-            <span>结构化发票</span>
-            <strong>${summary.invoiceStructuredCount || 0}</strong>
-          </div>
-        </div>
-        <div class="oa-finance-rebuild-target">
-          <div><span>付款单号</span><strong>${escapeHtml(target.processCode || "未识别")}</strong></div>
-          <div><span>付款金额</span><strong>${escapeHtml(models.formatAmount(target.paymentAmount) || "未识别")}</strong></div>
-          <div><span>收款公司</span><strong>${escapeHtml(target.payeeCompany || "未识别")}</strong></div>
-          <div><span>收款账号</span><strong>${escapeHtml(target.payeeAccount || "未识别")}</strong></div>
         </div>
       </section>
     `;
+  }
+
+  function renderOverviewSideSummary(analysis) {
+    if (!analysis) {
+      return `
+        <div class="oa-finance-rebuild-panel-card oa-finance-rebuild-overview-side-empty">
+          <div class="oa-finance-rebuild-section-title">采集概览</div>
+          <p class="oa-finance-rebuild-empty">开始采集后，这里会展示页面采集结果和当前付款单关键信息。</p>
+        </div>
+      `;
+    }
+
+    return renderPageSummary(analysis);
   }
 
   function renderEvidencePoolSummary(analysis) {
@@ -1159,8 +1355,31 @@
     return "";
   }
 
+  function renderOverviewSolo(analysis, verificationHtml) {
+    return `
+      <div class="oa-finance-rebuild-overview-solo">
+        <div class="oa-finance-rebuild-overview-solo-main">
+          ${renderProgressSection()}
+          <section class="oa-finance-rebuild-section">
+            <div class="oa-finance-rebuild-section-title">三项主核对</div>
+            <div class="oa-finance-rebuild-results">
+              ${verificationHtml || "<p class='oa-finance-rebuild-empty'>点击“开始采集”后，这里会显示金额、收款公司、收款账号三项主核对。</p>"}
+            </div>
+          </section>
+          ${renderErrorSection()}
+        </div>
+        <div class="oa-finance-rebuild-overview-solo-side" role="complementary" aria-label="主核对辅助信息">
+          ${renderOverviewSideSummary(analysis)}
+        </div>
+      </div>
+    `;
+  }
+
   function renderSectionContent(sectionKey, analysis, verificationHtml) {
     if (sectionKey === "overview") {
+      if (isOverviewSolo()) {
+        return renderOverviewSolo(analysis, verificationHtml);
+      }
       return `
         ${renderProgressSection()}
         <section class="oa-finance-rebuild-section">
@@ -1213,13 +1432,29 @@
     `;
   }
 
+  function renderCollapseAllButton(openCount, extraClass = "") {
+    const className = ["oa-finance-rebuild-collapse-all", extraClass].filter(Boolean).join(" ");
+    return `
+      <button
+        class="${className}"
+        type="button"
+        ${openCount === 0 ? "disabled" : ""}
+      >
+        全部收起
+      </button>
+    `;
+  }
+
   function renderPanelSection(sectionKey, analysis, verificationHtml) {
     const section = PANEL_SECTIONS[sectionKey];
     const isOpen = isSectionOpen(sectionKey);
+    const overviewSolo = isOverviewSolo();
     const bodyId = `oa-finance-rebuild-section-${sectionKey}`;
     const summary = getSectionSummary(sectionKey, analysis);
+    const soloClass =
+      overviewSolo && sectionKey !== "overview" ? "is-overview-solo-secondary" : overviewSolo ? "is-overview-solo-primary" : "";
     return `
-      <section class="oa-finance-rebuild-panel-section ${isOpen ? "" : "is-collapsed"}" data-panel-section="${escapeHtml(sectionKey)}">
+      <section class="oa-finance-rebuild-panel-section ${isOpen ? "" : "is-collapsed"} ${soloClass}" data-panel-section="${escapeHtml(sectionKey)}">
         <button
           class="oa-finance-rebuild-panel-section-toggle"
           type="button"
@@ -1318,6 +1553,12 @@
       return;
     }
 
+    const resizeHandleY = eventEl.closest(".oa-finance-rebuild-resize-handle-y");
+    if (resizeHandleY) {
+      startPanelResizeY(event, resizeHandleY);
+      return;
+    }
+
     const resizeHandle = eventEl.closest(".oa-finance-rebuild-resize-handle");
     if (resizeHandle) {
       startPanelResize(event, resizeHandle);
@@ -1333,9 +1574,16 @@
   function handleViewportResize() {
     const previousWidth = state.panelWidth;
     const previousTop = state.panelTop;
+    const previousRight = state.panelRight;
+    const previousHeight = state.panelHeight;
     clampPanelUiState();
     applyPanelLayout();
-    if (previousWidth !== state.panelWidth || previousTop !== state.panelTop) {
+    if (
+      previousWidth !== state.panelWidth ||
+      previousTop !== state.panelTop ||
+      previousRight !== state.panelRight ||
+      previousHeight !== state.panelHeight
+    ) {
       scheduleUiStatePersist();
     }
   }
@@ -1356,12 +1604,15 @@
     const verificationHtml = (analysis?.verificationItems || []).map((item) => renderVerificationItem(item)).join("");
     const openCount = state.openSections.size;
     const railButtonsHtml = PANEL_SECTION_ORDER.map((sectionKey) => renderRailButton(sectionKey, analysis)).join("");
+    const railCollapseButtonHtml = renderCollapseAllButton(openCount, "oa-finance-rebuild-rail-collapse");
 
     if (isRailOnly()) {
       root.innerHTML = `
         <div class="oa-finance-rebuild-workspace oa-finance-rebuild-workspace-compact">
           <div class="oa-finance-rebuild-rail-dock">
-            <button class="oa-finance-rebuild-rail-dock-grip oa-finance-rebuild-drag-handle" type="button" title="拖动面板位置" aria-label="拖动面板位置">•••</button>
+            <button class="oa-finance-rebuild-rail-dock-grip oa-finance-rebuild-drag-handle" type="button" title="拖动面板位置" aria-label="拖动面板位置">
+              <span class="oa-finance-rebuild-drag-pill" aria-hidden="true"></span>
+            </button>
             <div class="oa-finance-rebuild-compact-nav" aria-label="详情区块快捷入口">
               ${railButtonsHtml}
             </div>
@@ -1377,29 +1628,30 @@
       <div class="oa-finance-rebuild-workspace">
         <div class="oa-finance-rebuild-workbench">
           <div class="oa-finance-rebuild-resize-handle" aria-hidden="true"></div>
+          <div class="oa-finance-rebuild-resize-handle-y" aria-hidden="true"></div>
           <div class="oa-finance-rebuild-rail" aria-label="详情区块快捷入口">
-            ${railButtonsHtml}
+            <div class="oa-finance-rebuild-rail-nav">
+              ${railButtonsHtml}
+            </div>
+            ${railCollapseButtonHtml}
           </div>
           <div class="oa-finance-rebuild-panel-shell" aria-hidden="${isRailOnly() ? "true" : "false"}">
             <div class="oa-finance-rebuild-card">
+              <button class="oa-finance-rebuild-top-drag-handle oa-finance-rebuild-drag-handle" type="button" title="拖动面板位置" aria-label="拖动面板位置">
+                <span class="oa-finance-rebuild-drag-pill" aria-hidden="true"></span>
+              </button>
               <div class="oa-finance-rebuild-head">
                 <div class="oa-finance-rebuild-head-main">
                   <div class="oa-finance-rebuild-head-copy">
-                    <div class="oa-finance-rebuild-eyebrow">OA 付款审核</div>
-                    <h1>重构版</h1>
+                    <h1>OA 付款审核</h1>
                   </div>
                 </div>
                 <div class="oa-finance-rebuild-head-side">
-                  <button class="oa-finance-rebuild-drag-handle" type="button" title="拖动面板位置">拖动</button>
+                  <button class="oa-finance-rebuild-run" type="button" ${state.isRunning ? "disabled" : ""}>
+                    ${state.isRunning ? "分析中..." : "开始采集"}
+                  </button>
                   <div class="oa-finance-rebuild-badge">${escapeHtml(state.statusText)}</div>
-                  <button class="oa-finance-rebuild-collapse-all" type="button" ${openCount === 0 ? "disabled" : ""}>全部收起</button>
                 </div>
-              </div>
-              <div class="oa-finance-rebuild-toolbar">
-                <button class="oa-finance-rebuild-run" type="button" ${state.isRunning ? "disabled" : ""}>
-                  ${state.isRunning ? "分析中..." : "开始采集"}
-                </button>
-                <span class="oa-finance-rebuild-build">${escapeHtml(state.buildTag || "未连接")}</span>
               </div>
               <div class="oa-finance-rebuild-body">
                 ${PANEL_SECTION_ORDER.map((sectionKey) => renderPanelSection(sectionKey, analysis, verificationHtml)).join("")}
@@ -1415,7 +1667,9 @@
 
   function runAnalysisNow() {
     const snapshot = collector.collectPageSnapshot();
+    const requestId = createRequestId(extractProcessCodeFromUrl() || "detail");
     state.isRunning = true;
+    state.activeRequestId = requestId;
     state.analysis = null;
     state.errorText = "";
     state.statusText = "准备开始";
@@ -1425,8 +1679,12 @@
     rememberProgress({ text: "准备开始", detail: "正在采集当前页面基础信息" });
     render();
 
-    chrome.runtime.sendMessage({ type: "oa-finance-rebuild-analyze-page", snapshot }, (response) => {
+    chrome.runtime.sendMessage({ type: "oa-finance-rebuild-analyze-page", snapshot, requestId }, (response) => {
+      if (state.activeRequestId !== requestId) {
+        return;
+      }
       state.isRunning = false;
+      state.activeRequestId = "";
 
       if (!chrome.runtime.lastError && response?.ok && response.result) {
         rememberProgress({ text: "分析完成", detail: "已生成主核对、关联摘要和合同参考信息" });
@@ -1451,6 +1709,10 @@
 
   chrome.runtime.onMessage.addListener((message) => {
     if (message?.type !== "oa-finance-rebuild-progress") {
+      return;
+    }
+    const requestId = cleanText(message.payload?.requestId || "");
+    if (!state.activeRequestId || requestId !== state.activeRequestId) {
       return;
     }
     state.isRunning = true;

@@ -139,7 +139,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       ok: true,
       buildTag: BUILD_TAG,
       status: "ready",
-      message: "重构版已加载"
+      message: "插件已加载"
     });
     return false;
   }
@@ -147,6 +147,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === "oa-finance-rebuild-analyze-page") {
     return handleAnalyzeRequest(
       {
+        requestId: message.requestId || "",
         snapshot: message.snapshot || {}
       },
       sender,

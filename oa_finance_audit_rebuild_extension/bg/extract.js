@@ -2,6 +2,7 @@ import { strFromU8, unzipSync } from "../node_modules/fflate/esm/browser.js";
 import * as XLSX from "../node_modules/xlsx/xlsx.mjs";
 import { cleanText, supportsAttachmentTextExtraction } from "./common.js";
 import { getCurrentPageTabId, uint8ArrayToBase64 } from "./io.js";
+import { initOcrBridge, OCR_BRIDGE_KEY } from "./ocr_bridge.js";
 
 const OCR_LANG_PATH = chrome.runtime.getURL("assets/tessdata");
 
@@ -41,6 +42,44 @@ function detectAttachmentKind(attachment, bytes, contentType = "") {
   return "";
 }
 
+function executeInTab(tabId, func, args, errorMessage) {
+  return new Promise((resolve, reject) => {
+    chrome.scripting.executeScript(
+      {
+        target: { tabId },
+        world: "ISOLATED",
+        func,
+        args
+      },
+      (results) => {
+        const runtimeError = chrome.runtime.lastError;
+        if (runtimeError) {
+          reject(new Error(runtimeError.message || errorMessage));
+          return;
+        }
+        const payload = results?.[0]?.result;
+        if (!payload?.ok) {
+          reject(new Error(payload?.error || errorMessage));
+          return;
+        }
+        resolve(payload);
+      }
+    );
+  });
+}
+
+function mergeUniqueTexts(values) {
+  const unique = [];
+  for (const value of values || []) {
+    const text = cleanText(value);
+    if (!text || unique.includes(text)) {
+      continue;
+    }
+    unique.push(text);
+  }
+  return unique.join("\n");
+}
+
 async function extractAttachmentReferenceText(attachment, bytes, kind) {
   if (kind === "pdf") return extractPdfText(bytes);
   if (kind === "docx") return extractDocxText(bytes);
@@ -49,7 +88,7 @@ async function extractAttachmentReferenceText(attachment, bytes, kind) {
   if (kind === "plain") return decodeBytesSmart(bytes);
   if (kind === "xml") return extractXmlText(decodeBytesSmart(bytes));
   if (kind === "rtf") return extractRtfText(bytes);
-  if (kind === "image") return extractImageTextSafe(bytes, attachment?.name || "image");
+  if (kind === "image") return extractImageTextSafeViaBridge(bytes, attachment?.name || "image");
   if (kind === "eml") return (await extractEmlEvidence(bytes))?.text || "";
   if (kind === "msg") return (await extractMsgEvidenceHeuristically(bytes, attachment?.name || "mail.msg"))?.text || "";
   return "";
@@ -60,7 +99,7 @@ async function extractPdfText(data) {
   if (!Number.isInteger(tabId)) {
     throw new Error("未找到当前标签页，无法解析 PDF 附件");
   }
-  return extractPdfTextInTab(tabId, data);
+  return extractPdfTextViaBridge(tabId, data);
 }
 
 async function extractPdfTextInTab(tabId, data) {
@@ -88,6 +127,7 @@ async function extractPdfTextInTab(tabId, data) {
           injectedTesseractCoreUrl,
           langPath
         ) => {
+          let ocrWorker = null;
           try {
             const flattenItems = (items) => {
               const parts = [];
@@ -107,29 +147,66 @@ async function extractPdfTextInTab(tabId, data) {
               await page.render({ canvasContext: context, viewport }).promise;
               return canvas.toDataURL("image/png");
             };
+            const extractRecognizedText = (result) => {
+              const data = result?.data || {};
+              const lines = Array.isArray(data.lines) ? data.lines : [];
+              const filteredLines = lines
+                .filter((line) => Number(line?.confidence || 0) >= 30)
+                .map((line) => String(line?.text || "").trim())
+                .filter(Boolean);
+              if (filteredLines.length > 0) {
+                return filteredLines.join("\n");
+              }
+
+              const words = Array.isArray(data.words) ? data.words : [];
+              const filteredWords = words
+                .filter((word) => Number(word?.confidence || 0) >= 40)
+                .map((word) => String(word?.text || "").trim())
+                .filter(Boolean);
+              if (filteredWords.length >= 3) {
+                return filteredWords.join(" ");
+              }
+
+              const confidence = Number(data.confidence || 0);
+              return confidence >= 25 ? String(data.text || "").trim() : "";
+            };
             const runOcr = async (dataUrl) => {
-              const moduleNs = await import(injectedTesseractModuleUrl);
-              const tesseractApi = moduleNs?.createWorker
-                ? moduleNs
-                : moduleNs?.default?.createWorker
-                  ? moduleNs.default
-                  : moduleNs?.default || moduleNs;
-              const createWorker = tesseractApi?.createWorker;
-              if (typeof createWorker !== "function") {
-                throw new Error("Tesseract createWorker unavailable");
+              if (!ocrWorker) {
+                const moduleNs = await import(injectedTesseractModuleUrl);
+                const tesseractApi = moduleNs?.createWorker
+                  ? moduleNs
+                  : moduleNs?.default?.createWorker
+                    ? moduleNs.default
+                    : moduleNs?.default || moduleNs;
+                const createWorker = tesseractApi?.createWorker;
+                if (typeof createWorker !== "function") {
+                  throw new Error("Tesseract createWorker unavailable");
+                }
+                ocrWorker = await createWorker("chi_sim+eng", 1, {
+                  workerPath: injectedTesseractWorkerUrl,
+                  corePath: injectedTesseractCoreUrl,
+                  langPath
+                });
+                await ocrWorker.setParameters({ preserve_interword_spaces: "1" });
               }
-              const worker = await createWorker("chi_sim+eng", 1, {
-                workerPath: injectedTesseractWorkerUrl,
-                corePath: injectedTesseractCoreUrl,
-                langPath
-              });
-              try {
-                await worker.setParameters({ preserve_interword_spaces: "1" });
-                const result = await worker.recognize(dataUrl);
-                return result?.data?.text || "";
-              } finally {
-                await worker.terminate();
+              const result = await ocrWorker.recognize(dataUrl);
+              return extractRecognizedText(result);
+            };
+            const hasUsefulPdfText = (value) => {
+              const raw = String(value || "");
+              const stripped = raw.replace(/\s+/g, "");
+              if (stripped.length < 80) {
+                return false;
               }
+              const usefulChars = stripped.match(/[\u4e00-\u9fa5A-Za-z0-9¥￥]/g) || [];
+              const usefulRatio = usefulChars.length / Math.max(1, stripped.length);
+              const lineCount = raw
+                .split(/\n+/)
+                .map((line) => String(line || "").trim())
+                .filter(Boolean).length;
+              const digitCount = (stripped.match(/\d/g) || []).length;
+              const hasKeyword = /(合同|协议|发票|金额|税额|付款|验收|账号|银行|供应商|公司|invoice|amount|tax|bank|account)/i.test(raw);
+              return usefulRatio >= 0.35 && (hasKeyword || lineCount >= 3 || digitCount >= 4);
             };
             const buildOcrPageNumbers = (numPages) => {
               if (!Number.isFinite(numPages) || numPages <= 0) return [];
@@ -170,8 +247,8 @@ async function extractPdfTextInTab(tabId, data) {
               const content = await current.getTextContent();
               parts.push(flattenItems(content.items || []));
             }
-            let text = parts.join("\\n");
-            if ((text || "").replace(/\s+/g, "").length < 80) {
+            let text = parts.join("\n");
+            if (!hasUsefulPdfText(text)) {
               const ocrParts = [];
               for (const page of buildOcrPageNumbers(pdf.numPages)) {
                 const current = await pdf.getPage(page);
@@ -180,7 +257,7 @@ async function extractPdfTextInTab(tabId, data) {
                 if (ocrText) ocrParts.push(ocrText);
               }
               if (ocrParts.length) {
-                text = [text, ...ocrParts].filter(Boolean).join("\\n");
+                text = [text, ...ocrParts].filter(Boolean).join("\n");
               }
             }
             return { ok: true, text };
@@ -189,6 +266,12 @@ async function extractPdfTextInTab(tabId, data) {
               ok: false,
               error: error?.stack || error?.message || String(error)
             };
+          } finally {
+            if (ocrWorker) {
+              try {
+                await ocrWorker.terminate();
+              } catch (_error) {}
+            }
           }
         },
         args: [
@@ -222,6 +305,136 @@ async function extractPdfTextInTab(tabId, data) {
       }
     );
   });
+}
+
+async function extractPdfTextViaBridge(tabId, data) {
+  await initOcrBridge(tabId);
+  const base64 = uint8ArrayToBase64(data);
+  const moduleUrl = chrome.runtime.getURL("node_modules/pdfjs-dist/legacy/build/pdf.mjs");
+  const workerUrl = chrome.runtime.getURL("node_modules/pdfjs-dist/legacy/build/pdf.worker.mjs");
+  const cMapUrl = chrome.runtime.getURL("node_modules/pdfjs-dist/cmaps/");
+  const standardFontDataUrl = chrome.runtime.getURL("node_modules/pdfjs-dist/standard_fonts/");
+  const payload = await executeInTab(
+    tabId,
+    async (
+      inputBase64,
+      pdfModuleUrl,
+      pdfWorkerUrl,
+      injectedCMapUrl,
+      injectedStandardFontDataUrl,
+      bridgeKey
+    ) => {
+      try {
+        const flattenItems = (items) => {
+          const parts = [];
+          for (const item of items || []) {
+            if (!item || typeof item.str !== "string") continue;
+            parts.push(item.str);
+            parts.push(item.hasEOL ? "\n" : " ");
+          }
+          return parts.join("");
+        };
+        const renderPageToDataUrl = async (page) => {
+          const viewport = page.getViewport({ scale: 2 });
+          const canvas = document.createElement("canvas");
+          canvas.width = Math.max(1, Math.floor(viewport.width));
+          canvas.height = Math.max(1, Math.floor(viewport.height));
+          const context = canvas.getContext("2d", { alpha: false });
+          await page.render({ canvasContext: context, viewport }).promise;
+          return canvas.toDataURL("image/png");
+        };
+        const hasUsefulPdfText = (value) => {
+          const raw = String(value || "");
+          const stripped = raw.replace(/\s+/g, "");
+          if (stripped.length < 80) {
+            return false;
+          }
+          const usefulChars = stripped.match(/[\u4e00-\u9fa5A-Za-z0-9楼锟]/g) || [];
+          const usefulRatio = usefulChars.length / Math.max(1, stripped.length);
+          const lineCount = raw
+            .split(/\n+/)
+            .map((line) => String(line || "").trim())
+            .filter(Boolean).length;
+          const digitCount = (stripped.match(/\d/g) || []).length;
+          const hasKeyword = /(合同|协议|发票|金额|税额|付款|验收|账号|银行|供应商|公司|invoice|amount|tax|bank|account)/i.test(raw);
+          return usefulRatio >= 0.35 && (hasKeyword || lineCount >= 3 || digitCount >= 4);
+        };
+        const buildOcrPageNumbers = (numPages) => {
+          if (!Number.isFinite(numPages) || numPages <= 0) return [];
+          if (numPages <= 8) {
+            return Array.from({ length: numPages }, (_, index) => index + 1);
+          }
+          const picks = new Set([1, 2, 3, numPages - 2, numPages - 1, numPages]);
+          return Array.from(picks)
+            .filter((pageNo) => pageNo >= 1 && pageNo <= numPages)
+            .sort((left, right) => left - right);
+        };
+        const runOcr = async (dataUrl) => {
+          const bridge = globalThis?.[bridgeKey];
+          if (!bridge) {
+            throw new Error("OCR bridge not initialized");
+          }
+          return bridge.recognize(dataUrl, "general");
+        };
+        const binary = atob(inputBase64 || "");
+        const bytes = new Uint8Array(binary.length);
+        for (let index = 0; index < binary.length; index += 1) {
+          bytes[index] = binary.charCodeAt(index);
+        }
+
+        const pdfjs = await import(pdfModuleUrl);
+        if (pdfjs?.GlobalWorkerOptions) {
+          pdfjs.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
+        }
+        if (typeof pdfjs?.setVerbosityLevel === "function" && pdfjs?.VerbosityLevel) {
+          pdfjs.setVerbosityLevel(pdfjs.VerbosityLevel.ERRORS);
+        }
+        const loadingTask = pdfjs.getDocument({
+          data: bytes,
+          cMapUrl: injectedCMapUrl,
+          cMapPacked: true,
+          standardFontDataUrl: injectedStandardFontDataUrl,
+          verbosity: pdfjs?.VerbosityLevel?.ERRORS ?? 0,
+          useSystemFonts: true,
+          isEvalSupported: false
+        });
+        const pdf = await loadingTask.promise;
+        const parts = [];
+        for (let page = 1; page <= Math.min(pdf.numPages, 4); page += 1) {
+          const current = await pdf.getPage(page);
+          const content = await current.getTextContent();
+          parts.push(flattenItems(content.items || []));
+        }
+        let text = parts.join("\n");
+        if (!hasUsefulPdfText(text)) {
+          const ocrParts = [];
+          for (const page of buildOcrPageNumbers(pdf.numPages)) {
+            const current = await pdf.getPage(page);
+            const dataUrl = await renderPageToDataUrl(current);
+            const ocrText = await runOcr(dataUrl);
+            if (ocrText) {
+              ocrParts.push(ocrText);
+            }
+          }
+          if (ocrParts.length) {
+            text = [text, ...ocrParts].filter(Boolean).join("\n");
+          }
+        }
+        return { ok: true, text };
+      } catch (error) {
+        return {
+          ok: false,
+          error: error?.stack || error?.message || String(error)
+        };
+      }
+    },
+    [base64, moduleUrl, workerUrl, cMapUrl, standardFontDataUrl, OCR_BRIDGE_KEY],
+    "鏍囩椤?PDF 瑙ｆ瀽澶辫触"
+  );
+  if (typeof payload.text !== "string") {
+    throw new Error("鏍囩椤?PDF 瑙ｆ瀽娌℃湁杩斿洖鏂囨湰");
+  }
+  return payload.text;
 }
 
 function extractDocxText(data) {
@@ -327,6 +540,29 @@ async function extractImageTextSafe(data, name = "image") {
               }
               return unique.join("\n");
             };
+            const extractRecognizedText = (result) => {
+              const data = result?.data || {};
+              const lines = Array.isArray(data.lines) ? data.lines : [];
+              const filteredLines = lines
+                .filter((line) => Number(line?.confidence || 0) >= 30)
+                .map((line) => String(line?.text || "").trim())
+                .filter(Boolean);
+              if (filteredLines.length > 0) {
+                return filteredLines.join("\n");
+              }
+
+              const words = Array.isArray(data.words) ? data.words : [];
+              const filteredWords = words
+                .filter((word) => Number(word?.confidence || 0) >= 40)
+                .map((word) => String(word?.text || "").trim())
+                .filter(Boolean);
+              if (filteredWords.length >= 3) {
+                return filteredWords.join(" ");
+              }
+
+              const confidence = Number(data.confidence || 0);
+              return confidence >= 25 ? String(data.text || "").trim() : "";
+            };
             const createTesseractWorker = async (langs) => {
               const moduleNs = await import(tesseractModuleUrl);
               const tesseractApi = moduleNs?.createWorker
@@ -375,6 +611,36 @@ async function extractImageTextSafe(data, name = "image") {
                 context.drawImage(image, cropX, cropY, cropWidth, cropHeight, 0, 0, canvas.width, canvas.height);
                 return { canvas, context };
               };
+              const toGray = (red, green, blue) => Math.round(red * 0.299 + green * 0.587 + blue * 0.114);
+              const whitenRedPixels = (pixels, preserveContrast = false) => {
+                for (let index = 0; index < pixels.length; index += 4) {
+                  const red = pixels[index];
+                  const green = pixels[index + 1];
+                  const blue = pixels[index + 2];
+                  if (red > 120 && red > green * 1.35 && red > blue * 1.35) {
+                    pixels[index] = 255;
+                    pixels[index + 1] = 255;
+                    pixels[index + 2] = 255;
+                    continue;
+                  }
+                  const gray = toGray(red, green, blue);
+                  const nextValue = preserveContrast
+                    ? Math.min(255, Math.max(0, Math.round((gray - 128) * 1.45 + 128)))
+                    : gray;
+                  pixels[index] = nextValue;
+                  pixels[index + 1] = nextValue;
+                  pixels[index + 2] = nextValue;
+                }
+              };
+              const applyThreshold = (pixels, thresholdValue) => {
+                for (let index = 0; index < pixels.length; index += 4) {
+                  const gray = toGray(pixels[index], pixels[index + 1], pixels[index + 2]);
+                  const threshold = gray > thresholdValue ? 255 : 0;
+                  pixels[index] = threshold;
+                  pixels[index + 1] = threshold;
+                  pixels[index + 2] = threshold;
+                }
+              };
 
               {
                 const { canvas } = makeCanvas();
@@ -399,16 +665,25 @@ async function extractImageTextSafe(data, name = "image") {
               {
                 const { canvas, context } = makeCanvas();
                 const imageData = context.getImageData(0, 0, width, height);
-                const pixels = imageData.data;
-                for (let index = 0; index < pixels.length; index += 4) {
-                  const gray = Math.round(pixels[index] * 0.299 + pixels[index + 1] * 0.587 + pixels[index + 2] * 0.114);
-                  const threshold = gray > 182 ? 255 : 0;
-                  pixels[index] = threshold;
-                  pixels[index + 1] = threshold;
-                  pixels[index + 2] = threshold;
-                }
+                whitenRedPixels(imageData.data, true);
+                context.putImageData(imageData, 0, 0);
+                pushCanvas("red-removed", canvas);
+              }
+
+              {
+                const { canvas, context } = makeCanvas();
+                const imageData = context.getImageData(0, 0, width, height);
+                applyThreshold(imageData.data, 182);
                 context.putImageData(imageData, 0, 0);
                 pushCanvas("threshold", canvas);
+              }
+
+              {
+                const { canvas, context } = makeCropCanvas(0.18, 0.0, 0.64, 0.22);
+                const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
+                whitenRedPixels(imageData.data, true);
+                context.putImageData(imageData, 0, 0);
+                pushCanvas("top-title-red-removed", canvas);
               }
 
               {
@@ -417,18 +692,24 @@ async function extractImageTextSafe(data, name = "image") {
               }
 
               {
+                const { canvas } = makeCropCanvas(0.30, 0.40, 0.68, 0.35);
+                pushCanvas("mid-right", canvas, "numeric");
+              }
+
+              {
                 const { canvas, context } = makeCropCanvas(0.40, 0.48, 0.58, 0.32);
                 const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
-                const pixels = imageData.data;
-                for (let index = 0; index < pixels.length; index += 4) {
-                  const gray = Math.round(pixels[index] * 0.299 + pixels[index + 1] * 0.587 + pixels[index + 2] * 0.114);
-                  const threshold = gray > 176 ? 255 : 0;
-                  pixels[index] = threshold;
-                  pixels[index + 1] = threshold;
-                  pixels[index + 2] = threshold;
-                }
+                applyThreshold(imageData.data, 176);
                 context.putImageData(imageData, 0, 0);
                 pushCanvas("bottom-right-threshold", canvas, "numeric");
+              }
+
+              {
+                const { canvas, context } = makeCropCanvas(0.0, 0.50, 1.0, 0.30);
+                const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
+                applyThreshold(imageData.data, 178);
+                context.putImageData(imageData, 0, 0);
+                pushCanvas("bottom-full-threshold", canvas, "numeric");
               }
 
               return variants;
@@ -449,13 +730,20 @@ async function extractImageTextSafe(data, name = "image") {
               tessedit_pageseg_mode: "6"
             });
 
+            await numericWorker.setParameters({
+              preserve_interword_spaces: "1",
+              tessedit_char_whitelist: "0123456789.,-() ",
+              tessedit_pageseg_mode: "6"
+            });
+
             const variants = await buildVariants(new Blob([bytes], { type: inputMimeType }));
             const texts = [];
             for (const variant of variants) {
               const activeWorker = variant.mode === "numeric" ? numericWorker : generalWorker;
               const result = await activeWorker.recognize(variant.dataUrl);
-              if (result?.data?.text) {
-                texts.push(result.data.text);
+              const recognizedText = extractRecognizedText(result);
+              if (recognizedText) {
+                texts.push(recognizedText);
               }
             }
             return { ok: true, text: mergeTexts(texts) };
@@ -494,6 +782,203 @@ async function extractImageTextSafe(data, name = "image") {
       }
     );
   });
+}
+
+async function extractImageTextSafeViaBridge(data, name = "image") {
+  if (!data || data.byteLength < 128) return "";
+  const tabId = getCurrentPageTabId();
+  if (!Number.isInteger(tabId)) {
+    throw new Error("鏈壘鍒板綋鍓嶆爣绛鹃〉锛屾棤娉曟墽琛屽浘鐗?OCR");
+  }
+  await initOcrBridge(tabId);
+  const mimeType = /\.png(?:$|\?)/i.test(String(name || "")) ? "image/png" : "image/jpeg";
+  const base64 = uint8ArrayToBase64(data);
+  const payload = await executeInTab(
+    tabId,
+    async (inputBase64, inputMimeType, bridgeKey) => {
+      try {
+        const loadImageFromBlob = (blob) =>
+          new Promise((resolve, reject) => {
+            const objectUrl = URL.createObjectURL(blob);
+            const image = new Image();
+            image.onload = () => {
+              URL.revokeObjectURL(objectUrl);
+              resolve(image);
+            };
+            image.onerror = () => {
+              URL.revokeObjectURL(objectUrl);
+              reject(new Error("Image decode failed"));
+            };
+            image.src = objectUrl;
+          });
+        const buildVariants = async (blob) => {
+          const image = await loadImageFromBlob(blob);
+          const sourceWidth = Math.max(1, image.naturalWidth || image.width || 1);
+          const sourceHeight = Math.max(1, image.naturalHeight || image.height || 1);
+          const scale = Math.min(2.2, Math.max(1.6, 1800 / Math.max(sourceWidth, sourceHeight)));
+          const width = Math.max(1, Math.floor(sourceWidth * scale));
+          const height = Math.max(1, Math.floor(sourceHeight * scale));
+          const variants = [];
+          const bridge = globalThis?.[bridgeKey];
+          if (!bridge) {
+            throw new Error("OCR bridge not initialized");
+          }
+          const makeCanvas = () => {
+            const canvas = document.createElement("canvas");
+            canvas.width = width;
+            canvas.height = height;
+            const context = canvas.getContext("2d", { willReadFrequently: true });
+            context.drawImage(image, 0, 0, width, height);
+            return { canvas, context };
+          };
+          const pushCanvas = (label, canvas, mode = "general") => {
+            variants.push({ label, mode, dataUrl: canvas.toDataURL("image/png") });
+          };
+          const makeCropCanvas = (leftRatio, topRatio, widthRatio, heightRatio) => {
+            const canvas = document.createElement("canvas");
+            const cropX = Math.max(0, Math.floor(sourceWidth * leftRatio));
+            const cropY = Math.max(0, Math.floor(sourceHeight * topRatio));
+            const cropWidth = Math.max(1, Math.floor(sourceWidth * widthRatio));
+            const cropHeight = Math.max(1, Math.floor(sourceHeight * heightRatio));
+            canvas.width = Math.max(1, Math.floor(cropWidth * Math.max(2, scale)));
+            canvas.height = Math.max(1, Math.floor(cropHeight * Math.max(2, scale)));
+            const context = canvas.getContext("2d", { willReadFrequently: true });
+            context.drawImage(image, cropX, cropY, cropWidth, cropHeight, 0, 0, canvas.width, canvas.height);
+            return { canvas, context };
+          };
+          const toGray = (red, green, blue) => Math.round(red * 0.299 + green * 0.587 + blue * 0.114);
+          const whitenRedPixels = (pixels, preserveContrast = false) => {
+            for (let index = 0; index < pixels.length; index += 4) {
+              const red = pixels[index];
+              const green = pixels[index + 1];
+              const blue = pixels[index + 2];
+              if (red > 120 && red > green * 1.35 && red > blue * 1.35) {
+                pixels[index] = 255;
+                pixels[index + 1] = 255;
+                pixels[index + 2] = 255;
+                continue;
+              }
+              const gray = toGray(red, green, blue);
+              const nextValue = preserveContrast
+                ? Math.min(255, Math.max(0, Math.round((gray - 128) * 1.45 + 128)))
+                : gray;
+              pixels[index] = nextValue;
+              pixels[index + 1] = nextValue;
+              pixels[index + 2] = nextValue;
+            }
+          };
+          const applyThreshold = (pixels, thresholdValue) => {
+            for (let index = 0; index < pixels.length; index += 4) {
+              const gray = toGray(pixels[index], pixels[index + 1], pixels[index + 2]);
+              const threshold = gray > thresholdValue ? 255 : 0;
+              pixels[index] = threshold;
+              pixels[index + 1] = threshold;
+              pixels[index + 2] = threshold;
+            }
+          };
+
+          {
+            const { canvas } = makeCanvas();
+            pushCanvas("original", canvas);
+          }
+
+          {
+            const { canvas, context } = makeCanvas();
+            const imageData = context.getImageData(0, 0, width, height);
+            const pixels = imageData.data;
+            for (let index = 0; index < pixels.length; index += 4) {
+              const gray = Math.round(pixels[index] * 0.299 + pixels[index + 1] * 0.587 + pixels[index + 2] * 0.114);
+              const boosted = Math.min(255, Math.max(0, Math.round((gray - 128) * 1.55 + 128)));
+              pixels[index] = boosted;
+              pixels[index + 1] = boosted;
+              pixels[index + 2] = boosted;
+            }
+            context.putImageData(imageData, 0, 0);
+            pushCanvas("grayscale-boost", canvas);
+          }
+
+          {
+            const { canvas, context } = makeCanvas();
+            const imageData = context.getImageData(0, 0, width, height);
+            whitenRedPixels(imageData.data, true);
+            context.putImageData(imageData, 0, 0);
+            pushCanvas("red-removed", canvas);
+          }
+
+          {
+            const { canvas, context } = makeCanvas();
+            const imageData = context.getImageData(0, 0, width, height);
+            applyThreshold(imageData.data, 182);
+            context.putImageData(imageData, 0, 0);
+            pushCanvas("threshold", canvas);
+          }
+
+          {
+            const { canvas, context } = makeCropCanvas(0.18, 0.0, 0.64, 0.22);
+            const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
+            whitenRedPixels(imageData.data, true);
+            context.putImageData(imageData, 0, 0);
+            pushCanvas("top-title-red-removed", canvas);
+          }
+
+          {
+            const { canvas } = makeCropCanvas(0.46, 0.55, 0.52, 0.25);
+            pushCanvas("bottom-right", canvas, "numeric");
+          }
+
+          {
+            const { canvas } = makeCropCanvas(0.30, 0.40, 0.68, 0.35);
+            pushCanvas("mid-right", canvas, "numeric");
+          }
+
+          {
+            const { canvas, context } = makeCropCanvas(0.40, 0.48, 0.58, 0.32);
+            const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
+            applyThreshold(imageData.data, 176);
+            context.putImageData(imageData, 0, 0);
+            pushCanvas("bottom-right-threshold", canvas, "numeric");
+          }
+
+          {
+            const { canvas, context } = makeCropCanvas(0.0, 0.50, 1.0, 0.30);
+            const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
+            applyThreshold(imageData.data, 178);
+            context.putImageData(imageData, 0, 0);
+            pushCanvas("bottom-full-threshold", canvas, "numeric");
+          }
+
+          return variants;
+        };
+        const binary = atob(inputBase64 || "");
+        const bytes = new Uint8Array(binary.length);
+        for (let index = 0; index < binary.length; index += 1) {
+          bytes[index] = binary.charCodeAt(index);
+        }
+
+        const bridge = globalThis?.[bridgeKey];
+        if (!bridge) {
+          throw new Error("OCR bridge not initialized");
+        }
+        const variants = await buildVariants(new Blob([bytes], { type: inputMimeType }));
+        const texts = [];
+        for (const variant of variants) {
+          const recognizedText = await bridge.recognize(variant.dataUrl, variant.mode);
+          if (recognizedText) {
+            texts.push(recognizedText);
+          }
+        }
+        return { ok: true, text: texts.join("\n") };
+      } catch (error) {
+        return {
+          ok: false,
+          error: error?.stack || error?.message || String(error)
+        };
+      }
+    },
+    [base64, mimeType, OCR_BRIDGE_KEY],
+    "鏍囩椤?OCR 瑙ｆ瀽澶辫触"
+  );
+  return mergeUniqueTexts(String(payload.text || "").split(/\n+/));
 }
 
 function extractXmlText(xmlText) {
