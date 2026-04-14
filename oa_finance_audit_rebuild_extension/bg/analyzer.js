@@ -39,10 +39,11 @@ import {
   findHistoryField,
   parseProcessRef
 } from "./detail.js";
-import { buildContractClauseCandidates, deriveLocalContractSummary } from "./contract_terms.js";
+import { buildContractClauseCandidates } from "./contract_terms.js";
+import { buildContractSummaryProviderMeta, generateContractSummary } from "./contract_summary_provider.js";
 import { extractMailEvidenceFromAttachment, extractReferenceTextsFromAttachment } from "./extract.js";
 
-export const BUILD_TAG = "rebuild-phase5-related-docs-2026-04-13-beta2";
+export const BUILD_TAG = "rebuild-phase5-local-summary-2026-04-14";
 
 const GENERIC_PROCESS_CODE_RE = /\b[A-Z]{2,10}-\d{8,}\b/i;
 const DOMESTIC_PR_CODE_RE = /\bGNPR-\d{8,}\b/i;
@@ -1927,13 +1928,10 @@ async function analyzeContractDetail(ref, attachments, baseFacts, target, source
   candidateSources.push(...(attachmentAnalysis.referenceEntries || []));
 
   const clauseCandidates = buildContractClauseCandidates(candidateSources);
-  let summary = deriveLocalContractSummary(clauseCandidates, facts);
+  let summary = generateContractSummary(clauseCandidates, facts);
   summary = {
     ...summary,
     evidenceClauses: selectSummaryEvidenceClauses(summary.evidenceClauses, clauseCandidates),
-    llmDispatchStatus: "未启用",
-    llmDispatchReason: clauseCandidates.length > 0 ? "当前版本已关闭外部AI合同摘要，使用本地规则整理" : "未筛到付款相关条款候选，仅做本地处理",
-    llmRequestPreview: null,
     errorText: ""
   };
 
@@ -2327,9 +2325,7 @@ function emptyContractSummary() {
     restrictionHints: [],
     conflictHints: [],
     detectedContractTypes: [],
-    llmDispatchStatus: "未启用",
-    llmDispatchReason: "当前版本已关闭外部AI合同摘要，默认仅使用本地规则",
-    llmRequestPreview: null,
+    provider: buildContractSummaryProviderMeta("idle", "默认仅使用本地规则整理合同摘要"),
     errorText: ""
   };
 }
