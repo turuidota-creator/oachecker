@@ -7,8 +7,11 @@
 
   const PROGRESS_MESSAGE_TYPE = "oa-finance-rebuild-progress";
   const PAYMENT_CODE_RE = /^(?:DDFK|GNTYYFK)-\d{8,}$/i;
+  const DETAIL_PAGE_RE = /\/workflow\/process\/detail\/\d+/i;
   const AUTO_REVIEW_COL_ATTR = "data-oa-finance-auto-review";
   const AUTO_REVIEW_WIDTH = "120px";
+  const DETAIL_AUTO_REVIEW_ATTR = "data-oa-finance-detail-auto-review";
+  const DETAIL_AUTO_REVIEW_LABELS = ["通过", "保存", "转办", "退回"];
 
   const STATUS_META = {
     idle: { label: "待审核", tone: "idle" },
@@ -33,14 +36,17 @@
     cleanupFns: [],
     popover: null,
     popoverCode: "",
-    activeTableEl: null
+    activeTableEl: null,
+    lastKnownUrl: window.location.href,
+    detailEntryTimer: null,
+    detailEntryBusy: false
   };
 
   function isManagedUiNode(node) {
     if (!node || node.nodeType !== Node.ELEMENT_NODE) {
       return false;
     }
-    return !!node.closest(`.oa-finance-auto-review-popover, .oa-finance-auto-review-toolbar, .oa-finance-auto-review-cell, [${AUTO_REVIEW_COL_ATTR}]`);
+    return !!node.closest(`.oa-finance-auto-review-popover, .oa-finance-auto-review-toolbar, .oa-finance-auto-review-cell, [${AUTO_REVIEW_COL_ATTR}], [${DETAIL_AUTO_REVIEW_ATTR}]`);
   }
 
   function shouldIgnoreMutation(record) {
@@ -79,6 +85,262 @@
   function debounceRefresh() {
     clearTimeout(state.refreshTimer);
     state.refreshTimer = setTimeout(refreshListUi, 120);
+  }
+
+  function scheduleDetailEntryRefresh(delay = 120) {
+    clearTimeout(state.detailEntryTimer);
+    state.detailEntryTimer = setTimeout(refreshDetailAutoReviewEntry, delay);
+  }
+
+  function isDetailPageUrl(url = window.location.href) {
+    return DETAIL_PAGE_RE.test(cleanText(url));
+  }
+
+  function dispatchDetailRootEvent(eventName, detail = {}) {
+    const root = document.getElementById("oa-finance-rebuild-root");
+    if (!root) {
+      return false;
+    }
+    root.dispatchEvent(new CustomEvent(eventName, { detail }));
+    return true;
+  }
+
+  async function syncDetailPageEnhancements(url = window.location.href) {
+    const currentUrl = cleanText(url);
+    if (!currentUrl) {
+      return;
+    }
+    if (isDetailPageUrl(currentUrl)) {
+      scheduleDetailEntryRefresh();
+      if (
+        dispatchDetailRootEvent("oa-finance-rebuild-route-change", {
+          pageUrl: currentUrl,
+          autoRun: false
+        })
+      ) {
+        return;
+      }
+      try {
+        await sendRuntimeMessage({
+          type: "oa-finance-rebuild-ensure-detail-content",
+          url: currentUrl
+        });
+      } catch (_error) {
+        // Ignore dynamic injection failures and keep the page usable.
+      }
+      return;
+    }
+    cleanupDetailAutoReviewEntry();
+    dispatchDetailRootEvent("oa-finance-rebuild-unmount", {
+      pageUrl: currentUrl
+    });
+  }
+
+  function handleUrlMaybeChanged(force = false) {
+    const nextUrl = cleanText(window.location.href);
+    if (!nextUrl) {
+      return;
+    }
+    if (!force && nextUrl === cleanText(state.lastKnownUrl)) {
+      return;
+    }
+    state.lastKnownUrl = nextUrl;
+    void syncDetailPageEnhancements(nextUrl);
+  }
+
+  function detailEntryText() {
+    return state.detailEntryBusy ? "打开中..." : "自动审核";
+  }
+
+  function updateDetailEntryButtons() {
+    Array.from(document.querySelectorAll(`[${DETAIL_AUTO_REVIEW_ATTR}]`)).forEach((button) => {
+      if (!(button instanceof HTMLButtonElement)) {
+        return;
+      }
+      button.textContent = detailEntryText();
+      button.disabled = state.detailEntryBusy;
+      button.classList.toggle("is-loading", state.detailEntryBusy);
+    });
+  }
+
+  function setDetailEntryBusy(isBusy) {
+    state.detailEntryBusy = !!isBusy;
+    updateDetailEntryButtons();
+  }
+
+  function createDetailAutoReviewButton(kind) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className =
+      kind === "fallback"
+        ? "oa-finance-detail-auto-review-fallback"
+        : "oa-finance-detail-auto-review-btn";
+    button.setAttribute(DETAIL_AUTO_REVIEW_ATTR, kind);
+    button.textContent = detailEntryText();
+    button.disabled = state.detailEntryBusy;
+    button.addEventListener("click", handleDetailAutoReviewClick);
+    return button;
+  }
+
+  function removeDetailEntry(kind = "") {
+    const selector = kind
+      ? `[${DETAIL_AUTO_REVIEW_ATTR}="${CSS.escape(kind)}"]`
+      : `[${DETAIL_AUTO_REVIEW_ATTR}]`;
+    Array.from(document.querySelectorAll(selector)).forEach((node) => node.remove());
+  }
+
+  function cleanupDetailAutoReviewEntry() {
+    clearTimeout(state.detailEntryTimer);
+    state.detailEntryTimer = null;
+    state.detailEntryBusy = false;
+    removeDetailEntry();
+  }
+
+  function buttonLabelMatch(text) {
+    const normalized = cleanText(text);
+    return DETAIL_AUTO_REVIEW_LABELS.find((label) => normalized.includes(label) && normalized.length <= 12) || "";
+  }
+
+  function listButtonLikeDescendants(rootNode) {
+    return Array.from(rootNode?.querySelectorAll?.("button, a, [role='button'], .el-button, .ant-btn") || [])
+      .filter((node) => !node.hasAttribute?.(DETAIL_AUTO_REVIEW_ATTR) && isVisible(node));
+  }
+
+  function scoreDetailActionContainer(container) {
+    const labels = new Set();
+    const matchedButtons = [];
+    for (const button of listButtonLikeDescendants(container)) {
+      const label = buttonLabelMatch(button.textContent || "");
+      if (!label) {
+        continue;
+      }
+      labels.add(label);
+      matchedButtons.push(button);
+    }
+    if (labels.size < 2 || matchedButtons.length < 2) {
+      return null;
+    }
+    const rect = container.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0 || rect.width > Math.max(760, window.innerWidth * 0.95)) {
+      return null;
+    }
+    return {
+      container,
+      labels,
+      matchedButtons,
+      score: labels.size * 100 + matchedButtons.length * 10 - rect.height
+    };
+  }
+
+  function locateDetailActionTarget() {
+    const buttonLikes = listButtonLikeDescendants(document.body)
+      .filter((node) => buttonLabelMatch(node.textContent || ""));
+    const scored = [];
+    const visited = new Set();
+    for (const button of buttonLikes) {
+      let current = button.parentElement;
+      let depth = 0;
+      while (current && current !== document.body && depth < 5) {
+        if (!visited.has(current)) {
+          visited.add(current);
+          const candidate = scoreDetailActionContainer(current);
+          if (candidate) {
+            scored.push(candidate);
+          }
+        }
+        current = current.parentElement;
+        depth += 1;
+      }
+    }
+    scored.sort((left, right) => right.score - left.score);
+    const winner = scored[0];
+    if (!winner) {
+      return null;
+    }
+    const lastButton = winner.matchedButtons[winner.matchedButtons.length - 1] || null;
+    return lastButton ? { container: winner.container, afterButton: lastButton } : null;
+  }
+
+  function refreshDetailAutoReviewEntry() {
+    state.detailEntryTimer = null;
+    if (!isDetailPageUrl()) {
+      cleanupDetailAutoReviewEntry();
+      return;
+    }
+
+    const target = locateDetailActionTarget();
+    if (target?.afterButton?.parentElement) {
+      removeDetailEntry("fallback");
+      let inlineButton = document.querySelector(`[${DETAIL_AUTO_REVIEW_ATTR}="inline"]`);
+      if (!inlineButton) {
+        inlineButton = createDetailAutoReviewButton("inline");
+      }
+      if (inlineButton.previousElementSibling !== target.afterButton) {
+        target.afterButton.insertAdjacentElement("afterend", inlineButton);
+      }
+      updateDetailEntryButtons();
+      return;
+    }
+
+    removeDetailEntry("inline");
+    let fallbackButton = document.querySelector(`[${DETAIL_AUTO_REVIEW_ATTR}="fallback"]`);
+    if (!fallbackButton) {
+      fallbackButton = createDetailAutoReviewButton("fallback");
+      document.body.appendChild(fallbackButton);
+    }
+    updateDetailEntryButtons();
+  }
+
+  function waitForDetailRoot(timeoutMs = 2500) {
+    const startedAt = Date.now();
+    return new Promise((resolve) => {
+      const tick = () => {
+        const root = document.getElementById("oa-finance-rebuild-root");
+        if (root) {
+          resolve(root);
+          return;
+        }
+        if (Date.now() - startedAt >= timeoutMs) {
+          resolve(null);
+          return;
+        }
+        setTimeout(tick, 80);
+      };
+      tick();
+    });
+  }
+
+  async function openDetailAuditPanelFromPageButton() {
+    await syncDetailPageEnhancements(window.location.href);
+    const root = (await waitForDetailRoot()) || document.getElementById("oa-finance-rebuild-root");
+    if (!root) {
+      throw new Error("审核面板暂未加载，请刷新扩展后重试");
+    }
+    root.dispatchEvent(
+      new CustomEvent("oa-finance-rebuild-open-panel", {
+        detail: {
+          preferCache: true,
+          autoRunOnCacheMiss: true,
+          source: "detail-action-button"
+        }
+      })
+    );
+  }
+
+  async function handleDetailAutoReviewClick(event) {
+    event.preventDefault();
+    event.stopPropagation();
+    if (state.detailEntryBusy) {
+      return;
+    }
+    setDetailEntryBusy(true);
+    try {
+      await openDetailAuditPanelFromPageButton();
+    } catch (error) {
+      console.warn("[OA Finance Audit] 打开详情审核面板失败", error);
+    } finally {
+      setTimeout(() => setDetailEntryBusy(false), 1200);
+    }
   }
 
   function readCookie(name) {
@@ -144,6 +406,26 @@
     return row || null;
   }
 
+  function appendDetailCacheHint(rawUrl, processCode = "") {
+    const text = cleanText(rawUrl);
+    if (!text) {
+      return "";
+    }
+    try {
+      const url = new URL(text, window.location.origin);
+      if (!/\/workflow\/process\/detail\//i.test(url.pathname)) {
+        return text;
+      }
+      url.searchParams.set("oaAuditUseCache", "1");
+      if (processCode && !cleanText(url.searchParams.get("processCode"))) {
+        url.searchParams.set("processCode", processCode);
+      }
+      return url.toString();
+    } catch (_error) {
+      return text;
+    }
+  }
+
   function buildDetailUrl(row) {
     const procInsId = cleanText(row?.procInsId);
     if (!procInsId) {
@@ -164,7 +446,7 @@
     if (row?.processCode) {
       url.searchParams.set("processCode", row.processCode);
     }
-    return url.toString();
+    return appendDetailCacheHint(url.toString(), cleanText(row?.processCode));
   }
 
   function sendRuntimeMessage(message) {
@@ -178,6 +460,31 @@
         resolve(response || null);
       });
     });
+  }
+
+  async function openResolvedSourceUrl(sourceName, sourceUrl, processCode = "") {
+    const url = cleanText(sourceUrl);
+    if (!url) {
+      return;
+    }
+
+    let nextUrl = url;
+    try {
+      const response = await sendRuntimeMessage({
+        type: "oa-finance-rebuild-resolve-source-url",
+        pageUrl: window.location.href,
+        processCode: cleanText(processCode),
+        sourceName: cleanText(sourceName),
+        sourceUrl: url
+      });
+      if (response?.ok && cleanText(response.sourceUrl)) {
+        nextUrl = cleanText(response.sourceUrl);
+      }
+    } catch (_error) {
+      // Fall back to the original URL when refresh fails.
+    }
+
+    window.open(nextUrl, "_blank", "noopener,noreferrer");
   }
 
   function ensureRowState(processCode) {
@@ -203,8 +510,68 @@
       ...patch
     };
     state.rowStates.set(processCode, next);
-    debounceRefresh();
+    refreshRowUi(processCode);
     return next;
+  }
+
+  function buildRowRenderKey(processCode) {
+    const rowState = ensureRowState(processCode);
+    return [
+      processCode,
+      rowState.status,
+      rowState.progressPhase,
+      rowState.progressText,
+      rowState.result ? "1" : "0",
+      rowState.errorText,
+      rowState.detailUrl ? "1" : "0"
+    ].join("|");
+  }
+
+  function renderAuditCellInnerHtml(processCode) {
+    return `<div class="cell oa-finance-auto-review-cell-inner">${renderStatusButton(processCode)}</div>`;
+  }
+
+  function bindAuditCellTrigger(cell, processCode) {
+    const triggerEl = cell?.querySelector(".oa-finance-auto-review-trigger");
+    if (!triggerEl) {
+      return;
+    }
+    triggerEl.onclick = (event) => {
+      void handleTriggerActivate(processCode, triggerEl, event);
+    };
+  }
+
+  function renderAuditCell(cell, processCode) {
+    const renderKey = buildRowRenderKey(processCode);
+    cell.setAttribute("data-process-code", processCode);
+    if (cell.getAttribute("data-render-key") === renderKey) {
+      return;
+    }
+    cell.setAttribute("data-render-key", renderKey);
+    cell.innerHTML = renderAuditCellInnerHtml(processCode);
+    bindAuditCellTrigger(cell, processCode);
+  }
+
+  function refreshRowUi(processCode) {
+    const normalized = cleanText(processCode).toUpperCase();
+    if (!normalized) {
+      return;
+    }
+    const triggerEl = findTriggerByProcessCode(normalized);
+    const cell =
+      triggerEl?.closest?.(".oa-finance-auto-review-cell") ||
+      document.querySelector(`td.oa-finance-auto-review-cell[data-process-code="${CSS.escape(normalized)}"]`);
+    if (!cell) {
+      debounceRefresh();
+      return;
+    }
+    renderAuditCell(cell, normalized);
+    if (state.popover && !state.popover.hidden && state.popoverCode === normalized) {
+      const liveAnchor = findTriggerByProcessCode(normalized);
+      if (liveAnchor) {
+        showPopover(normalized, liveAnchor);
+      }
+    }
   }
 
   function createRequestId(processCode) {
@@ -565,13 +932,20 @@
     }
     cell.style.width = AUTO_REVIEW_WIDTH;
     cell.style.minWidth = AUTO_REVIEW_WIDTH;
-    cell.innerHTML = `<div class="cell oa-finance-auto-review-cell-inner">${renderStatusButton(processCode)}</div>`;
-    const triggerEl = cell.querySelector(".oa-finance-auto-review-trigger");
-    if (triggerEl) {
-      triggerEl.onclick = (event) => {
-        void handleTriggerActivate(processCode, triggerEl, event);
-      };
-    }
+    renderAuditCell(cell, processCode);
+  }
+
+  function decorateNativeDetailLinks(rowEl, processCode) {
+    Array.from(rowEl?.querySelectorAll('a[href*="/workflow/process/detail/"]') || []).forEach((linkEl) => {
+      const href = cleanText(linkEl.getAttribute("href"));
+      if (!href) {
+        return;
+      }
+      const nextHref = appendDetailCacheHint(href, processCode);
+      if (nextHref && nextHref !== href) {
+        linkEl.setAttribute("href", nextHref);
+      }
+    });
   }
 
   function formatStatusText(status) {
@@ -664,15 +1038,17 @@
     return "暂未生成说明";
   }
 
-  function renderSourceAction(sourceName, sourceUrl, label = "打开来源") {
+  function renderSourceAction(sourceName, sourceUrl, label = "打开来源", processCode = "") {
     const url = cleanText(sourceUrl);
     if (!url) {
       return "";
     }
     const title = prettifySourceName(sourceName, url) || label;
-    return `<a class="oa-finance-auto-review-inline-link" href="${escapeHtml(url)}" target="_blank" rel="noreferrer" title="${escapeHtml(
-      title
-    )}" aria-label="${escapeHtml(title)}">${escapeHtml(label)}</a>`;
+    return `<a class="oa-finance-auto-review-inline-link oa-finance-auto-review-source-link" href="${escapeHtml(
+      url
+    )}" data-source-url="${escapeHtml(url)}" data-source-name="${escapeHtml(cleanText(sourceName))}" data-process-code="${escapeHtml(
+      cleanText(processCode)
+    )}" target="_blank" rel="noreferrer" title="${escapeHtml(title)}" aria-label="${escapeHtml(title)}">${escapeHtml(label)}</a>`;
   }
 
   function joinMeaningfulTexts(values, limit = 3, separator = "；") {
@@ -731,7 +1107,7 @@
     `;
   }
 
-  function renderVerificationSummary(result) {
+  function renderVerificationSummary(result, processCode = "") {
     const items = Array.isArray(result?.verificationItems) ? result.verificationItems : [];
     if (items.length === 0) {
       return '<div class="oa-finance-auto-review-empty">还没有生成主核对结果。</div>';
@@ -741,7 +1117,7 @@
         (item, index) => {
           const label = formatVerificationLabelMapped(item, index);
           const statement = formatVerificationStatementMapped(item, label);
-          const sourceAction = renderSourceAction(item?.sourceName, item?.sourceUrl, "打开证据");
+          const sourceAction = renderSourceAction(item?.sourceName, item?.sourceUrl, "打开证据", processCode);
           return `
           <div class="oa-finance-auto-review-check">
             <div class="oa-finance-auto-review-check-head">
@@ -761,7 +1137,7 @@
       .join("");
   }
 
-  function renderRelatedSummary(result) {
+  function renderRelatedSummary(result, processCode = "") {
     const related = result?.relatedDocuments || {};
     const blocks = [];
 
@@ -823,7 +1199,7 @@
           `<div class="oa-finance-auto-review-related-summary" title="${escapeHtml(
             description || "未提取到订单内容描述"
           )}">${escapeHtml(compactText || "已读取采购订单")}</div>`,
-          purchaseOrder.sourceUrl ? renderSourceAction(purchaseOrder.sourceName, purchaseOrder.sourceUrl, "打开订单") : ""
+          purchaseOrder.sourceUrl ? renderSourceAction(purchaseOrder.sourceName, purchaseOrder.sourceUrl, "打开订单", processCode) : ""
         )
       );
     }
@@ -871,7 +1247,7 @@
         renderRelatedCard(
           "付款条件",
           renderValueBlock(contractText || "已读取合同信息", 3),
-          contractSourceUrl ? renderSourceAction(contractSource, contractSourceUrl, "打开合同来源") : ""
+          contractSourceUrl ? renderSourceAction(contractSource, contractSourceUrl, "打开合同来源", processCode) : ""
         )
       );
     }
@@ -934,11 +1310,11 @@
       </div>
       <section class="oa-finance-auto-review-popover-section">
         <h4>主核对</h4>
-        ${renderVerificationSummary(result)}
+        ${renderVerificationSummary(result, processCode)}
       </section>
       <section class="oa-finance-auto-review-popover-section">
         <h4>关联摘要</h4>
-        ${renderRelatedSummary(result)}
+        ${renderRelatedSummary(result, processCode)}
       </section>
     `;
   }
@@ -1188,7 +1564,10 @@
     rebalanceColumnWidths(context);
     ensureToolbar(context);
     ensureHeaderCell(context.headerTable);
-    context.rowInfos.forEach((item) => ensureBodyCell(item.rowEl, item.processCode, context.bodyTable));
+    context.rowInfos.forEach((item) => {
+      decorateNativeDetailLinks(item.rowEl, item.processCode);
+      ensureBodyCell(item.rowEl, item.processCode, context.bodyTable);
+    });
     void hydrateRowsFromCache(context.rowInfos.map((item) => item.processCode));
     if (state.popover && !state.popover.hidden && state.popoverCode) {
       const anchor = findTriggerByProcessCode(state.popoverCode);
@@ -1228,17 +1607,46 @@
 
   function handleDocumentClick(event) {
     const eventEl = resolveEventElement(event.target);
+    const sourceLink = eventEl?.closest?.(".oa-finance-auto-review-source-link[data-source-url]");
+    if (sourceLink) {
+      event.preventDefault();
+      void openResolvedSourceUrl(
+        sourceLink.getAttribute("data-source-name") || "",
+        sourceLink.getAttribute("data-source-url") || "",
+        sourceLink.getAttribute("data-process-code") || ""
+      );
+      return;
+    }
     if (state.popover && !state.popover.hidden && !eventEl?.closest?.(".oa-finance-auto-review-popover")) {
       hidePopover();
     }
   }
 
   function mount() {
+    const originalPushState = history.pushState;
+    history.pushState = function (...args) {
+      const result = originalPushState.apply(this, args);
+      setTimeout(() => handleUrlMaybeChanged(), 0);
+      return result;
+    };
+    const originalReplaceState = history.replaceState;
+    history.replaceState = function (...args) {
+      const result = originalReplaceState.apply(this, args);
+      setTimeout(() => handleUrlMaybeChanged(), 0);
+      return result;
+    };
+
     debounceRefresh();
+    handleUrlMaybeChanged(true);
+    scheduleDetailEntryRefresh();
     state.observer = new MutationObserver((records) => {
       const meaningful = (records || []).some((record) => !shouldIgnoreMutation(record));
       if (!meaningful) {
         return;
+      }
+      handleUrlMaybeChanged();
+      if (isDetailPageUrl()) {
+        scheduleDetailEntryRefresh();
       }
       debounceRefresh();
     });
@@ -1250,6 +1658,8 @@
     chrome.runtime.onMessage.addListener(handleProgressMessage);
     document.addEventListener("click", handleDocumentClick, true);
     window.addEventListener("resize", debounceRefresh);
+    window.addEventListener("popstate", handleUrlMaybeChanged);
+    window.addEventListener("hashchange", handleUrlMaybeChanged);
     document.addEventListener("keydown", (event) => {
       if (event.key === "Escape") {
         hidePopover();
@@ -1259,6 +1669,9 @@
     state.cleanupFns.push(() => chrome.runtime.onMessage.removeListener(handleProgressMessage));
     state.cleanupFns.push(() => document.removeEventListener("click", handleDocumentClick, true));
     state.cleanupFns.push(() => window.removeEventListener("resize", debounceRefresh));
+    state.cleanupFns.push(() => window.removeEventListener("popstate", handleUrlMaybeChanged));
+    state.cleanupFns.push(() => window.removeEventListener("hashchange", handleUrlMaybeChanged));
+    state.cleanupFns.push(cleanupDetailAutoReviewEntry);
   }
 
   /* const VERIFICATION_LABEL_MAP = {

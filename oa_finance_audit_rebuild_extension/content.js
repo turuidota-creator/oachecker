@@ -1,5 +1,17 @@
 (() => {
-  if (document.getElementById("oa-finance-rebuild-root")) {
+  const existingRoot = document.getElementById("oa-finance-rebuild-root");
+  if (existingRoot) {
+    const currentPageUrl = String(window.location.href || "").trim();
+    if (String(existingRoot.dataset.pageUrl || "").trim() !== currentPageUrl) {
+      existingRoot.dispatchEvent(
+        new CustomEvent("oa-finance-rebuild-route-change", {
+          detail: {
+            pageUrl: currentPageUrl,
+            autoRun: false
+          }
+        })
+      );
+    }
     return;
   }
 
@@ -46,6 +58,7 @@
   const MIN_PANEL_HEIGHT = 320;
   const PANEL_RAIL_WIDTH = 76;
   const PANEL_WORKSPACE_GAP = 0;
+  const PAYMENT_PROCESS_CODE_RE = /^(?:DDFK|GNTYYFK)-\d{8,}$/i;
 
   const PANEL_SECTIONS = {
     overview: {
@@ -87,11 +100,17 @@
 
   const runtime = {
     saveTimer: null,
-    rootEventsBound: false
+    rootEventsBound: false,
+    autoRunTimer: null,
+    autoRunAttempts: 0,
+    autoRunCompletedFor: "",
+    cacheHydrateTimer: null,
+    cacheHydrateAttempts: 0
   };
 
   const root = document.createElement("div");
   root.id = "oa-finance-rebuild-root";
+  root.dataset.pageUrl = window.location.href;
   document.body.appendChild(root);
 
   function escapeHtml(value) {
@@ -144,6 +163,10 @@
     } catch (_error) {
       return "";
     }
+  }
+
+  function normalizeProcessCode(value) {
+    return cleanText(value).toUpperCase();
   }
 
   function normalizeSectionKeys(values) {
@@ -470,10 +493,10 @@
     render();
   }
 
-  async function tryLoadCachedAnalysis() {
-    const processCode = extractProcessCodeFromUrl();
-    if (!processCode || state.analysis) {
-      return;
+  async function tryLoadCachedAnalysis(processCodeOverride = "") {
+    const processCode = normalizeProcessCode(processCodeOverride || extractProcessCodeFromUrl());
+    if (!PAYMENT_PROCESS_CODE_RE.test(processCode) || state.analysis) {
+      return false;
     }
     try {
       const response = await sendRuntimeMessage({
@@ -481,17 +504,249 @@
         processCode
       });
       if (!response?.ok || !response.entry?.result) {
-        return;
+        return false;
       }
       state.progressItems = [];
       rememberProgress({
         text: "读取缓存",
         detail: "已载入最近一次自动审核结果"
       });
+      runtime.autoRunAttempts = 0;
+      runtime.autoRunCompletedFor = processCode;
       applyAnalysisResult(response.entry.result, "已载入缓存");
+      return true;
     } catch (_error) {
       // Ignore cache read failures and keep manual analysis available.
+      return false;
     }
+  }
+
+  async function tryLoadCurrentPageCache(options = {}) {
+    const { allowSnapshotFallback = true } = options;
+    let processCode = currentProcessCode();
+    if (!PAYMENT_PROCESS_CODE_RE.test(processCode) && allowSnapshotFallback) {
+      const snapshot = collector.collectPageSnapshot();
+      processCode = currentProcessCode(snapshot);
+    }
+    return tryLoadCachedAnalysis(processCode);
+  }
+
+  function shouldAutoLoadCachedAnalysis() {
+    const params = new URLSearchParams(window.location.search || "");
+    return params.get("oaAuditUseCache") === "1";
+  }
+
+  function currentProcessCode(snapshot = null) {
+    const urlCode = normalizeProcessCode(extractProcessCodeFromUrl());
+    if (PAYMENT_PROCESS_CODE_RE.test(urlCode)) {
+      return urlCode;
+    }
+
+    const snapshotCode = normalizeProcessCode(snapshot?.paymentTarget?.processCode || "");
+    if (PAYMENT_PROCESS_CODE_RE.test(snapshotCode)) {
+      return snapshotCode;
+    }
+
+    return urlCode;
+  }
+
+  function hasPaymentProcessCodeInUrl() {
+    return PAYMENT_PROCESS_CODE_RE.test(normalizeProcessCode(extractProcessCodeFromUrl()));
+  }
+
+  function clearAutoRunTimer() {
+    if (runtime.autoRunTimer) {
+      clearTimeout(runtime.autoRunTimer);
+      runtime.autoRunTimer = null;
+    }
+  }
+
+  function clearCacheHydrateTimer() {
+    if (runtime.cacheHydrateTimer) {
+      clearTimeout(runtime.cacheHydrateTimer);
+      runtime.cacheHydrateTimer = null;
+    }
+  }
+
+  function shouldAutoRunAnalysis() {
+    const params = new URLSearchParams(window.location.search || "");
+    if (params.get("oaAuditAutoRun") === "0") {
+      return false;
+    }
+    return true;
+  }
+
+  function snapshotLooksReady(snapshot) {
+    const fieldPairCount = Array.isArray(snapshot?.fieldPairs) ? snapshot.fieldPairs.length : 0;
+    const attachmentCount = Array.isArray(snapshot?.attachments) ? snapshot.attachments.length : 0;
+    const relatedLinkCount = Array.isArray(snapshot?.relatedLinks) ? snapshot.relatedLinks.length : 0;
+    const bodyLength = cleanText(snapshot?.bodyText || "").length;
+    return fieldPairCount >= 4 || attachmentCount > 0 || relatedLinkCount > 0 || bodyLength >= 200;
+  }
+
+  function resetAnalysisState(statusText = "待采集") {
+    state.analysis = null;
+    state.errorText = "";
+    state.isRunning = false;
+    state.activeRequestId = "";
+    state.statusText = statusText;
+    state.progressItems = [];
+    state.progressCollapsed = false;
+    runtime.autoRunAttempts = 0;
+    runtime.autoRunCompletedFor = "";
+    runtime.cacheHydrateAttempts = 0;
+    delete root.dataset.analysisJson;
+    root.dataset.pageUrl = window.location.href;
+  }
+
+  function scheduleAutoRunAnalysis() {
+    clearAutoRunTimer();
+    if (
+      !shouldAutoRunAnalysis() ||
+      state.analysis ||
+      state.isRunning ||
+      state.activeRequestId
+    ) {
+      return;
+    }
+
+    const attempt = runtime.autoRunAttempts;
+    runtime.autoRunTimer = setTimeout(async () => {
+      runtime.autoRunTimer = null;
+      if (state.analysis || state.isRunning || state.activeRequestId) {
+        return;
+      }
+
+      const snapshot = collector.collectPageSnapshot();
+      const processCode = currentProcessCode(snapshot);
+      if (!PAYMENT_PROCESS_CODE_RE.test(processCode) || !snapshotLooksReady(snapshot)) {
+        if (runtime.autoRunAttempts >= 10) {
+          return;
+        }
+        runtime.autoRunAttempts += 1;
+        scheduleAutoRunAnalysis();
+        return;
+      }
+
+      if (runtime.autoRunCompletedFor === processCode) {
+        return;
+      }
+      const shouldPreferCache = shouldAutoLoadCachedAnalysis() || !hasPaymentProcessCodeInUrl();
+      if (shouldPreferCache && (await tryLoadCachedAnalysis(processCode))) {
+        return;
+      }
+
+      runtime.autoRunAttempts = 0;
+      runtime.autoRunCompletedFor = processCode;
+      runAnalysisNow(snapshot);
+    }, Math.min(1800, 300 + attempt * 200));
+  }
+
+  async function hydrateCurrentPage(options = {}) {
+    const { preferCache = true, autoRun = false } = options;
+    clearAutoRunTimer();
+    clearCacheHydrateTimer();
+    if (preferCache) {
+      const loaded = await tryLoadCurrentPageCache({
+        allowSnapshotFallback: true
+      });
+      if (!loaded && !state.analysis && !state.isRunning && !state.activeRequestId) {
+        schedulePassiveCacheHydration();
+      }
+    }
+    if (autoRun && !state.analysis) {
+      scheduleAutoRunAnalysis();
+    }
+  }
+
+  function schedulePassiveCacheHydration() {
+    clearCacheHydrateTimer();
+    if (state.analysis || state.isRunning || state.activeRequestId || runtime.cacheHydrateAttempts >= 10) {
+      return;
+    }
+
+    const attempt = runtime.cacheHydrateAttempts;
+    runtime.cacheHydrateTimer = setTimeout(async () => {
+      runtime.cacheHydrateTimer = null;
+      if (state.analysis || state.isRunning || state.activeRequestId) {
+        return;
+      }
+
+      const snapshot = collector.collectPageSnapshot();
+      const processCode = currentProcessCode(snapshot);
+      if (!PAYMENT_PROCESS_CODE_RE.test(processCode) || !snapshotLooksReady(snapshot)) {
+        runtime.cacheHydrateAttempts += 1;
+        schedulePassiveCacheHydration();
+        return;
+      }
+
+      const loaded = await tryLoadCachedAnalysis(processCode);
+      if (!loaded) {
+        runtime.cacheHydrateAttempts = 0;
+      }
+    }, Math.min(1800, 300 + attempt * 200));
+  }
+
+  function openDefaultPanelSections() {
+    if (!state.openSections.has("overview")) {
+      state.openSections.add("overview");
+    }
+    scheduleUiStatePersist();
+  }
+
+  async function openPanelAndMaybeRun(options = {}) {
+    const { preferCache = true, autoRunOnCacheMiss = true } = options;
+    clearAutoRunTimer();
+    clearCacheHydrateTimer();
+    openDefaultPanelSections();
+    state.progressCollapsed = false;
+    if (!state.analysis && !state.isRunning && !state.activeRequestId) {
+      state.statusText = preferCache ? "读取缓存" : "待采集";
+    }
+    render();
+
+    if (state.analysis || state.isRunning || state.activeRequestId) {
+      return;
+    }
+
+    let snapshot = null;
+    let processCode = currentProcessCode();
+    if (!PAYMENT_PROCESS_CODE_RE.test(processCode) || autoRunOnCacheMiss) {
+      snapshot = collector.collectPageSnapshot();
+      processCode = currentProcessCode(snapshot);
+    }
+
+    if (preferCache && (await tryLoadCachedAnalysis(processCode))) {
+      return;
+    }
+
+    if (!autoRunOnCacheMiss) {
+      state.statusText = "待采集";
+      render();
+      return;
+    }
+
+    if (!snapshot) {
+      snapshot = collector.collectPageSnapshot();
+      processCode = currentProcessCode(snapshot);
+    }
+
+    if (PAYMENT_PROCESS_CODE_RE.test(processCode) && snapshotLooksReady(snapshot)) {
+      runtime.autoRunAttempts = 0;
+      runtime.autoRunCompletedFor = processCode;
+      runAnalysisNow(snapshot);
+      return;
+    }
+
+    state.statusText = "等待页面加载";
+    rememberProgress({
+      text: "等待页面加载",
+      detail: "正在等待付款单字段稳定后自动审核"
+    });
+    render();
+    runtime.autoRunAttempts = 0;
+    runtime.autoRunCompletedFor = "";
+    scheduleAutoRunAnalysis();
   }
 
   function hasMeaningfulText(value) {
@@ -624,6 +879,26 @@
     `;
   }
 
+  function buildSourceAttrs(sourceName, sourceUrl) {
+    const url = cleanText(sourceUrl);
+    if (!url) {
+      return "";
+    }
+    const name = cleanText(sourceName);
+    const nameAttr = name ? ` data-source-name="${escapeHtml(name)}"` : "";
+    return `data-source-url="${escapeHtml(url)}"${nameAttr} tabindex="0" role="button"`;
+  }
+
+  function renderSourceLink(label, sourceName, sourceUrl) {
+    const url = cleanText(sourceUrl);
+    if (!url) {
+      return "";
+    }
+    return `<a class="oa-finance-rebuild-source-link" href="${escapeHtml(url)}" data-source-url="${escapeHtml(
+      url
+    )}" data-source-name="${escapeHtml(cleanText(sourceName))}" target="_blank" rel="noreferrer">${escapeHtml(label)}</a>`;
+  }
+
   function renderContractEvidenceCard(item, index) {
     if (!item) {
       return "";
@@ -636,9 +911,7 @@
     const excerpt = contextRows.find((row) => row.label === "当前条")?.text || cleanText(item.text);
     const sourceName = usefulSourceName(item.sourceName);
     const clickableClass = item.sourceUrl ? "is-clickable" : "";
-    const sourceAttrs = item.sourceUrl
-      ? `data-source-url="${escapeHtml(item.sourceUrl)}" tabindex="0" role="button"`
-      : "";
+    const sourceAttrs = buildSourceAttrs(item.sourceName, item.sourceUrl);
 
     return `
       <article class="oa-finance-rebuild-clause ${clickableClass}" ${sourceAttrs}>
@@ -672,11 +945,7 @@
         </details>
         <div class="oa-finance-rebuild-clause-footer">
           ${sourceName ? `<span>${escapeHtml(sourceName)}</span>` : "<span>合同原文</span>"}
-          ${
-            item.sourceUrl
-              ? `<a href="${escapeHtml(item.sourceUrl)}" target="_blank" rel="noreferrer">打开原文</a>`
-              : ""
-          }
+          ${renderSourceLink("打开原文", item.sourceName, item.sourceUrl)}
         </div>
       </article>
     `;
@@ -987,9 +1256,7 @@
     const snippetLine = item.snippet || "当前阶段尚未生成可展示的来源片段。";
     const matchedValue = item.matchedValue ? `匹配值：${item.matchedValue}` : "";
     const clickableClass = item.sourceUrl ? "is-clickable" : "";
-    const sourceAttrs = item.sourceUrl
-      ? `data-source-url="${escapeHtml(item.sourceUrl)}" tabindex="0" role="button"`
-      : "";
+    const sourceAttrs = buildSourceAttrs(item.sourceName, item.sourceUrl);
 
     return `
       <article class="oa-finance-rebuild-result is-${escapeHtml(item.status)} ${clickableClass}" ${sourceAttrs}>
@@ -1069,11 +1336,7 @@
           ${renderContractEvidenceTheme("付款条件", paymentEvidence, "暂未筛到高可信付款条款候选。")}
           ${renderContractEvidenceTheme("合同期间", termEvidence, "暂未筛到高可信期限条款候选。")}
         </div>
-        ${
-          sourceUrl
-            ? `<div class="oa-finance-rebuild-link-row"><a href="${escapeHtml(sourceUrl)}" target="_blank" rel="noreferrer">打开合同来源</a></div>`
-            : ""
-        }
+        ${sourceUrl ? `<div class="oa-finance-rebuild-link-row">${renderSourceLink("打开合同来源", sourceName, sourceUrl)}</div>` : ""}
       </section>
     `;
   }
@@ -1136,11 +1399,7 @@
           ${rows.join("") || "<p class='oa-finance-rebuild-empty'>暂无可展示信息</p>"}
         </div>
         ${hoverHtml}
-        ${
-          doc.sourceUrl
-            ? `<div class="oa-finance-rebuild-link-row"><a href="${escapeHtml(doc.sourceUrl)}" target="_blank" rel="noreferrer">打开来源页面</a></div>`
-            : ""
-        }
+        ${doc.sourceUrl ? `<div class="oa-finance-rebuild-link-row">${renderSourceLink("打开来源页面", doc.sourceName, doc.sourceUrl)}</div>` : ""}
       </div>
     `;
   }
@@ -1479,16 +1738,42 @@
     `;
   }
 
-  function openSourceFromElement(element) {
-    const sourceUrl = element.getAttribute("data-source-url");
-    if (sourceUrl) {
-      window.open(sourceUrl, "_blank", "noopener,noreferrer");
+  async function openSourceFromElement(element) {
+    const sourceUrl = cleanText(element?.getAttribute?.("data-source-url") || "");
+    if (!sourceUrl) {
+      return;
     }
+
+    let nextUrl = sourceUrl;
+    const sourceName = cleanText(element?.getAttribute?.("data-source-name") || "");
+    try {
+      const response = await sendRuntimeMessage({
+        type: "oa-finance-rebuild-resolve-source-url",
+        pageUrl: window.location.href,
+        processCode: extractProcessCodeFromUrl(),
+        sourceName,
+        sourceUrl
+      });
+      if (response?.ok && cleanText(response.sourceUrl)) {
+        nextUrl = cleanText(response.sourceUrl);
+      }
+    } catch (_error) {
+      // Fall back to the original source URL when refresh fails.
+    }
+
+    window.open(nextUrl, "_blank", "noopener,noreferrer");
   }
 
   function handleRootClick(event) {
     const eventEl = resolveEventElement(event.target);
     if (!eventEl || !root.contains(eventEl)) {
+      return;
+    }
+
+    const sourceLink = eventEl.closest(".oa-finance-rebuild-source-link[data-source-url]");
+    if (sourceLink) {
+      event.preventDefault();
+      void openSourceFromElement(sourceLink);
       return;
     }
 
@@ -1521,7 +1806,7 @@
 
     const sourceEl = eventEl.closest(".oa-finance-rebuild-result[data-source-url], .oa-finance-rebuild-clause[data-source-url]");
     if (sourceEl && !eventEl.closest("a, button, summary")) {
-      openSourceFromElement(sourceEl);
+      void openSourceFromElement(sourceEl);
     }
   }
 
@@ -1544,7 +1829,7 @@
       return;
     }
     event.preventDefault();
-    openSourceFromElement(sourceEl);
+    void openSourceFromElement(sourceEl);
   }
 
   function handleRootPointerDown(event) {
@@ -1588,6 +1873,39 @@
     }
   }
 
+  function handleRouteChangeEvent(event) {
+    const nextUrl = cleanText(event?.detail?.pageUrl || window.location.href);
+    if (!nextUrl || cleanText(root.dataset.pageUrl || "") === nextUrl) {
+      return;
+    }
+    resetAnalysisState("待采集");
+    root.dataset.pageUrl = nextUrl;
+    render();
+    void hydrateCurrentPage({
+      preferCache: true,
+      autoRun: event?.detail?.autoRun === true
+    });
+  }
+
+  function handleUnmountEvent() {
+    clearAutoRunTimer();
+    clearCacheHydrateTimer();
+    if (runtime.saveTimer) {
+      clearTimeout(runtime.saveTimer);
+      runtime.saveTimer = null;
+    }
+    chrome.runtime.onMessage.removeListener(handleProgressMessage);
+    unbindRootEvents();
+    root.remove();
+  }
+
+  function handleOpenPanelEvent(event) {
+    void openPanelAndMaybeRun({
+      preferCache: event?.detail?.preferCache !== false,
+      autoRunOnCacheMiss: event?.detail?.autoRunOnCacheMiss !== false
+    });
+  }
+
   function bindRootEvents() {
     if (runtime.rootEventsBound) {
       return;
@@ -1595,8 +1913,40 @@
     root.addEventListener("click", handleRootClick);
     root.addEventListener("keydown", handleRootKeydown);
     root.addEventListener("pointerdown", handleRootPointerDown);
+    root.addEventListener("oa-finance-rebuild-route-change", handleRouteChangeEvent);
+    root.addEventListener("oa-finance-rebuild-open-panel", handleOpenPanelEvent);
+    root.addEventListener("oa-finance-rebuild-unmount", handleUnmountEvent);
     window.addEventListener("resize", handleViewportResize);
     runtime.rootEventsBound = true;
+  }
+
+  function unbindRootEvents() {
+    if (!runtime.rootEventsBound) {
+      return;
+    }
+    root.removeEventListener("click", handleRootClick);
+    root.removeEventListener("keydown", handleRootKeydown);
+    root.removeEventListener("pointerdown", handleRootPointerDown);
+    root.removeEventListener("oa-finance-rebuild-route-change", handleRouteChangeEvent);
+    root.removeEventListener("oa-finance-rebuild-open-panel", handleOpenPanelEvent);
+    root.removeEventListener("oa-finance-rebuild-unmount", handleUnmountEvent);
+    window.removeEventListener("resize", handleViewportResize);
+    runtime.rootEventsBound = false;
+  }
+
+  function handleProgressMessage(message) {
+    if (message?.type !== "oa-finance-rebuild-progress") {
+      return;
+    }
+    const requestId = cleanText(message.payload?.requestId || "");
+    if (!state.activeRequestId || requestId !== state.activeRequestId) {
+      return;
+    }
+    state.isRunning = true;
+    state.progressCollapsed = false;
+    state.statusText = message.payload?.text || "分析中...";
+    rememberProgress(message.payload || {});
+    render();
   }
 
   function render() {
@@ -1665,8 +2015,10 @@
     applyPanelLayout();
   }
 
-  function runAnalysisNow() {
-    const snapshot = collector.collectPageSnapshot();
+  function runAnalysisNow(snapshotOverride = null) {
+    clearAutoRunTimer();
+    clearCacheHydrateTimer();
+    const snapshot = snapshotOverride || collector.collectPageSnapshot();
     const requestId = createRequestId(extractProcessCodeFromUrl() || "detail");
     state.isRunning = true;
     state.activeRequestId = requestId;
@@ -1706,32 +2058,20 @@
   }
 
   bindRootEvents();
-
-  chrome.runtime.onMessage.addListener((message) => {
-    if (message?.type !== "oa-finance-rebuild-progress") {
-      return;
-    }
-    const requestId = cleanText(message.payload?.requestId || "");
-    if (!state.activeRequestId || requestId !== state.activeRequestId) {
-      return;
-    }
-    state.isRunning = true;
-    state.progressCollapsed = false;
-    state.statusText = message.payload?.text || "分析中...";
-    rememberProgress(message.payload || {});
-    render();
-  });
+  chrome.runtime.onMessage.addListener(handleProgressMessage);
 
   chrome.runtime.sendMessage({ type: "oa-finance-rebuild-ping" }, (response) => {
     if (!chrome.runtime.lastError && response?.ok) {
       state.buildTag = response.buildTag || "";
+      root.dataset.buildTag = state.buildTag;
       state.statusText = response.message || "已加载";
     }
     render();
   });
   render();
   loadUiState();
-  setTimeout(() => {
-    void tryLoadCachedAnalysis();
-  }, 0);
+  void hydrateCurrentPage({
+    preferCache: true,
+    autoRun: false
+  });
 })();

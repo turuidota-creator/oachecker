@@ -1,10 +1,109 @@
 import { BUILD_TAG, analyzePageSnapshot } from "./bg/analyzer.js";
+import {
+  buildFlowableInvoiceEvidenceList,
+  fetchFlowableDetail,
+  parseProcessRef,
+  resolveProcessCodeRef
+} from "./bg/detail.js";
 
 const PROGRESS_MESSAGE_TYPE = "oa-finance-rebuild-progress";
 const CACHE_KEY_PREFIX = "oa-finance-rebuild-cache:";
+const CACHE_SCHEMA_VERSION = "detail-cache-refresh-2026-04-15";
+const DETAIL_CONTENT_SCRIPT_FILES = ["shared/models.js", "shared/evidence.js", "page/collector.js", "content.js"];
 
 function cleanText(value) {
   return String(value || "").trim();
+}
+
+function normalizeProcessCode(value) {
+  return cleanText(value).toUpperCase();
+}
+
+function extractInvoiceNoFromSourceName(sourceName) {
+  const matched = cleanText(sourceName).match(/付款页发票明细[:：]\s*([A-Za-z0-9]+)/i);
+  return matched?.[1] ? matched[1].trim() : "";
+}
+
+function normalizeComparableUrl(url) {
+  const text = cleanText(url);
+  if (!text) {
+    return "";
+  }
+  try {
+    const parsed = new URL(text);
+    parsed.search = "";
+    parsed.hash = "";
+    return parsed.toString();
+  } catch (_error) {
+    return text.replace(/[?#].*$/, "");
+  }
+}
+
+function shouldRefreshInvoiceSource(sourceName, sourceUrl) {
+  const normalizedName = cleanText(sourceName);
+  const normalizedUrl = cleanText(sourceUrl);
+  return /付款页发票明细/.test(normalizedName) || /invoice-cyou-com-1251125656\.cos\.ap-beijing\.myqcloud\.com/i.test(normalizedUrl);
+}
+
+function pickFreshInvoiceSource(items, sourceName, sourceUrl) {
+  const candidates = Array.isArray(items) ? items.filter((item) => cleanText(item?.sourceUrl)) : [];
+  if (candidates.length === 0) {
+    return "";
+  }
+
+  const invoiceNo = extractInvoiceNoFromSourceName(sourceName);
+  if (invoiceNo) {
+    const matchedByNo = candidates.find((item) => cleanText(item?.invoiceNo) === invoiceNo);
+    if (matchedByNo?.sourceUrl) {
+      return matchedByNo.sourceUrl;
+    }
+  }
+
+  const comparableSourceUrl = normalizeComparableUrl(sourceUrl);
+  if (comparableSourceUrl) {
+    const matchedByUrl = candidates.find((item) => normalizeComparableUrl(item?.sourceUrl) === comparableSourceUrl);
+    if (matchedByUrl?.sourceUrl) {
+      return matchedByUrl.sourceUrl;
+    }
+  }
+
+  if (candidates.length === 1) {
+    return candidates[0].sourceUrl || "";
+  }
+
+  return "";
+}
+
+async function resolveFreshSourceUrl({ pageUrl = "", processCode = "", sourceName = "", sourceUrl = "" } = {}) {
+  const normalizedSourceUrl = cleanText(sourceUrl);
+  if (!shouldRefreshInvoiceSource(sourceName, normalizedSourceUrl)) {
+    return normalizedSourceUrl;
+  }
+
+  const normalizedPageUrl = cleanText(pageUrl);
+  const normalizedProcessCode = cleanText(processCode).toUpperCase();
+  let ref = normalizedPageUrl ? parseProcessRef(normalizedPageUrl, "payment") : null;
+  const baseUrl = (() => {
+    if (normalizedPageUrl) {
+      try {
+        return new URL(normalizedPageUrl).origin;
+      } catch (_error) {
+        return "http://oa.cyou-inc.com";
+      }
+    }
+    return "http://oa.cyou-inc.com";
+  })();
+
+  if ((!ref || !ref.detailId) && normalizedProcessCode) {
+    ref = await resolveProcessCodeRef(normalizedProcessCode, "payment", baseUrl).catch(() => null);
+  }
+  if (!ref || ref.mode !== "flowable" || !ref.detailId) {
+    return normalizedSourceUrl;
+  }
+
+  const detail = await fetchFlowableDetail(ref, baseUrl);
+  const invoiceItems = await buildFlowableInvoiceEvidenceList(detail, baseUrl);
+  return pickFreshInvoiceSource(invoiceItems, sourceName, normalizedSourceUrl) || normalizedSourceUrl;
 }
 
 function currentDayKey() {
@@ -13,6 +112,24 @@ function currentDayKey() {
   const month = String(now.getMonth() + 1).padStart(2, "0");
   const day = String(now.getDate()).padStart(2, "0");
   return `${year}-${month}-${day}`;
+}
+
+function isDetailPageUrl(url) {
+  return /https?:\/\/oa\.cyou-inc\.com\/workflow\/process\/detail\/\d+/i.test(cleanText(url));
+}
+
+async function ensureDetailContentScripts(tabId, frameId = 0, pageUrl = "") {
+  if (!Number.isInteger(tabId) || !isDetailPageUrl(pageUrl)) {
+    return false;
+  }
+  await chrome.scripting.executeScript({
+    target: {
+      tabId,
+      frameIds: [frameId]
+    },
+    files: DETAIL_CONTENT_SCRIPT_FILES
+  });
+  return true;
 }
 
 function sendProgressToTab(tabId, payload) {
@@ -36,11 +153,11 @@ function sendProgressToTab(tabId, payload) {
 }
 
 function buildCacheKey(processCode) {
-  return `${CACHE_KEY_PREFIX}${processCode}`;
+  return `${CACHE_KEY_PREFIX}${normalizeProcessCode(processCode)}`;
 }
 
 function pickProcessCode(result, fallback = {}) {
-  return cleanText(result?.paymentTarget?.processCode || fallback?.processCode || "");
+  return normalizeProcessCode(result?.paymentTarget?.processCode || fallback?.processCode || "");
 }
 
 function isFreshCacheEntry(entry) {
@@ -48,6 +165,9 @@ function isFreshCacheEntry(entry) {
     return false;
   }
   if (entry.buildTag && entry.buildTag !== BUILD_TAG) {
+    return false;
+  }
+  if (entry.cacheSchema !== CACHE_SCHEMA_VERSION) {
     return false;
   }
   const cachedAt = Number.parseInt(entry.cachedAt || "0", 10);
@@ -66,6 +186,7 @@ async function storeAnalysisCache(result, meta = {}) {
     processCode,
     detailUrl: cleanText(meta.detailUrl || meta.pageUrl || ""),
     buildTag: BUILD_TAG,
+    cacheSchema: CACHE_SCHEMA_VERSION,
     cachedDay: currentDayKey(),
     cachedAt: Date.now(),
     result
@@ -74,7 +195,7 @@ async function storeAnalysisCache(result, meta = {}) {
 }
 
 async function getAnalysisCache(processCode) {
-  const normalized = cleanText(processCode);
+  const normalized = normalizeProcessCode(processCode);
   if (!normalized) {
     return null;
   }
@@ -92,7 +213,7 @@ async function getAnalysisCache(processCode) {
 }
 
 async function getAnalysisCaches(processCodes) {
-  const normalizedCodes = Array.from(new Set((processCodes || []).map((item) => cleanText(item)).filter(Boolean)));
+  const normalizedCodes = Array.from(new Set((processCodes || []).map((item) => normalizeProcessCode(item)).filter(Boolean)));
   const entries = [];
   for (const processCode of normalizedCodes) {
     const entry = await getAnalysisCache(processCode);
@@ -155,6 +276,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     );
   }
 
+  if (message?.type === "oa-finance-rebuild-ensure-detail-content") {
+    ensureDetailContentScripts(sender?.tab?.id, sender?.frameId || 0, message.url || sender?.tab?.url || "")
+      .then((injected) => sendResponse({ ok: true, injected: !!injected }))
+      .catch((error) => sendResponse({ ok: false, error: error?.message || String(error) }));
+    return true;
+  }
+
   if (message?.type === "oa-finance-rebuild-analyze-url") {
     return handleAnalyzeRequest(
       {
@@ -180,6 +308,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === "oa-finance-rebuild-get-cache-bulk") {
     getAnalysisCaches(Array.isArray(message.processCodes) ? message.processCodes : [])
       .then((entries) => sendResponse({ ok: true, entries }))
+      .catch((error) => sendResponse({ ok: false, error: error?.message || String(error) }));
+    return true;
+  }
+
+  if (message?.type === "oa-finance-rebuild-resolve-source-url") {
+    resolveFreshSourceUrl({
+      pageUrl: message.pageUrl || sender?.tab?.url || "",
+      processCode: message.processCode || "",
+      sourceName: message.sourceName || "",
+      sourceUrl: message.sourceUrl || ""
+    })
+      .then((sourceUrl) => sendResponse({ ok: true, sourceUrl }))
       .catch((error) => sendResponse({ ok: false, error: error?.message || String(error) }));
     return true;
   }
