@@ -1,6 +1,6 @@
 # OA 付款审核插件重构清单
 
-这份文档记录的是“重构版插件应该如何做”，以及“当前已经做到哪一步”。
+这份文档记录的是 OA 付款审核插件应该如何做，以及当前已经做到哪一步。
 
 ## 1. 重构目标
 
@@ -192,6 +192,7 @@
 
 - 已完成主链路
 - 已接入合同摘要 MVP
+- 已接入多链路异步并行分析
 - 当前重点是继续补强“合同附件读全”“付款条件提取”和“本地摘要稳定性”
 
 ### 5.7 合同摘要与条款提取层
@@ -216,11 +217,14 @@
 文件：
 
 - [content.js](C:/Users/turui/Documents/OA_Payment_Audit_Rebuild_Project/oa_finance_audit_rebuild_extension/content.js)
+- [list_page.js](C:/Users/turui/Documents/OA_Payment_Audit_Rebuild_Project/oa_finance_audit_rebuild_extension/list_page.js)
 - [styles.css](C:/Users/turui/Documents/OA_Payment_Audit_Rebuild_Project/oa_finance_audit_rebuild_extension/styles.css)
 
 职责：
 
 - 实时进度
+- 详情页页面内 `自动审核` 入口
+- 原生按钮区找不到时的固定兜底入口
 - 三张主卡片
 - 合同参考信息
 - 合同付款摘要
@@ -232,6 +236,32 @@
 
 - 已完成主展示
 - 已加合同处理状态信息
+- 已加 `requestId` 级别的实时进度隔离
+- 已加详情页稳定入口：页面内按钮负责打开/触发，悬浮面板继续负责结果展示和手动重跑
+
+### 5.9 异步并行审查与进度桥接层
+
+文件：
+
+- [background.js](C:/Users/turui/Documents/OA_Payment_Audit_Rebuild_Project/oa_finance_audit_rebuild_extension/background.js)
+- [list_page.js](C:/Users/turui/Documents/OA_Payment_Audit_Rebuild_Project/oa_finance_audit_rebuild_extension/list_page.js)
+- [bg/ocr_bridge.js](C:/Users/turui/Documents/OA_Payment_Audit_Rebuild_Project/oa_finance_audit_rebuild_extension/bg/ocr_bridge.js)
+
+职责：
+
+- 统一为详情页分析和列表页自动审核生成 `requestId`
+- 通过 background 将进度消息透传给当前 tab
+- 列表页按受控并发队列拉起多条付款单自动审核
+- 用 OCR bridge 复用宿主页隔离世界中的 OCR worker 生命周期
+- 用 `buildTag + cachedDay + processCode` 管理当日缓存结果
+- 详情页进入时只被动读取缓存；只有用户点击 `自动审核` 后，缓存未命中才自动开始审核
+
+状态：
+
+- 已完成第一版正式实现
+- 当前列表页默认并发数为 `2`
+- 批量审核结果和详情页缓存回放统一按规范化后的 `processCode` 读取
+- 后续仍可继续把缓存批量读取改成单次批量 `storage.get`
 
 ## 6. 当前已经落实的关键实现
 
@@ -242,6 +272,7 @@
 - 使用本地 `tessdata`
 - 不再依赖外网下载语言包
 - 对扫描版 PDF 和图片附件都可用
+- OCR worker 已转为 bridge 复用，而不是每次在 service worker 里重新创建整套生命周期
 
 ### 6.2 小文件优先扫描
 
@@ -263,7 +294,35 @@
 - 有效期来源
 - 付款条件来源
 
-### 6.4 VPN 代理绕过
+### 6.4 异步并行审查机制
+
+当前异步并行审查机制已经落地，核心规则如下：
+
+1. 详情页每次点击分析都会生成新的 `requestId`
+2. background 在进度透传时附带同一个 `requestId`
+3. content/list 侧只消费“当前活动请求”的进度，旧回调直接丢弃
+4. 列表页批量自动审核采用受控并发队列，当前默认 `2` 个 worker
+5. 主分析层内部把付款页附件、合同、国内 PR、采购订单、验收等拆成可并发的异步任务，再按阶段汇总
+
+当前收益：
+
+- 避免上一轮慢请求覆盖当前分析状态
+- 列表页批量审核明显快于完全串行
+- OCR 初始化成本下降，长批次任务更稳定
+- 进度提示可以明确映射到“读取付款单 / 读取合同 / 核对附件 / 汇总结果”等阶段
+
+### 6.5 详情页入口与缓存回放
+
+详情页入口遵循“页面内入口保底，悬浮面板展示结果”的规则：
+
+1. `list_page.js` 作为全站常驻脚本监听 URL 和 DOM 变化，只在 `/workflow/process/detail/<id>` 页面工作。
+2. 优先把 `自动审核` 按钮插入 `通过 / 保存 / 转办 / 退回` 这组 OA 原生按钮右侧。
+3. 如果按钮区延迟渲染或暂时找不到，先显示固定兜底入口；按钮区出现后迁移回原生按钮区。
+4. 进入详情页时只尝试读取已有缓存，不自动发起审核。
+5. 用户点击 `自动审核` 后，先打开面板并读取缓存；命中则展示缓存结果，未命中才开始审核。
+6. 离开详情页时清理页面内入口和固定兜底，避免 SPA 路由切换后重复插入。
+
+### 6.6 VPN 代理绕过
 
 测试脚本现在已经默认带直连参数，避免因为 VPN 导致自动化浏览器打不开 OA。
 
@@ -271,7 +330,7 @@
 
 - [test_rebuild_single_case.py](C:/Users/turui/Documents/OA_Payment_Audit_Rebuild_Project/scripts/test_rebuild_single_case.py)
 
-### 6.5 合同摘要 MVP
+### 6.7 合同摘要 MVP
 
 当前已经落地：
 

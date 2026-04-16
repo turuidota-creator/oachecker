@@ -1,5 +1,14 @@
 # 文档索引
 
+## 当前版本重点
+
+- 2026-04-15：详情页和列表页都已经接入基于 `requestId` 的异步进度隔离。
+- 2026-04-15：列表页自动审核已采用受控并发，当前默认并发数为 `2`。
+- 2026-04-15：OCR 识别链路已改成 `background 编排 + 宿主页 ISOLATED world bridge 复用`。
+- 2026-04-16：详情页增加页面内 `自动审核` 入口和固定兜底入口，避免只依赖悬浮面板自动出现。
+- 2026-04-16：详情页进入时只被动读取批量审核缓存；只有用户点击 `自动审核` 时，缓存未命中才自动开始审核。
+- 2026-04-16：`pitfalls_and_lessons.md` 已从长篇事故记录整理为高密度经验清单，细节回溯以 git 历史为准。
+
 - `rebuild_plan.md`
   总体重构范围、分阶段目标和推进顺序。
 
@@ -19,7 +28,22 @@
   基于真实回放、页面源码和接口行为整理的 OA 系统解读指导。
 
 - `pitfalls_and_lessons.md`
-  当前项目已经踩过的坑、排查过程和修复经验。
+  当前项目已经踩过的关键坑、排查顺序和可复用修复原则。
+
+- `scripts/test_extract_ocr_guards.mjs`
+  OCR / 提取兜底规则的本地校验脚本。
+
+- `scripts/test_invoice_type_rules.mjs`
+  发票类型与金额主核对闸门规则的本地校验脚本。
+
+- `scripts/test_invoice_type_page_context.mjs`
+  发票类型识别在页面上下文中的本地校验脚本。
+
+- `scripts/test_process_link_refs.mjs`
+  付款流程关联链接引用的本地校验脚本。
+
+- `scripts/test_docx_extraction_guards.mjs`
+  DOCX 可见文本提取与防误提取规则的本地校验脚本。
 
 - `proxy_troubleshooting_lessons_2026-04-10.md`
   代理导致无法访问 OA 时的排查记录与处理办法。

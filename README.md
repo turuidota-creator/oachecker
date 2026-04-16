@@ -1,6 +1,6 @@
-# OA 付款审核重构
+# OA 付款审核
 
-这里是 OA 付款审核重构工作的整理后项目根目录。
+这里是 OA 付款审核插件当前正式工作区的整理后项目根目录。
 
 请将以下目录作为项目根目录使用：
 
@@ -17,9 +17,10 @@
 
 ## 包含内容
 
-- 重构版 OA 付款审核插件源码
+- OA 付款审核插件源码
 - 当前产品与实现文档
 - 本地单案例校验脚本
+- 列表页异步并行审查与 OCR bridge 相关实现
 
 ## 推荐工作目录
 
@@ -43,6 +44,21 @@
 - `docs/contract_summary_and_redaction.md`
 - `docs/invoice_detection_rules.md`
 - `docs/pitfalls_and_lessons.md`
+
+## 当前实现摘要
+
+- 详情页分析已经采用 `requestId + progress` 的异步进度隔离，避免旧回调把新一次分析状态覆盖掉。
+- 列表页自动审核已支持受控并行，当前默认并发数为 `2`，通过 worker 队列逐条拉起付款单审查。
+- background 会把分析结果按 `processCode + buildTag + 当天日期` 写入本地缓存；详情页进入后只被动读取缓存，不自动开跑审核。
+- 详情页底部 OA 原生按钮区右侧会挂载页面内 `自动审核` 入口；找不到原生按钮区时会显示小型固定兜底入口。
+- 点击详情页 `自动审核` 后会先展开审核面板并读取缓存；命中缓存则直接展示，未命中才开始当前付款单审核。
+- OCR 已切到宿主页 `ISOLATED` world 的 bridge 复用模式，避免 MV3 service worker 里直接长期承载 OCR worker。
+- 新增本地规则校验脚本：
+  - `scripts/test_extract_ocr_guards.mjs`
+  - `scripts/test_invoice_type_rules.mjs`
+  - `scripts/test_invoice_type_page_context.mjs`
+  - `scripts/test_process_link_refs.mjs`
+  - `scripts/test_docx_extraction_guards.mjs`
 
 ## 说明
 
