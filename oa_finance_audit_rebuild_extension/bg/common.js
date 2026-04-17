@@ -251,6 +251,145 @@ export function amountMatchesPayment(text, paymentAmount) {
   return !!findAmountPairMatch(text, target);
 }
 
+function structuredInvoiceTypeMatch(item) {
+  return pickFirstNormalizedValue(
+    [
+      item?.invoiceTypeRaw,
+      ...(Array.isArray(item?.invoiceTypeCandidates) ? item.invoiceTypeCandidates : []),
+      item?.sourceText,
+      item?.sourceName
+    ],
+    normalizeInvoiceSubtypeLabel
+  );
+}
+
+function structuredInvoiceAmountEntry(item) {
+  const rawAmount = cleanText(item?.amount || "");
+  const value = parseAmount(rawAmount);
+  return {
+    invoiceNo: cleanText(item?.invoiceNo || ""),
+    rawAmount,
+    value,
+    valid: !!rawAmount && value > 0
+  };
+}
+
+function buildStructuredInvoiceDetailText(items, amountEntries, typeEntries) {
+  const parts = [];
+  for (let index = 0; index < items.length; index += 1) {
+    const item = items[index] || {};
+    const amount = amountEntries[index] || {};
+    const type = typeEntries[index] || {};
+    const invoiceName = cleanText(item.invoiceNo || item.sourceName || `第${index + 1}张`);
+    const amountText = amount.valid ? formatAmount(amount.value) : "金额未识别";
+    const typeText = type.label || "票种未识别";
+    parts.push(`${invoiceName}：${amountText}，${typeText}`);
+  }
+  return parts.join("；");
+}
+
+function buildMultiStructuredInvoiceAmountEvidence(items, target) {
+  const sources = Array.isArray(items) ? items : [];
+  if (sources.length <= 1) {
+    return null;
+  }
+
+  const targetAmount = parseAmount(target?.paymentAmount);
+  if (!(targetAmount > 0)) {
+    return null;
+  }
+
+  const amountEntries = sources.map((item) => structuredInvoiceAmountEntry(item));
+  if (!amountEntries.every((item) => item.valid)) {
+    return null;
+  }
+
+  const totalAmount = amountEntries.reduce((sum, item) => sum + item.value, 0);
+  if (Math.abs(totalAmount - targetAmount) >= 0.01) {
+    return null;
+  }
+
+  const typeEntries = sources.map((item) => structuredInvoiceTypeMatch(item));
+  const allSpecialInvoices = typeEntries.every((item) => item.label === "增值税专用发票");
+  const detailText = buildStructuredInvoiceDetailText(sources, amountEntries, typeEntries);
+
+  return makeEvidence(
+    `付款页发票明细合计（${sources.length}张）`,
+    firstNonEmpty(...sources.map((item) => item?.sourceUrl)),
+    formatAmount(totalAmount),
+    `价税合计：${formatAmount(totalAmount)}；${detailText}`,
+    {
+      invoiceTypeLabel: allSpecialInvoices ? "增值税专用发票" : "",
+      invoiceTypeRaw: allSpecialInvoices ? "多张发票均为增值税专用发票" : "",
+      invoiceTypeCandidates: typeEntries.map((item) => item.raw || item.label).filter(Boolean),
+      evidenceRole: "invoice",
+      multiInvoiceAggregate: true,
+      invoiceCount: sources.length,
+      invoiceAmountTotal: totalAmount,
+      invoiceTypeAllSpecial: allSpecialInvoices,
+      invoiceAmountItems: amountEntries.map((item, index) => ({
+        invoiceNo: item.invoiceNo || cleanText(sources[index]?.invoiceNo || ""),
+        amount: item.rawAmount,
+        parsedAmount: item.value,
+        invoiceType: typeEntries[index]?.label || "",
+        invoiceTypeRaw: typeEntries[index]?.raw || ""
+      }))
+    }
+  );
+}
+
+export function analyzeStructuredInvoiceSources(items, target) {
+  const sources = Array.isArray(items) ? items : [];
+  const matches = { amount: null, company: null, account: null };
+  const multiInvoiceMode = sources.length > 1;
+
+  if (multiInvoiceMode) {
+    matches.amount = buildMultiStructuredInvoiceAmountEvidence(sources, target);
+  }
+
+  for (const item of sources) {
+    const sourceText = cleanText(item?.sourceText || "");
+    const sourceName = item?.sourceName || "付款页发票明细";
+    const sourceUrl = item?.sourceUrl || "";
+    const invoiceTypeMatch = structuredInvoiceTypeMatch(item);
+
+    if (!multiInvoiceMode && !matches.amount && amountMatchesPayment(sourceText, target?.paymentAmount)) {
+      matches.amount = makeEvidence(
+        sourceName,
+        sourceUrl,
+        formatAmount(target?.paymentAmount),
+        sourceText || `价税合计：${item?.amount || ""}`,
+        {
+          invoiceTypeLabel: invoiceTypeMatch.label || "",
+          invoiceTypeRaw: invoiceTypeMatch.raw || cleanText(item?.invoiceTypeRaw || ""),
+          invoiceTypeCandidates: Array.isArray(item?.invoiceTypeCandidates) ? item.invoiceTypeCandidates : [],
+          evidenceRole: "invoice"
+        }
+      );
+    }
+
+    if (!matches.company && companyMatchesPayment(sourceText, target?.payeeCompany)) {
+      matches.company = makeEvidence(
+        sourceName,
+        sourceUrl,
+        target?.payeeCompany || "",
+        sourceText || `销售方：${item?.supplier || ""}`
+      );
+    }
+
+    if (!matches.account && accountMatchesPayment(sourceText, target?.payeeAccount)) {
+      matches.account = makeEvidence(
+        sourceName,
+        sourceUrl,
+        target?.payeeAccount || "",
+        sourceText || `收款账号：${item?.accountNo || ""}`
+      );
+    }
+  }
+
+  return matches;
+}
+
 export function companyMatchesPayment(text, payeeCompany) {
   const target = normalizeCompareText(payeeCompany);
   return target && target.length >= 4 ? normalizeCompareText(text).includes(target) : false;
@@ -324,6 +463,276 @@ export function pickFirstNormalizedValue(values, normalizer) {
 
 export function isInvoiceTypePass(invoiceSubtypeLabel, pageInvoiceLabel) {
   return invoiceSubtypeLabel === "增值税专用发票" && pageInvoiceLabel === "增值税发票";
+}
+
+export function inferInvoiceSubtypeFromPageContext(pageInvoiceContext = {}) {
+  const pageInvoiceLabel = firstNonEmpty(pageInvoiceContext?.pageInvoiceLabel);
+  const linkedInvoiceCorrectness = cleanText(pageInvoiceContext?.linkedInvoiceCorrectness || "");
+  const deductibleTaxAmount = parseAmount(pageInvoiceContext?.deductibleTaxAmount);
+
+  if (pageInvoiceLabel !== "增值税发票") {
+    return "";
+  }
+  if (linkedInvoiceCorrectness !== "正确") {
+    return "";
+  }
+  if (!(deductibleTaxAmount > 0)) {
+    return "";
+  }
+
+  return "增值税专用发票";
+}
+
+const DETAIL_FIELD_OPTION_FALLBACKS = {
+  fplx: {
+    "1": "增值税发票",
+    "2": "其他票据",
+    "3": "暂未取得发票"
+  },
+  fpsfzq: {
+    "1": "正确",
+    "2": "不正确"
+  }
+};
+
+function findFieldValuesFromPairs(pairs, ...labels) {
+  const results = [];
+  const seen = new Set();
+
+  for (const label of labels) {
+    for (const item of pairs || []) {
+      if (!String(item?.label || "").includes(label)) {
+        continue;
+      }
+      const value = cleanText(item?.value || "");
+      if (!value || seen.has(value)) {
+        continue;
+      }
+      seen.add(value);
+      results.push(value);
+    }
+  }
+
+  return results;
+}
+
+function collectBodyFieldCandidates(bodyText, patterns) {
+  const source = cleanText(bodyText || "");
+  const results = [];
+  const seen = new Set();
+  if (!source) {
+    return results;
+  }
+
+  for (const pattern of patterns || []) {
+    if (!(pattern instanceof RegExp)) {
+      continue;
+    }
+    const flags = pattern.flags.includes("g") ? pattern.flags : `${pattern.flags}g`;
+    const matcher = new RegExp(pattern.source, flags);
+    for (const match of source.matchAll(matcher)) {
+      const value = cleanText(match?.[1] || match?.[0] || "");
+      if (!value || seen.has(value)) {
+        continue;
+      }
+      seen.add(value);
+      results.push(value);
+    }
+  }
+
+  return results;
+}
+
+function pickSingleFieldValue(values, predicate) {
+  for (const value of values || []) {
+    const text = cleanText(value || "");
+    if (!text) {
+      continue;
+    }
+    if (typeof predicate === "function" && !predicate(text)) {
+      continue;
+    }
+    return text;
+  }
+  return "";
+}
+
+function walkTaskFormWidgets(nodes, visitor) {
+  const queue = Array.isArray(nodes) ? [...nodes] : [];
+
+  while (queue.length > 0) {
+    const node = queue.shift();
+    if (!node || typeof node !== "object") {
+      continue;
+    }
+
+    if (typeof visitor === "function" && visitor(node) === true) {
+      return true;
+    }
+
+    if (Array.isArray(node.widgetList)) {
+      queue.push(...node.widgetList);
+    }
+    if (Array.isArray(node.cols)) {
+      queue.push(...node.cols);
+    }
+  }
+
+  return false;
+}
+
+function findTaskFormFieldOptionLabel(detail, fieldName, rawValue) {
+  const normalizedFieldName = cleanText(fieldName || "");
+  const normalizedRawValue = cleanText(rawValue || "");
+  if (!normalizedFieldName || !normalizedRawValue) {
+    return "";
+  }
+
+  let matchedLabel = "";
+  walkTaskFormWidgets(detail?.taskFormData?.widgetList, (node) => {
+    const options = node?.options || {};
+    if (cleanText(options.name) !== normalizedFieldName || !Array.isArray(options.optionItems)) {
+      return false;
+    }
+
+    const matched = options.optionItems.find(
+      (item) => cleanText(item?.value) === normalizedRawValue || cleanText(item?.label) === normalizedRawValue
+    );
+    if (!matched?.label) {
+      return false;
+    }
+
+    matchedLabel = cleanText(matched.label);
+    return true;
+  });
+
+  if (matchedLabel) {
+    return matchedLabel;
+  }
+
+  return DETAIL_FIELD_OPTION_FALLBACKS[normalizedFieldName]?.[normalizedRawValue] || "";
+}
+
+function collectStructuredInvoiceTypeCandidates(structuredInvoiceSources) {
+  const results = [];
+  const seen = new Set();
+  const push = (value) => {
+    const text = cleanText(value || "");
+    if (!text || seen.has(text)) {
+      return;
+    }
+    seen.add(text);
+    results.push(text);
+  };
+
+  for (const item of structuredInvoiceSources || []) {
+    push(item?.invoiceTypeRaw);
+    for (const candidate of item?.invoiceTypeCandidates || []) {
+      push(candidate);
+    }
+  }
+
+  return results;
+}
+
+function collectDetailInvoiceTypeCandidates(detail, structuredInvoiceSources) {
+  const flow = detail?.flowFormData || detail?.formData || {};
+  const rows = Array.isArray(flow?.fpSubform) ? flow.fpSubform : [];
+  const results = [];
+  const seen = new Set();
+  const push = (value) => {
+    const text = cleanText(value || "");
+    if (!text || seen.has(text)) {
+      return;
+    }
+    seen.add(text);
+    results.push(text);
+  };
+
+  push(findTaskFormFieldOptionLabel(detail, "fplx", firstNonEmpty(flow?.fplx, flow?.fplxbak)));
+  push(flow?.fplx);
+  push(flow?.fplxbak);
+
+  for (const item of collectStructuredInvoiceTypeCandidates(structuredInvoiceSources)) {
+    push(item);
+  }
+
+  for (const row of rows) {
+    push(row?.invoiceTypeName);
+    push(row?.invoiceType);
+    push(row?.fplxmc);
+    push(findTaskFormFieldOptionLabel(detail, "fplx", row?.fplx));
+    push(row?.fplx);
+    push(row?.fpzl);
+    push(row?.zslx);
+    push(row?.kplx);
+    push(row?.billType);
+    push(row?.billTypeName);
+    push(row?.invoiceKind);
+    push(row?.invoiceKindName);
+  }
+
+  return results;
+}
+
+function collectDeductibleTaxCandidates(detail) {
+  const flow = detail?.flowFormData || detail?.formData || {};
+  const rows = Array.isArray(flow?.fpSubform) ? flow.fpSubform : [];
+  const rowValues = rows
+    .map((row) => cleanText(firstNonEmpty(row?.yxdkse, row?.effectiveDeductibleTaxAmount)))
+    .filter((value) => /-?\d+(?:\.\d+)?/.test(value));
+
+  if (rowValues.length <= 1) {
+    return [cleanText(flow?.yxdkse), ...rowValues].filter(Boolean);
+  }
+
+  const total = rowValues.reduce((sum, value) => sum + parseAmount(value), 0);
+  const totalText = total > 0 ? total.toFixed(2).replace(/\.00$/, "") : "";
+  return [cleanText(flow?.yxdkse), totalText, ...rowValues].filter(Boolean);
+}
+
+export function derivePageInvoiceContext(snapshot = {}, detail = null, structuredInvoiceSources = []) {
+  const fieldPairs = Array.isArray(snapshot?.fieldPairs) ? snapshot.fieldPairs : [];
+  const flow = detail?.flowFormData || detail?.formData || {};
+  const pageInvoiceValues = [
+    ...findFieldValuesFromPairs(fieldPairs, "发票类型"),
+    ...collectBodyFieldCandidates(snapshot?.bodyText || "", [
+      /(?:发票类型|票据类型)[：:\s]{0,8}(增值税发票|其他票据|暂未取得发票)/i
+    ]),
+    findTaskFormFieldOptionLabel(detail, "fplx", firstNonEmpty(flow?.fplx, flow?.fplxbak)),
+    firstNonEmpty(flow?.fplx, flow?.fplxbak)
+  ].filter(Boolean);
+  const invoiceSubtypeValues = [
+    ...findFieldValuesFromPairs(fieldPairs, "发票类型"),
+    ...collectBodyFieldCandidates(snapshot?.bodyText || "", [
+      /(?:发票类型|票面类型)[：:\s]{0,8}(增值税专用发票|增值税普通发票|专票|普票)/i
+    ]),
+    ...collectDetailInvoiceTypeCandidates(detail, structuredInvoiceSources)
+  ];
+
+  const pageInvoice = pickFirstNormalizedValue(pageInvoiceValues, normalizePageInvoiceLabel);
+  const invoiceSubtype = pickFirstNormalizedValue(invoiceSubtypeValues, normalizeInvoiceSubtypeLabel);
+  const linkedInvoiceCorrectness = pickSingleFieldValue(
+    [
+      ...findFieldValuesFromPairs(fieldPairs, "关联发票是否正确"),
+      findTaskFormFieldOptionLabel(detail, "fpsfzq", flow?.fpsfzq),
+      cleanText(flow?.fpsfzq)
+    ],
+    (value) => /^(正确|不正确)$/.test(value)
+  );
+  const deductibleTaxAmount = pickSingleFieldValue(
+    [...findFieldValuesFromPairs(fieldPairs, "有效抵扣税额"), ...collectDeductibleTaxCandidates(detail)],
+    (value) => /-?\d+(?:\.\d+)?/.test(value)
+  );
+
+  return {
+    pageInvoiceLabel: pageInvoice.label || "",
+    pageInvoiceRaw: pageInvoice.raw || "",
+    invoiceSubtypeLabel: invoiceSubtype.label || "",
+    invoiceSubtypeRaw: invoiceSubtype.raw || "",
+    linkedInvoiceCorrectness,
+    deductibleTaxAmount
+  };
 }
 
 export function classifyAttachmentRole(item) {
@@ -474,6 +883,7 @@ export function attachmentPreScanPriority(item) {
   if (isPotentialInvoiceCarrier && namedRole === "other") return 1;
 
   if (namedRole === "bank_notice") return 2;
+  if (namedRole === "contract" && /\.(?:png|jpg|jpeg)$/i.test(marker)) return 3.5;
   if (namedRole === "contract") return 3;
   if (namedRole === "acceptance") return 4;
   if (/\.zip$/i.test(marker)) return 6;

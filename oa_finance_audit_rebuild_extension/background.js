@@ -8,7 +8,7 @@ import {
 
 const PROGRESS_MESSAGE_TYPE = "oa-finance-rebuild-progress";
 const CACHE_KEY_PREFIX = "oa-finance-rebuild-cache:";
-const CACHE_SCHEMA_VERSION = "detail-cache-refresh-2026-04-15";
+const CACHE_SCHEMA_VERSION = "detail-cache-multi-invoice-2026-04-17";
 const DETAIL_CONTENT_SCRIPT_FILES = ["shared/models.js", "shared/evidence.js", "page/collector.js", "content.js"];
 
 function cleanText(value) {

@@ -1,5 +1,6 @@
 import {
   accountMatchesPayment,
+  analyzeStructuredInvoiceSources,
   attachmentPreScanPriority,
   amountMatchesPayment,
   classifyAttachmentRole,
@@ -8,6 +9,7 @@ import {
   createVerificationItem,
   detectAttachmentRole,
   deriveBaseUrl,
+  derivePageInvoiceContext,
   attachmentSizeHint,
   extractContractPeriod,
   extractPaymentTerms,
@@ -16,6 +18,7 @@ import {
   firstNonEmpty,
   firstNonEmptyDate,
   formatAmount,
+  inferInvoiceSubtypeFromPageContext,
   isInvoiceTypePass,
   makeEvidence,
   normalizeCompareText,
@@ -47,9 +50,9 @@ import {
 import { buildContractClauseCandidates, deriveLocalContractSummary } from "./contract_terms.js";
 import { buildContractSummaryProviderMeta, generateContractSummary } from "./contract_summary_provider.js";
 import { extractMailEvidenceFromAttachment, extractReferenceTextsFromAttachment } from "./extract.js";
-import { initOcrBridge, releaseOcrBridge } from "./ocr_bridge.js";
+import { acquireOcrBridge, releaseOcrBridge } from "./ocr_bridge.js";
 
-export const BUILD_TAG = "rebuild-phase5-ocr-bridge-2026-04-14";
+export const BUILD_TAG = "rebuild-phase5-multi-invoice-2026-04-17";
 
 const GENERIC_PROCESS_CODE_RE = /\b[A-Z]{2,10}-\d{8,}\b/i;
 const DOMESTIC_PR_CODE_RE = /\bGNPR-\d{8,}\b/i;
@@ -76,7 +79,7 @@ function reportProgress(onProgress, phase, text, detail = "") {
 export async function analyzePageSnapshot(snapshot, tabId, onProgress = null) {
   const baseUrl = deriveBaseUrl(snapshot?.pageUrl);
   setRuntimeContext(baseUrl, tabId);
-  await initOcrBridge(tabId).catch(() => false);
+  await acquireOcrBridge(tabId).catch(() => false);
 
   try {
 
@@ -111,8 +114,16 @@ export async function analyzePageSnapshot(snapshot, tabId, onProgress = null) {
         ...snapshotWithResolvedPr,
         flowType
       };
+  const pageInvoiceContext = derivePageInvoiceContext(enrichedSnapshot, rootDetail, structuredInvoiceSources);
+  const structuredInvoiceMatches = analyzeStructuredInvoiceSources(structuredInvoiceSources, target);
+  const structuredInvoiceAttachmentsForOcr = selectStructuredInvoiceAttachmentsForOcr(
+    structuredInvoiceSources,
+    target,
+    pageInvoiceContext,
+    structuredInvoiceMatches
+  );
   const normalizedAttachments = normalizeAttachmentCandidates([
-    ...structuredInvoiceSources.map((item) => item.attachment).filter(Boolean),
+    ...structuredInvoiceAttachmentsForOcr,
     ...(enrichedSnapshot?.attachments || [])
   ]);
 
@@ -135,7 +146,6 @@ export async function analyzePageSnapshot(snapshot, tabId, onProgress = null) {
     attachments: normalizedAttachments,
     structuredInvoices: structuredInvoiceSources
   });
-  const structuredInvoiceMatches = analyzeStructuredInvoiceSources(structuredInvoiceSources, target);
   const pageAttachmentAnalysisTask = analyzeAttachmentList(
     [
       ...inventories.invoiceAttachments,
@@ -147,7 +157,8 @@ export async function analyzePageSnapshot(snapshot, tabId, onProgress = null) {
     target,
     "付款页附件",
     onProgress,
-    "page-attachments"
+    "page-attachments",
+    { knownMatches: structuredInvoiceMatches }
   );
 
   reportProgress(
@@ -253,12 +264,12 @@ export async function analyzePageSnapshot(snapshot, tabId, onProgress = null) {
     purchaseOrderResultTask
   ]);
 
+  const hasMultiStructuredInvoices = structuredInvoiceSources.length > 1;
   const matches = {
-    amount: structuredInvoiceMatches.amount || pageAttachmentAnalysis.matches.amount || contractResult.matches.amount || null,
+    amount: structuredInvoiceMatches.amount || (hasMultiStructuredInvoices ? null : pageAttachmentAnalysis.matches.amount || contractResult.matches.amount || null),
     company: structuredInvoiceMatches.company || pageAttachmentAnalysis.matches.company || contractResult.matches.company || null,
     account: structuredInvoiceMatches.account || pageAttachmentAnalysis.matches.account || contractResult.matches.account || null
   };
-  const pageInvoiceContext = buildPageInvoiceContext(enrichedSnapshot);
   const invoiceTypeCheck = buildInvoiceTypeCheck(
     matches.amount,
     pageInvoiceContext,
@@ -455,53 +466,54 @@ function buildSourceInventories(snapshot) {
   return inventories;
 }
 
-function analyzeStructuredInvoiceSources(items, target) {
-  const matches = { amount: null, company: null, account: null };
+function getStructuredInvoiceTypeLabel(item, pageInvoiceContext = {}) {
+  return firstNonEmpty(
+    normalizeInvoiceSubtypeLabel(item?.invoiceTypeRaw || ""),
+    pickFirstNormalizedValue(
+      Array.isArray(item?.invoiceTypeCandidates) ? item.invoiceTypeCandidates : [],
+      normalizeInvoiceSubtypeLabel
+    ).label,
+    normalizeInvoiceSubtypeLabel(item?.sourceText || ""),
+    pageInvoiceContext?.invoiceSubtypeLabel,
+    inferInvoiceSubtypeFromPageContext(pageInvoiceContext)
+  );
+}
 
-  for (const item of items || []) {
-      const sourceText = cleanText(item?.sourceText || "");
-      const sourceName = item?.sourceName || "付款页发票明细";
-      const sourceUrl = item?.sourceUrl || "";
-      const invoiceTypeMatch = pickFirstNormalizedValue(
-        [item?.invoiceTypeRaw, ...(Array.isArray(item?.invoiceTypeCandidates) ? item.invoiceTypeCandidates : []), sourceText, sourceName],
-        normalizeInvoiceSubtypeLabel
-      );
+function selectStructuredInvoiceAttachmentsForOcr(items, target, pageInvoiceContext = {}, structuredMatches = {}) {
+  const sources = Array.isArray(items) ? items : [];
+  const hasStructuredInvoiceType = sources.some((item) => getStructuredInvoiceTypeLabel(item, pageInvoiceContext));
+  const hasEnoughStructuredEvidence =
+    structuredMatches?.amount &&
+    (!target?.payeeCompany || structuredMatches?.company) &&
+    (!target?.payeeAccount || structuredMatches?.account) &&
+    hasStructuredInvoiceType;
 
-    if (!matches.amount && amountMatchesPayment(sourceText, target.paymentAmount)) {
-      matches.amount = makeEvidence(
-        sourceName,
-        sourceUrl,
-          formatAmount(target.paymentAmount),
-          sourceText || `价税合计：${item?.amount || ""}`,
-          {
-            invoiceTypeLabel: invoiceTypeMatch.label || "",
-            invoiceTypeRaw: invoiceTypeMatch.raw || cleanText(item?.invoiceTypeRaw || ""),
-            invoiceTypeCandidates: Array.isArray(item?.invoiceTypeCandidates) ? item.invoiceTypeCandidates : [],
-            evidenceRole: "invoice"
-          }
-        );
-    }
-
-    if (!matches.company && companyMatchesPayment(sourceText, target.payeeCompany)) {
-      matches.company = makeEvidence(
-        sourceName,
-        sourceUrl,
-        target.payeeCompany || "",
-        sourceText || `销售方：${item?.supplier || ""}`
-      );
-    }
-
-    if (!matches.account && accountMatchesPayment(sourceText, target.payeeAccount)) {
-      matches.account = makeEvidence(
-        sourceName,
-        sourceUrl,
-        target.payeeAccount || "",
-        sourceText || `收款账号：${item?.accountNo || ""}`
-      );
-    }
+  if (hasEnoughStructuredEvidence) {
+    return [];
   }
 
-  return matches;
+  return sources
+    .filter((item) => {
+      if (!item?.attachment) {
+        return false;
+      }
+      const sourceText = cleanText(item?.sourceText || "");
+      if (!structuredMatches?.amount && !amountMatchesPayment(sourceText, target?.paymentAmount)) {
+        return true;
+      }
+      if (!hasStructuredInvoiceType && !getStructuredInvoiceTypeLabel(item, pageInvoiceContext)) {
+        return true;
+      }
+      if (target?.payeeCompany && !structuredMatches?.company && !companyMatchesPayment(sourceText, target.payeeCompany)) {
+        return true;
+      }
+      if (target?.payeeAccount && !structuredMatches?.account && !accountMatchesPayment(sourceText, target.payeeAccount)) {
+        return true;
+      }
+      return false;
+    })
+    .map((item) => item.attachment)
+    .filter(Boolean);
 }
 
 function normalizeAttachmentCandidates(items) {
@@ -666,22 +678,33 @@ function buildPageInvoiceContext(snapshot) {
 }
 
 function buildInvoiceTypeCheck(matched, pageInvoiceContext = {}, candidates = []) {
-  const invoiceEvidence = [matched, ...(Array.isArray(candidates) ? candidates : [])]
-    .filter(Boolean)
-    .find((item) =>
-      firstNonEmpty(
-        item?.invoiceTypeLabel,
-        normalizeInvoiceSubtypeLabel(item?.snippet || ""),
-        pickFirstNormalizedValue(item?.invoiceTypeCandidates || [], normalizeInvoiceSubtypeLabel).label
-      )
-    );
-  const invoiceTypeLabel = firstNonEmpty(
-    invoiceEvidence?.invoiceTypeLabel,
-    pickFirstNormalizedValue(invoiceEvidence?.invoiceTypeCandidates || [], normalizeInvoiceSubtypeLabel).label,
-    normalizeInvoiceSubtypeLabel(invoiceEvidence?.snippet || ""),
-    pageInvoiceContext?.invoiceSubtypeLabel,
-    normalizeInvoiceSubtypeLabel(matched?.snippet || "")
-  );
+  const isMultiInvoiceAggregate = !!matched?.multiInvoiceAggregate;
+  const invoiceEvidence = isMultiInvoiceAggregate
+    ? matched
+    : [matched, ...(Array.isArray(candidates) ? candidates : [])]
+        .filter(Boolean)
+        .find((item) =>
+          firstNonEmpty(
+            item?.invoiceTypeLabel,
+            normalizeInvoiceSubtypeLabel(item?.snippet || ""),
+            pickFirstNormalizedValue(item?.invoiceTypeCandidates || [], normalizeInvoiceSubtypeLabel).label
+          )
+        );
+  const directInvoiceTypeLabel = isMultiInvoiceAggregate
+    ? matched?.invoiceTypeAllSpecial
+      ? "增值税专用发票"
+      : ""
+    : firstNonEmpty(
+        invoiceEvidence?.invoiceTypeLabel,
+        pickFirstNormalizedValue(invoiceEvidence?.invoiceTypeCandidates || [], normalizeInvoiceSubtypeLabel).label,
+        normalizeInvoiceSubtypeLabel(invoiceEvidence?.snippet || ""),
+        pageInvoiceContext?.invoiceSubtypeLabel,
+        normalizeInvoiceSubtypeLabel(matched?.snippet || "")
+      );
+  const inferredInvoiceTypeLabel = directInvoiceTypeLabel || isMultiInvoiceAggregate
+    ? ""
+    : inferInvoiceSubtypeFromPageContext(pageInvoiceContext);
+  const invoiceTypeLabel = firstNonEmpty(directInvoiceTypeLabel, inferredInvoiceTypeLabel);
   const pageInvoiceLabel = firstNonEmpty(pageInvoiceContext?.pageInvoiceLabel);
   const status = matched && isInvoiceTypePass(invoiceTypeLabel, pageInvoiceLabel) ? "pass" : "warn";
   const detailParts = [
@@ -695,6 +718,15 @@ function buildInvoiceTypeCheck(matched, pageInvoiceContext = {}, candidates = []
   if (pageInvoiceContext?.deductibleTaxAmount) {
     detailParts.push(`有效抵扣税额：${pageInvoiceContext.deductibleTaxAmount}`);
   }
+  if (inferredInvoiceTypeLabel) {
+    detailParts.push("票面类型来源：页面字段兜底");
+  }
+  if (isMultiInvoiceAggregate) {
+    detailParts.push(`发票张数：${matched?.invoiceCount || 0}`);
+    if (!matched?.invoiceTypeAllSpecial) {
+      detailParts.push("票种要求：每张发票均需识别为增值税专用发票");
+    }
+  }
   if (matched?.snippet) {
     detailParts.push(`命中来源：${matched.snippet}`);
   }
@@ -702,16 +734,18 @@ function buildInvoiceTypeCheck(matched, pageInvoiceContext = {}, candidates = []
     detailParts.push(`票面补充来源：${invoiceEvidence.sourceName}`);
   }
 
-    return {
-      invoiceTypeLabel: invoiceTypeLabel || "未识别",
-      invoiceTypeRaw: firstNonEmpty(
-        invoiceEvidence?.invoiceTypeRaw,
-        ...(Array.isArray(invoiceEvidence?.invoiceTypeCandidates) ? invoiceEvidence.invoiceTypeCandidates : []),
-        matched?.invoiceTypeRaw,
-        ...(Array.isArray(matched?.invoiceTypeCandidates) ? matched.invoiceTypeCandidates : []),
-        pageInvoiceContext?.invoiceSubtypeRaw
-      ),
-      pageInvoiceLabel: pageInvoiceLabel || "未识别",
+  return {
+    invoiceTypeLabel: invoiceTypeLabel || "未识别",
+    invoiceTypeRaw: isMultiInvoiceAggregate
+      ? firstNonEmpty(matched?.invoiceTypeRaw)
+      : firstNonEmpty(
+          invoiceEvidence?.invoiceTypeRaw,
+          ...(Array.isArray(invoiceEvidence?.invoiceTypeCandidates) ? invoiceEvidence.invoiceTypeCandidates : []),
+          matched?.invoiceTypeRaw,
+          ...(Array.isArray(matched?.invoiceTypeCandidates) ? matched.invoiceTypeCandidates : []),
+          pageInvoiceContext?.invoiceSubtypeRaw
+        ),
+    pageInvoiceLabel: pageInvoiceLabel || "未识别",
     pageInvoiceRaw: pageInvoiceContext?.pageInvoiceRaw || "",
     linkedInvoiceCorrectness: pageInvoiceContext?.linkedInvoiceCorrectness || "",
     deductibleTaxAmount: pageInvoiceContext?.deductibleTaxAmount || "",
@@ -855,7 +889,7 @@ function pickRelatedLinks(relatedLinks, relation) {
 }
 
 async function loadRelatedProcessContext(ref, baseUrl, options = {}) {
-  const { includePageSnapshot = true } = options || {};
+  const { includePageSnapshot = false } = options || {};
   let detailResult = null;
   let pageResult = null;
 
@@ -2462,6 +2496,9 @@ async function analyzeAcceptanceMailLinks(relatedLinks, target, baseUrl, onProgr
 
   reportProgress(onProgress, "acceptance-open", "正在读取验收页", acceptanceLink.title || ref.detailUrl || "验收入口");
   const context = await loadRelatedProcessContext(ref, baseUrl);
+  if (!context.detail) {
+    await ensureRelatedProcessPageSnapshot(context);
+  }
   if (!context.detail && !context.pageSnapshot) {
     return createRelatedDocumentBase({
       kind: "acceptance",
@@ -2470,7 +2507,7 @@ async function analyzeAcceptanceMailLinks(relatedLinks, target, baseUrl, onProgr
       statusText: "读取失败",
       sourceName: acceptanceLink.title || "",
       sourceUrl: ref.detailUrl || "",
-      statement: `验收页读取失败：${context.detailError || context.pageError || "鏈煡閿欒"}`,
+      statement: `验收页读取失败：${context.detailError || context.pageError || "未知错误"}`,
       errorText: context.detailError || context.pageError || "",
       notes: ["只展示邮件附件与相关线索，不自动判断是否对应本次付款"]
     });
@@ -2604,6 +2641,9 @@ async function analyzeAcceptanceMailLinksMulti(relatedLinks, target, baseUrl, on
 
     reportProgress(onProgress, "acceptance-open", "正在读取验收页", acceptanceLink.title || ref.detailUrl || "验收入口");
     const context = await loadRelatedProcessContext(ref, baseUrl);
+    if (!context.detail) {
+      await ensureRelatedProcessPageSnapshot(context);
+    }
     if (!context.detail && !context.pageSnapshot) {
       docs.push(
         createRelatedDocumentBase({
@@ -2614,7 +2654,7 @@ async function analyzeAcceptanceMailLinksMulti(relatedLinks, target, baseUrl, on
           statusText: "读取失败",
           sourceName: acceptanceLink.title || "",
           sourceUrl: ref.detailUrl || "",
-          statement: `验收页读取失败：${context.detailError || context.pageError || "鏈煡閿欒"}`,
+          statement: `验收页读取失败：${context.detailError || context.pageError || "未知错误"}`,
           errorText: context.detailError || context.pageError || "",
           notes: ["只展示验收附件与相关线索，不自动判断是否对应本次付款"]
         })
@@ -2972,7 +3012,7 @@ function acceptanceTitleMatch(target, titles) {
   return matched ? `已发现验收标题与当前付款单相符：${matched}` : "验收标题暂未明显匹配当前付款单";
 }
 
-async function analyzeAttachmentList(attachments, target, sourceLabelPrefix, onProgress, progressPhase) {
+async function analyzeAttachmentList(attachments, target, sourceLabelPrefix, onProgress, progressPhase, options = {}) {
   const normalizedAttachments = normalizeAttachmentCandidates(attachments || []);
   const items = normalizedAttachments
     .filter((item) => supportsAttachmentTextExtraction(item?.name, item?.url))
@@ -3118,14 +3158,13 @@ async function analyzeAttachmentList(attachments, target, sourceLabelPrefix, onP
       });
     }
 
-    if (
-      matches.amount &&
-      matches.company &&
-      matches.account &&
-      contractFacts.sourceName &&
-      rolePriority(matchMeta.amount?.role) >= rolePriority("invoice") &&
-      rolePriority(matchMeta.company?.role) >= rolePriority("invoice")
-    ) {
+    const hasAmountEvidence = matches.amount || options?.knownMatches?.amount;
+    const hasCompanyEvidence = matches.company || options?.knownMatches?.company;
+    const hasAccountEvidence = matches.account || options?.knownMatches?.account;
+    const amountRoleIsStrong = matches.amount ? rolePriority(matchMeta.amount?.role) >= rolePriority("invoice") : !!options?.knownMatches?.amount;
+    const companyRoleIsStrong = matches.company ? rolePriority(matchMeta.company?.role) >= rolePriority("invoice") : !!options?.knownMatches?.company;
+
+    if (hasAmountEvidence && hasCompanyEvidence && hasAccountEvidence && contractFacts.sourceName && amountRoleIsStrong && companyRoleIsStrong) {
       break;
     }
   }
@@ -3409,9 +3448,13 @@ function buildAmountVerification(target, inventories, matched, invoiceTypeCheck)
 
   if (matched) {
     const invoiceTypePass = invoiceTypeCheck?.status === "pass";
-    const statement = invoiceTypePass
-      ? `已在${matched.sourceName}中找到相同金额，且票面为增值税专用发票、页面显示为增值税发票`
-      : `已在${matched.sourceName}中找到相同金额，但请确认发票类型`;
+    const statement = matched.multiInvoiceAggregate
+      ? invoiceTypePass
+        ? `已按${matched.sourceName}核对到相同金额，且每张发票均为增值税专用发票、页面显示为增值税发票`
+        : `已按${matched.sourceName}核对到相同金额，但请确认每张发票票种`
+      : invoiceTypePass
+        ? `已在${matched.sourceName}中找到相同金额，且票面为增值税专用发票、页面显示为增值税发票`
+        : `已在${matched.sourceName}中找到相同金额，但请确认发票类型`;
     return createVerificationItem(
       "amount",
       "金额一致",
@@ -3633,6 +3676,5 @@ function pickPreferredCapAmount(localValue, llmValue) {
   if (!llmText || /unknown|not found/i.test(llmText)) return localText || llmText;
   return localText || llmText;
 }
-
 
 
