@@ -125,6 +125,37 @@
     return String(value || "").replace(/\s+/g, " ").trim();
   }
 
+  function translateTechnicalErrorMessage(value, fallback = "扩展内部错误，请刷新页面后重试") {
+    const message = cleanText(value);
+    if (!message) {
+      return fallback;
+    }
+    const mappings = [
+      [/asynchronous response|message channel closed|message port closed/i, "后台分析连接中断，请重新点击自动审核"],
+      [/receiving end does not exist|could not establish connection/i, "页面脚本尚未就绪，请刷新 OA 页面后重试"],
+      [/extension context invalidated|context invalidated/i, "扩展已重新加载，请刷新 OA 页面后重试"],
+      [/failed to fetch|networkerror|load failed/i, "网络请求失败，请确认 OA 登录状态和网络后重试"],
+      [/timeout|timed out/i, "请求超时，请稍后重试"],
+      [/tesseract.*unavailable|createworker unavailable/i, "OCR 组件初始化失败，请刷新页面后重试"],
+      [/ocr bridge not initialized/i, "OCR 识别桥接尚未初始化，请重试"],
+      [/image decode failed/i, "图片解码失败，可能是附件格式异常"],
+      [/filereader failed/i, "附件读取失败，请重试"],
+      [/cannot access contents of url|missing host permission/i, "扩展缺少当前页面访问权限，请检查插件权限"],
+      [/no tab with id|tab.*closed/i, "目标标签页已关闭，请重新打开详情页"],
+      [/invalid value for argument/i, "扩展调用参数异常，请刷新页面后重试"],
+      [/script error|could not load file/i, "页面脚本执行失败，请刷新页面后重试"]
+    ];
+    for (const [pattern, text] of mappings) {
+      if (pattern.test(message)) {
+        return text;
+      }
+    }
+    if (!/[\u4e00-\u9fff]/.test(message) && /[A-Za-z]/.test(message)) {
+      return fallback;
+    }
+    return message;
+  }
+
   function resolveEventElement(target) {
     if (target instanceof Element) {
       return target;
@@ -137,7 +168,7 @@
       chrome.runtime.sendMessage(message, (response) => {
         const runtimeError = chrome.runtime.lastError;
         if (runtimeError) {
-          reject(new Error(runtimeError.message || "扩展通信失败"));
+          reject(new Error(translateTechnicalErrorMessage(runtimeError.message, "扩展通信失败")));
           return;
         }
         resolve(response || null);
@@ -2046,10 +2077,10 @@
 
       state.analysis = evidence.createPhaseOneAnalysis(snapshot, state.buildTag);
       state.statusText = "已采集";
-      state.errorText =
-        chrome.runtime.lastError?.message ||
-        response?.error ||
-        "后台分析失败，当前仅展示页面采集结果。";
+      state.errorText = translateTechnicalErrorMessage(
+        chrome.runtime.lastError?.message || response?.error,
+        "后台分析失败，当前仅展示页面采集结果。"
+      );
       rememberProgress({ text: "分析失败", detail: state.errorText });
       state.progressCollapsed = true;
       root.dataset.analysisJson = JSON.stringify(state.analysis);

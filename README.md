@@ -52,6 +52,8 @@
 - background 会把分析结果按 `processCode + buildTag + 当天日期` 写入本地缓存；详情页进入后只被动读取缓存，不自动开跑审核。
 - 详情页底部 OA 原生按钮区右侧会挂载页面内 `自动审核` 入口；找不到原生按钮区时会显示小型固定兜底入口。
 - 点击详情页 `自动审核` 后会先展开审核面板并读取缓存；命中缓存则直接展示，未命中才开始当前付款单审核。
+- 列表页长耗时自动审核按 `requestId` 合并后台响应，并对 Chrome message channel closed 类瞬时中断做有限重试。
+- 列表页和详情页会把 Chrome/浏览器/OCR 底层英文错误统一转成中文失败说明，避免用户直接看到内置英文提示。
 - OCR 已切到宿主页 `ISOLATED` world 的 bridge 复用模式，避免 MV3 service worker 里直接长期承载 OCR worker。
 - 旧的 in-tab PDF OCR 与直接图片 OCR 路径已移除，PDF/图片识别统一保留 `extractPdfTextViaBridge` / `extractImageTextSafeViaBridge` 主链路。
 - 活动代码中的合同兜底关键词、金额上限识别和 PDF/OCR/扩展通信错误消息已按 UTF-8 中文修正，并由 OCR guard 覆盖。

@@ -62,6 +62,10 @@ export function normalizeAccount(value) {
   return cleanText(normalizeOcrAccountText(value)).replace(/[^\d]/g, "");
 }
 
+function compactOcrKeywordText(value) {
+  return cleanText(value || "").replace(/\s+/g, "");
+}
+
 export function parseAmount(value) {
   const normalized = normalizeOcrNumberishText(value)
     .replaceAll(",", "")
@@ -405,11 +409,13 @@ export function normalizeInvoiceSubtypeLabel(value) {
   if (!text) {
     return "";
   }
+  const compactText = compactOcrKeywordText(text);
 
   const matched = [];
   if (
     /(?:电子发票\s*[（(]?\s*)?增值税专用发票/.test(text) ||
     /增值税\s*专用\s*发票/.test(text) ||
+    /(?:电子发票[（(]?)?增值税专用发票/.test(compactText) ||
     /专票/.test(text)
   ) {
     matched.push("增值税专用发票");
@@ -417,6 +423,7 @@ export function normalizeInvoiceSubtypeLabel(value) {
   if (
     /(?:电子发票\s*[（(]?\s*)?(?:增值税)?普通发票/.test(text) ||
     /增值税\s*普通\s*发票/.test(text) ||
+    /(?:电子发票[（(]?)?(?:增值税)?普通发票/.test(compactText) ||
     /普票/.test(text)
   ) {
     matched.push("增值税普通发票");
@@ -431,15 +438,16 @@ export function normalizePageInvoiceLabel(value) {
   if (!text) {
     return "";
   }
+  const compactText = compactOcrKeywordText(text);
 
   const matched = [];
-  if (/暂未取得发票|未取得发票/.test(text)) {
+  if (/暂未取得发票|未取得发票/.test(text) || /暂未取得发票|未取得发票/.test(compactText)) {
     matched.push("暂未取得发票");
   }
-  if (/其他票据|收据|非税票据|\binvoice\b/i.test(text)) {
+  if (/其他票据|收据|非税票据|\binvoice\b/i.test(text) || /其他票据|收据|非税票据/.test(compactText)) {
     matched.push("其他票据");
   }
-  if (/增值税发票/.test(text)) {
+  if (/增值税发票/.test(text) || /增值税发票/.test(compactText)) {
     matched.push("增值税发票");
   }
 
@@ -748,6 +756,7 @@ export function detectInvoiceRole(item, text = "") {
   const nameText = cleanText(`${item?.name || ""} ${item?.url || ""}`);
   const bodyText = cleanText(text);
   const combined = `${nameText}\n${bodyText}`;
+  const compactCombined = compactOcrKeywordText(combined);
   let score = 0;
   const reasons = [];
 
@@ -762,7 +771,7 @@ export function detectInvoiceRole(item, text = "") {
     ["统一社会信用代码", "发票号码"]
   ];
   for (const group of strongGroups) {
-    if (group.every((keyword) => combined.includes(keyword))) {
+    if (group.every((keyword) => combined.includes(keyword) || compactCombined.includes(keyword))) {
       score += 100;
       reasons.push(group.join(" + "));
     }
@@ -788,7 +797,7 @@ export function detectInvoiceRole(item, text = "") {
     "电子发票服务平台"
   ];
   for (const keyword of mediumKeywords) {
-    if (combined.includes(keyword)) {
+    if (combined.includes(keyword) || compactCombined.includes(keyword)) {
       score += 15;
       reasons.push(keyword);
     }
@@ -817,12 +826,12 @@ export function detectInvoiceRole(item, text = "") {
     "身份证"
   ];
   for (const keyword of negativeKeywords) {
-    if (combined.includes(keyword)) {
+    if (combined.includes(keyword) || compactCombined.includes(keyword)) {
       score -= 30;
     }
   }
 
-  if (combined.includes("¥") && combined.includes("税额") && combined.includes("销售方")) {
+  if (combined.includes("¥") && compactCombined.includes("税额") && compactCombined.includes("销售方")) {
     score += 45;
     reasons.push("金额符号 + 税额 + 销售方");
   }
@@ -909,7 +918,38 @@ export function extractPaymentTerms(text) {
 }
 
 export function normalizeError(error) {
-  return cleanText(error?.message || error?.stack || String(error || "未知错误"));
+  return translateTechnicalErrorMessage(error?.message || error?.stack || String(error || "未知错误"));
+}
+
+function translateTechnicalErrorMessage(value, fallback = "扩展内部错误，请刷新页面后重试") {
+  const message = cleanText(value);
+  if (!message) {
+    return fallback;
+  }
+  const mappings = [
+    [/asynchronous response|message channel closed|message port closed/i, "后台分析连接中断，请重新点击自动审核"],
+    [/receiving end does not exist|could not establish connection/i, "页面脚本尚未就绪，请刷新 OA 页面后重试"],
+    [/extension context invalidated|context invalidated/i, "扩展已重新加载，请刷新 OA 页面后重试"],
+    [/failed to fetch|networkerror|load failed/i, "网络请求失败，请确认 OA 登录状态和网络后重试"],
+    [/timeout|timed out/i, "请求超时，请稍后重试"],
+    [/tesseract.*unavailable|createworker unavailable/i, "OCR 组件初始化失败，请刷新页面后重试"],
+    [/ocr bridge not initialized/i, "OCR 识别桥接尚未初始化，请重试"],
+    [/image decode failed/i, "图片解码失败，可能是附件格式异常"],
+    [/filereader failed/i, "附件读取失败，请重试"],
+    [/cannot access contents of url|missing host permission/i, "扩展缺少当前页面访问权限，请检查插件权限"],
+    [/no tab with id|tab.*closed/i, "目标标签页已关闭，请重新打开详情页"],
+    [/invalid value for argument/i, "扩展调用参数异常，请刷新页面后重试"],
+    [/script error|could not load file/i, "页面脚本执行失败，请刷新页面后重试"]
+  ];
+  for (const [pattern, text] of mappings) {
+    if (pattern.test(message)) {
+      return text;
+    }
+  }
+  if (!/[\u4e00-\u9fff]/.test(message) && /[A-Za-z]/.test(message)) {
+    return fallback;
+  }
+  return message;
 }
 
 function extractAmountTokens(text) {

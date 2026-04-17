@@ -17,7 +17,7 @@ const ATTACHMENT_URL_RE =
 const GENERIC_URL_RE = /https?:\/\/[^\s"'<>]+/gi;
 const ANCHOR_TAG_RE = /<a[^>]+href=["'](?<url>https?:\/\/[^"']+)["'][^>]*>(?<label>.*?)<\/a>/gi;
 const PROCESS_LINK_RE =
-  /(?:(?:https?:\/\/(?:oa|workflow)\.cyou-inc\.com)?\/workflow\/process\/(?:detail\/\d+(?:\?[^"'\\s<>]*)?|history\/detail\/\d+\/monitor(?:\?[^"'\\s<>]*)?|history\/detail\/\d+\/link\/\d+(?:\?[^"'\\s<>]*)?)|(?:https?:\/\/workflow\.cyou-inc\.com)?\/workflow\/request\/ViewRequest\.jsp\?[^"'\\s<>]*requestid=\d+[^"'\\s<>]*)/gi;
+  /(?:(?:https?:\/\/(?:oa|workflow)\.cyou-inc\.com)?\/workflow\/process\/(?:detail\/\d+(?:\?[^"'\s<>]*)?|history\/detail\/\d+\/monitor(?:\?[^"'\s<>]*)?|history\/detail\/\d+\/link\/\d+(?:\?[^"'\s<>]*)?)|(?:https?:\/\/workflow\.cyou-inc\.com)?\/workflow\/request\/ViewRequest\.jsp\?[^"'\s<>]*requestid=\d+[^"'\s<>]*)/gi;
 
 const INVOICE_TYPE_FIELD_RE =
   /(?:invoice.*type|invoiceType|bill.*type|tax.*invoice|fplx|fpzl|kplx|pjlx|pjzl|zslx|发票.*类|票据.*类|票种|票类|专票|普票)/i;

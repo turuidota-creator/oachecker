@@ -32,3 +32,6 @@
 - `ShadowsocksR` may re-apply Windows proxy settings in the background, so a bypass list that was correct a moment ago can be overwritten later in the same session.
 - Even after adding `.cyou-inc.com direct` to `user.rule`, explicit proxy requests to OA still returned `502` on `2026-04-11`, so browser-side bypass remains the critical fix.
 - The same failure pattern happened again on `2026-04-13`: `ProxyOverride` was empty, direct OA access returned `200`, and explicit proxy access through `127.0.0.1:1080` returned `502`.
+- The same repair was re-applied again on `2026-04-15`, and the effective fix remained restoring `ProxyOverride` to include the OA / intranet bypass list.
+- On `2026-04-16`, `http://10.1.10.30:8080/` was added explicitly to the bypass list, even though `10.*` should already cover it. The explicit entry makes future diagnostics clearer.
+- A double-click repair wrapper was added at `scripts/fix_oa_proxy_bypass.cmd` so the Windows proxy bypass list can be restored without opening PowerShell manually.

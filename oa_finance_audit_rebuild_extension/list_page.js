@@ -449,7 +449,54 @@
     return appendDetailCacheHint(url.toString(), cleanText(row?.processCode));
   }
 
-  function sendRuntimeMessage(message) {
+  function wait(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  function translateTechnicalErrorMessage(value, fallback = "扩展内部错误，请刷新页面后重试") {
+    const message = cleanText(value);
+    if (!message) {
+      return fallback;
+    }
+    const mappings = [
+      [/asynchronous response|message channel closed|message port closed/i, "后台分析连接中断，请重新点击自动审核"],
+      [/receiving end does not exist|could not establish connection/i, "页面脚本尚未就绪，请刷新 OA 页面后重试"],
+      [/extension context invalidated|context invalidated/i, "扩展已重新加载，请刷新 OA 页面后重试"],
+      [/failed to fetch|networkerror|load failed/i, "网络请求失败，请确认 OA 登录状态和网络后重试"],
+      [/timeout|timed out/i, "请求超时，请稍后重试"],
+      [/tesseract.*unavailable|createworker unavailable/i, "OCR 组件初始化失败，请刷新页面后重试"],
+      [/ocr bridge not initialized/i, "OCR 识别桥接尚未初始化，请重试"],
+      [/image decode failed/i, "图片解码失败，可能是附件格式异常"],
+      [/filereader failed/i, "附件读取失败，请重试"],
+      [/cannot access contents of url|missing host permission/i, "扩展缺少当前页面访问权限，请检查插件权限"],
+      [/no tab with id|tab.*closed/i, "目标标签页已关闭，请重新打开详情页"],
+      [/invalid value for argument/i, "扩展调用参数异常，请刷新页面后重试"],
+      [/script error|could not load file/i, "页面脚本执行失败，请刷新页面后重试"]
+    ];
+    for (const [pattern, text] of mappings) {
+      if (pattern.test(message)) {
+        return text;
+      }
+    }
+    if (!/[\u4e00-\u9fff]/.test(message) && /[A-Za-z]/.test(message)) {
+      return fallback;
+    }
+    return message;
+  }
+
+  function isClosedRuntimeMessageError(error) {
+    const message = cleanText(error?.message || error);
+    return /asynchronous response|message channel closed|receiving end does not exist/i.test(message);
+  }
+
+  function normalizeRuntimeMessageError(error) {
+    if (isClosedRuntimeMessageError(error)) {
+      return new Error("后台分析连接中断，已自动重试仍未恢复，请重新点击自动审核。");
+    }
+    return new Error(translateTechnicalErrorMessage(error?.message || error, "扩展通信失败"));
+  }
+
+  function sendRuntimeMessageOnce(message) {
     return new Promise((resolve, reject) => {
       chrome.runtime.sendMessage(message, (response) => {
         const runtimeError = chrome.runtime.lastError;
@@ -460,6 +507,26 @@
         resolve(response || null);
       });
     });
+  }
+
+  async function sendRuntimeMessage(message, options = {}) {
+    const retries = Math.max(0, Number.parseInt(options.retries || "0", 10) || 0);
+    const retryDelayMs = Math.max(0, Number.parseInt(options.retryDelayMs || "800", 10) || 0);
+    let lastError = null;
+
+    for (let attempt = 0; attempt <= retries; attempt += 1) {
+      try {
+        return await sendRuntimeMessageOnce(message);
+      } catch (error) {
+        lastError = error;
+        if (!isClosedRuntimeMessageError(error) || attempt >= retries) {
+          throw normalizeRuntimeMessageError(error);
+        }
+        await wait(retryDelayMs);
+      }
+    }
+
+    throw normalizeRuntimeMessageError(lastError);
   }
 
   async function openResolvedSourceUrl(sourceName, sourceUrl, processCode = "") {
@@ -1456,9 +1523,12 @@
           processCode: rowMeta.processCode || processCode,
           processTitle: rowMeta.processTitle || ""
         }
+      }, {
+        retries: 2,
+        retryDelayMs: 1000
       });
       if (!response?.ok) {
-        throw new Error(cleanText(response?.error) || "自动审核失败");
+        throw new Error(translateTechnicalErrorMessage(response?.error, "自动审核失败"));
       }
 
       patchRowState(processCode, {
@@ -1473,7 +1543,7 @@
     } catch (error) {
       patchRowState(processCode, {
         status: "error",
-        errorText: cleanText(error?.message || String(error) || "自动审核失败"),
+        errorText: translateTechnicalErrorMessage(error?.message || String(error), "自动审核失败"),
         requestId: "",
         progressPhase: "",
         progressText: ""

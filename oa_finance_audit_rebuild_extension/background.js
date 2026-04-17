@@ -10,9 +10,43 @@ const PROGRESS_MESSAGE_TYPE = "oa-finance-rebuild-progress";
 const CACHE_KEY_PREFIX = "oa-finance-rebuild-cache:";
 const CACHE_SCHEMA_VERSION = "detail-cache-multi-invoice-2026-04-17";
 const DETAIL_CONTENT_SCRIPT_FILES = ["shared/models.js", "shared/evidence.js", "page/collector.js", "content.js"];
+const RECENT_ANALYZE_RESPONSE_TTL_MS = 120000;
+const activeAnalyzeRequests = new Map();
+const recentAnalyzeResponses = new Map();
 
 function cleanText(value) {
   return String(value || "").trim();
+}
+
+function translateTechnicalErrorMessage(value, fallback = "扩展内部错误，请刷新页面后重试") {
+  const message = cleanText(value);
+  if (!message) {
+    return fallback;
+  }
+  const mappings = [
+    [/asynchronous response|message channel closed|message port closed/i, "后台分析连接中断，请重新点击自动审核"],
+    [/receiving end does not exist|could not establish connection/i, "页面脚本尚未就绪，请刷新 OA 页面后重试"],
+    [/extension context invalidated|context invalidated/i, "扩展已重新加载，请刷新 OA 页面后重试"],
+    [/failed to fetch|networkerror|load failed/i, "网络请求失败，请确认 OA 登录状态和网络后重试"],
+    [/timeout|timed out/i, "请求超时，请稍后重试"],
+    [/tesseract.*unavailable|createworker unavailable/i, "OCR 组件初始化失败，请刷新页面后重试"],
+    [/ocr bridge not initialized/i, "OCR 识别桥接尚未初始化，请重试"],
+    [/image decode failed/i, "图片解码失败，可能是附件格式异常"],
+    [/filereader failed/i, "附件读取失败，请重试"],
+    [/cannot access contents of url|missing host permission/i, "扩展缺少当前页面访问权限，请检查插件权限"],
+    [/no tab with id|tab.*closed/i, "目标标签页已关闭，请重新打开详情页"],
+    [/invalid value for argument/i, "扩展调用参数异常，请刷新页面后重试"],
+    [/script error|could not load file/i, "页面脚本执行失败，请刷新页面后重试"]
+  ];
+  for (const [pattern, text] of mappings) {
+    if (pattern.test(message)) {
+      return text;
+    }
+  }
+  if (!/[\u4e00-\u9fff]/.test(message) && /[A-Za-z]/.test(message)) {
+    return fallback;
+  }
+  return message;
 }
 
 function normalizeProcessCode(value) {
@@ -235,12 +269,69 @@ function normalizeAnalyzeUrlProgress(payload) {
   };
 }
 
+function buildAnalyzeRequestKey(input) {
+  const requestId = cleanText(input?.requestId);
+  return requestId ? `analyze:${requestId}` : "";
+}
+
+function sendAnalyzeResponse(job, payload) {
+  const responses = Array.isArray(job?.responses) ? job.responses.splice(0) : [];
+  for (const respond of responses) {
+    try {
+      respond(payload);
+    } catch (_error) {
+      // The sender may have navigated away or Chrome may have closed the old
+      // message channel; later retry waiters for the same requestId can still
+      // receive the shared result.
+    }
+  }
+}
+
+function rememberAnalyzeResponse(requestKey, payload) {
+  if (!requestKey) {
+    return;
+  }
+  const entry = { payload, expiresAt: Date.now() + RECENT_ANALYZE_RESPONSE_TTL_MS };
+  recentAnalyzeResponses.set(requestKey, entry);
+  setTimeout(() => {
+    if (recentAnalyzeResponses.get(requestKey) === entry) {
+      recentAnalyzeResponses.delete(requestKey);
+    }
+  }, RECENT_ANALYZE_RESPONSE_TTL_MS);
+}
+
+function getRecentAnalyzeResponse(requestKey) {
+  const entry = requestKey ? recentAnalyzeResponses.get(requestKey) : null;
+  if (!entry) {
+    return null;
+  }
+  if (Date.now() > entry.expiresAt) {
+    recentAnalyzeResponses.delete(requestKey);
+    return null;
+  }
+  return entry.payload || null;
+}
+
 function handleAnalyzeRequest(input, sender, sendResponse) {
   const tabId = sender?.tab?.id ?? null;
   const requestId = cleanText(input.requestId);
   const pushProgress = (payload) =>
     sendProgressToTab(tabId, requestId ? { ...payload, requestId } : payload);
+  const requestKey = buildAnalyzeRequestKey(input);
+  const recentResponse = getRecentAnalyzeResponse(requestKey);
+  if (recentResponse) {
+    sendResponse(recentResponse);
+    return false;
+  }
+  if (requestKey && activeAnalyzeRequests.has(requestKey)) {
+    activeAnalyzeRequests.get(requestKey).responses.push(sendResponse);
+    return true;
+  }
 
+  const job = { responses: [sendResponse] };
+  if (requestKey) {
+    activeAnalyzeRequests.set(requestKey, job);
+  }
   analyzePageSnapshot(input.snapshot, tabId, (payload) => pushProgress(input.normalizeProgress ? input.normalizeProgress(payload) : payload))
     .then(async (result) => {
       await storeAnalysisCache(result, {
@@ -248,9 +339,20 @@ function handleAnalyzeRequest(input, sender, sendResponse) {
         detailUrl: input.snapshot?.pageUrl || input.snapshot?.detailUrl || "",
         paymentTarget: input.snapshot?.paymentTarget || {}
       });
-      sendResponse({ ok: true, result });
+      const payload = { ok: true, result };
+      rememberAnalyzeResponse(requestKey, payload);
+      sendAnalyzeResponse(job, payload);
     })
-    .catch((error) => sendResponse({ ok: false, error: error?.message || String(error) }));
+    .catch((error) => {
+      const payload = { ok: false, error: translateTechnicalErrorMessage(error?.message || String(error)) };
+      rememberAnalyzeResponse(requestKey, payload);
+      sendAnalyzeResponse(job, payload);
+    })
+    .finally(() => {
+      if (requestKey && activeAnalyzeRequests.get(requestKey) === job) {
+        activeAnalyzeRequests.delete(requestKey);
+      }
+    });
   return true;
 }
 
@@ -279,7 +381,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === "oa-finance-rebuild-ensure-detail-content") {
     ensureDetailContentScripts(sender?.tab?.id, sender?.frameId || 0, message.url || sender?.tab?.url || "")
       .then((injected) => sendResponse({ ok: true, injected: !!injected }))
-      .catch((error) => sendResponse({ ok: false, error: error?.message || String(error) }));
+      .catch((error) => sendResponse({ ok: false, error: translateTechnicalErrorMessage(error?.message || String(error)) }));
     return true;
   }
 
@@ -301,14 +403,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === "oa-finance-rebuild-get-cache") {
     getAnalysisCache(message.processCode || "")
       .then((entry) => sendResponse({ ok: true, entry }))
-      .catch((error) => sendResponse({ ok: false, error: error?.message || String(error) }));
+      .catch((error) => sendResponse({ ok: false, error: translateTechnicalErrorMessage(error?.message || String(error)) }));
     return true;
   }
 
   if (message?.type === "oa-finance-rebuild-get-cache-bulk") {
     getAnalysisCaches(Array.isArray(message.processCodes) ? message.processCodes : [])
       .then((entries) => sendResponse({ ok: true, entries }))
-      .catch((error) => sendResponse({ ok: false, error: error?.message || String(error) }));
+      .catch((error) => sendResponse({ ok: false, error: translateTechnicalErrorMessage(error?.message || String(error)) }));
     return true;
   }
 
@@ -320,7 +422,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       sourceUrl: message.sourceUrl || ""
     })
       .then((sourceUrl) => sendResponse({ ok: true, sourceUrl }))
-      .catch((error) => sendResponse({ ok: false, error: error?.message || String(error) }));
+      .catch((error) => sendResponse({ ok: false, error: translateTechnicalErrorMessage(error?.message || String(error)) }));
     return true;
   }
 

@@ -14,6 +14,8 @@ $requiredItems = @(
   "www.cyou-inc.com",
   "*.cyou-inc.com",
   "ai.cy.com",
+  "10.1.10.30",
+  "10.1.10.30:8080",
   "10.*",
   "localhost",
   "127.0.0.1",
@@ -22,7 +24,8 @@ $requiredItems = @(
 
 $requiredDirectRules = @(
   ".cyou-inc.com direct",
-  "ai.cy.com direct"
+  "ai.cy.com direct",
+  "10.1.10.30 direct"
 )
 
 $merged = [System.Collections.Generic.List[string]]::new()
@@ -89,8 +92,10 @@ function Update-SsrUserRule {
     return
   }
 
-  Add-Content -Path $RulePath -Value ""
-  Add-Content -Path $RulePath -Value "# OA internal direct rules"
+  if (-not ($existingLines | Where-Object { $_.Trim() -eq "# OA internal direct rules" })) {
+    Add-Content -Path $RulePath -Value ""
+    Add-Content -Path $RulePath -Value "# OA internal direct rules"
+  }
   foreach ($rule in $missingRules) {
     Add-Content -Path $RulePath -Value $rule
   }

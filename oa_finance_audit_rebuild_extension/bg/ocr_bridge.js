@@ -1,5 +1,6 @@
 export const OCR_BRIDGE_KEY = "__oaFinanceOcrBridge";
 const OCR_IDLE_MS = 60_000;
+const bridgeRefCounts = new Map();
 
 function buildOcrBridgeConfig() {
   return {
@@ -31,36 +32,38 @@ function executeInTab(tabId, func, args = []) {
   });
 }
 
-function extractRecognizedText(result) {
-  const data = result?.data || {};
-  const lines = Array.isArray(data.lines) ? data.lines : [];
-  const filteredLines = lines
-    .filter((line) => Number(line?.confidence || 0) >= 30)
-    .map((line) => String(line?.text || "").trim())
-    .filter(Boolean);
-  if (filteredLines.length > 0) {
-    return filteredLines.join("\n");
-  }
-
-  const words = Array.isArray(data.words) ? data.words : [];
-  const filteredWords = words
-    .filter((word) => Number(word?.confidence || 0) >= 40)
-    .map((word) => String(word?.text || "").trim())
-    .filter(Boolean);
-  if (filteredWords.length >= 3) {
-    return filteredWords.join(" ");
-  }
-
-  const confidence = Number(data.confidence || 0);
-  return confidence >= 25 ? String(data.text || "").trim() : "";
-}
-
 async function bootstrapOcrBridgeInPage(config, bridgeKey, idleMs) {
   const scope = globalThis;
   if (scope[bridgeKey]) {
     scope[bridgeKey].touch();
     return { ok: true, reused: true };
   }
+
+  // `executeScript` only serializes the target function body, so helpers used by
+  // the injected bridge must live inside this scope instead of the module scope.
+  const extractRecognizedText = (result) => {
+    const data = result?.data || {};
+    const lines = Array.isArray(data.lines) ? data.lines : [];
+    const filteredLines = lines
+      .filter((line) => Number(line?.confidence || 0) >= 30)
+      .map((line) => String(line?.text || "").trim())
+      .filter(Boolean);
+    if (filteredLines.length > 0) {
+      return filteredLines.join("\n");
+    }
+
+    const words = Array.isArray(data.words) ? data.words : [];
+    const filteredWords = words
+      .filter((word) => Number(word?.confidence || 0) >= 40)
+      .map((word) => String(word?.text || "").trim())
+      .filter(Boolean);
+    if (filteredWords.length >= 3) {
+      return filteredWords.join(" ");
+    }
+
+    const confidence = Number(data.confidence || 0);
+    return confidence >= 25 ? String(data.text || "").trim() : "";
+  };
 
   const loadTesseractApi = async () => {
     const moduleNs = await import(config.tesseractModuleUrl);
@@ -214,6 +217,27 @@ export async function initOcrBridge(tabId) {
   return true;
 }
 
+export async function acquireOcrBridge(tabId) {
+  if (!Number.isInteger(tabId)) {
+    return false;
+  }
+
+  const key = String(tabId);
+  bridgeRefCounts.set(key, (bridgeRefCounts.get(key) || 0) + 1);
+  try {
+    await initOcrBridge(tabId);
+    return true;
+  } catch (error) {
+    const nextCount = Math.max(0, (bridgeRefCounts.get(key) || 1) - 1);
+    if (nextCount > 0) {
+      bridgeRefCounts.set(key, nextCount);
+    } else {
+      bridgeRefCounts.delete(key);
+    }
+    throw error;
+  }
+}
+
 export async function requestOcr(tabId, { dataUrl, mode = "general" } = {}) {
   if (!Number.isInteger(tabId)) {
     throw new Error("OCR bridge requires a valid tabId");
@@ -230,6 +254,17 @@ export async function releaseOcrBridge(tabId) {
   if (!Number.isInteger(tabId)) {
     return false;
   }
+
+  const key = String(tabId);
+  if (bridgeRefCounts.has(key)) {
+    const nextCount = Math.max(0, (bridgeRefCounts.get(key) || 0) - 1);
+    if (nextCount > 0) {
+      bridgeRefCounts.set(key, nextCount);
+      return true;
+    }
+    bridgeRefCounts.delete(key);
+  }
+
   try {
     await executeInTab(tabId, releaseBridgeInPage, [OCR_BRIDGE_KEY]);
     return true;

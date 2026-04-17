@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 
 import {
   analyzeStructuredInvoiceSources,
+  detectInvoiceRole,
   inferInvoiceSubtypeFromPageContext,
   isInvoiceTypePass,
   normalizeInvoiceSubtypeLabel,
@@ -24,6 +25,8 @@ runTest("专票文本归一化", () => {
   assert.equal(normalizeInvoiceSubtypeLabel("电子发票（增值税专用发票）"), "增值税专用发票");
   assert.equal(normalizeInvoiceSubtypeLabel("增值税专用发票"), "增值税专用发票");
   assert.equal(normalizeInvoiceSubtypeLabel("专票"), "增值税专用发票");
+  assert.equal(normalizeInvoiceSubtypeLabel("电 子 发 票 （ 增 值 税 专 用 发 票 ）"), "增值税专用发票");
+  assert.equal(normalizeInvoiceSubtypeLabel("增 值 税 专 用 发 票"), "增值税专用发票");
 });
 
 runTest("普票文本归一化", () => {
@@ -44,6 +47,7 @@ runTest("发票细分类选项串不应误判为当前值", () => {
 
 runTest("页面粗分类归一化", () => {
   assert.equal(normalizePageInvoiceLabel("增值税发票"), "增值税发票");
+  assert.equal(normalizePageInvoiceLabel("增 值 税 发 票"), "增值税发票");
   assert.equal(normalizePageInvoiceLabel("其他票据（收据、非税票据、invoice等）"), "其他票据");
   assert.equal(normalizePageInvoiceLabel("暂未取得发票"), "暂未取得发票");
 });
@@ -56,6 +60,14 @@ runTest("页面粗分类选项串不应误判为当前值", () => {
   );
   assert.equal(picked.label, "增值税发票");
   assert.equal(picked.raw, "增值税发票");
+});
+
+runTest("宽字距 OCR 发票关键词仍能识别附件角色", () => {
+  const detected = detectInvoiceRole(
+    { name: "vsg_output.jpg", url: "" },
+    "发 票 号 码：2611700000401458248 开 票 日 期：2026年04月08日 税 额：250.62 销 售 方：北京测试公司"
+  );
+  assert.equal(detected.role, "invoice");
 });
 
 runTest("金额卡放绿只允许专票加页面增值税发票", () => {
