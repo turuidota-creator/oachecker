@@ -52,7 +52,7 @@ import { buildContractSummaryProviderMeta, generateContractSummary } from "./con
 import { extractMailEvidenceFromAttachment, extractReferenceTextsFromAttachment } from "./extract.js";
 import { acquireOcrBridge, releaseOcrBridge } from "./ocr_bridge.js";
 
-export const BUILD_TAG = "rebuild-phase5-multi-invoice-2026-04-17";
+export const BUILD_TAG = "rebuild-phase5-ocr-special-title-2026-04-17";
 
 const GENERIC_PROCESS_CODE_RE = /\b[A-Z]{2,10}-\d{8,}\b/i;
 const DOMESTIC_PR_CODE_RE = /\bGNPR-\d{8,}\b/i;
@@ -273,7 +273,8 @@ export async function analyzePageSnapshot(snapshot, tabId, onProgress = null) {
   const invoiceTypeCheck = buildInvoiceTypeCheck(
     matches.amount,
     pageInvoiceContext,
-    [structuredInvoiceMatches.amount, pageAttachmentAnalysis.matches.amount, contractResult.matches.amount]
+    [structuredInvoiceMatches.amount, pageAttachmentAnalysis.matches.amount, contractResult.matches.amount],
+    pageAttachmentAnalysis.referenceEntries || []
   );
 
   reportProgress(onProgress, "summary", "正在汇总核对结果", "验收入口、核对结果和合同参考信息");
@@ -466,54 +467,40 @@ function buildSourceInventories(snapshot) {
   return inventories;
 }
 
-function getStructuredInvoiceTypeLabel(item, pageInvoiceContext = {}) {
-  return firstNonEmpty(
-    normalizeInvoiceSubtypeLabel(item?.invoiceTypeRaw || ""),
-    pickFirstNormalizedValue(
-      Array.isArray(item?.invoiceTypeCandidates) ? item.invoiceTypeCandidates : [],
-      normalizeInvoiceSubtypeLabel
-    ).label,
-    normalizeInvoiceSubtypeLabel(item?.sourceText || ""),
-    pageInvoiceContext?.invoiceSubtypeLabel,
-    inferInvoiceSubtypeFromPageContext(pageInvoiceContext)
-  );
-}
-
-function selectStructuredInvoiceAttachmentsForOcr(items, target, pageInvoiceContext = {}, structuredMatches = {}) {
+export function selectStructuredInvoiceAttachmentsForOcr(items, target, pageInvoiceContext = {}, structuredMatches = {}) {
   const sources = Array.isArray(items) ? items : [];
-  const hasStructuredInvoiceType = sources.some((item) => getStructuredInvoiceTypeLabel(item, pageInvoiceContext));
-  const hasEnoughStructuredEvidence =
-    structuredMatches?.amount &&
-    (!target?.payeeCompany || structuredMatches?.company) &&
-    (!target?.payeeAccount || structuredMatches?.account) &&
-    hasStructuredInvoiceType;
-
-  if (hasEnoughStructuredEvidence) {
+  const attachedSources = sources.filter((item) => item?.attachment);
+  if (attachedSources.length === 0) {
     return [];
   }
+  const matchedAmountEvidence = structuredMatches?.amount;
+  const matchedSourceUrls = new Set(collectMatchedSourceUrls(matchedAmountEvidence));
+  const matchedInvoiceNumbers = new Set(collectMatchedInvoiceNumbers(matchedAmountEvidence));
 
-  return sources
+  // 发票类型放绿必须依赖附件 OCR，不能因为页面字段或结构化文本已经像专票就跳过 OCR。
+  const matchedAttachments = attachedSources
     .filter((item) => {
-      if (!item?.attachment) {
+      const attachmentUrl = cleanText(item?.attachment?.url || "");
+      const sourceUrl = cleanText(item?.sourceUrl || "");
+      if (matchedSourceUrls.size > 0 && (matchedSourceUrls.has(sourceUrl) || matchedSourceUrls.has(attachmentUrl))) {
+        return true;
+      }
+      if (matchedInvoiceNumbers.size === 0) {
         return false;
       }
-      const sourceText = cleanText(item?.sourceText || "");
-      if (!structuredMatches?.amount && !amountMatchesPayment(sourceText, target?.paymentAmount)) {
-        return true;
-      }
-      if (!hasStructuredInvoiceType && !getStructuredInvoiceTypeLabel(item, pageInvoiceContext)) {
-        return true;
-      }
-      if (target?.payeeCompany && !structuredMatches?.company && !companyMatchesPayment(sourceText, target.payeeCompany)) {
-        return true;
-      }
-      if (target?.payeeAccount && !structuredMatches?.account && !accountMatchesPayment(sourceText, target.payeeAccount)) {
-        return true;
-      }
-      return false;
+      return extractLongNumericTokens(
+        item?.invoiceNo,
+        item?.sourceName,
+        item?.sourceText,
+        item?.attachment?.name
+      ).some((token) => matchedInvoiceNumbers.has(token));
     })
     .map((item) => item.attachment)
     .filter(Boolean);
+
+  return (matchedAttachments.length > 0 ? matchedAttachments : attachedSources
+    .map((item) => item.attachment)
+    .filter(Boolean));
 }
 
 function normalizeAttachmentCandidates(items) {
@@ -677,34 +664,158 @@ function buildPageInvoiceContext(snapshot) {
   };
 }
 
-function buildInvoiceTypeCheck(matched, pageInvoiceContext = {}, candidates = []) {
+function extractLongNumericTokens(...values) {
+  const tokens = [];
+  const seen = new Set();
+  for (const value of values) {
+    const source = cleanText(value || "");
+    if (!source) {
+      continue;
+    }
+    for (const match of source.matchAll(/\b\d{8,20}\b/g)) {
+      const token = cleanText(match?.[0] || "");
+      if (!token || seen.has(token)) {
+        continue;
+      }
+      seen.add(token);
+      tokens.push(token);
+    }
+  }
+  return tokens;
+}
+
+function collectMatchedInvoiceNumbers(matched, candidates = []) {
+  const numbers = new Set();
+  const push = (...values) => {
+    for (const token of extractLongNumericTokens(...values)) {
+      numbers.add(token);
+    }
+  };
+
+  if (matched?.multiInvoiceAggregate && Array.isArray(matched?.invoiceAmountItems)) {
+    for (const item of matched.invoiceAmountItems) {
+      push(item?.invoiceNo, item?.invoiceTypeRaw);
+    }
+  }
+
+  push(matched?.sourceName, matched?.snippet, matched?.invoiceTypeRaw);
+
+  for (const item of Array.isArray(candidates) ? candidates : []) {
+    push(item?.invoiceNo, item?.sourceName, item?.snippet, item?.invoiceTypeRaw);
+  }
+
+  return [...numbers];
+}
+
+function collectMatchedSourceUrls(matched, candidates = []) {
+  const urls = [];
+  const seen = new Set();
+  for (const value of [
+    matched?.sourceUrl,
+    ...(Array.isArray(candidates) ? candidates.map((item) => item?.sourceUrl) : [])
+  ]) {
+    const text = cleanText(value || "");
+    if (!text || seen.has(text)) {
+      continue;
+    }
+    seen.add(text);
+    urls.push(text);
+  }
+  return urls;
+}
+
+function dedupeOcrInvoiceTypeEvidence(items) {
+  const seen = new Set();
+  const results = [];
+  for (const item of items || []) {
+    const key = `${cleanText(item?.sourceUrl || "")}|${cleanText(item?.sourceName || "")}|${cleanText(item?.raw || "")}`;
+    if (!key || seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    results.push(item);
+  }
+  return results;
+}
+
+function pickSingleOcrInvoiceTypeEvidence(entries = []) {
+  const bucket = dedupeOcrInvoiceTypeEvidence(entries);
+  if (bucket.length === 0) {
+    return null;
+  }
+  return bucket.find((item) => item.label === "增值税专用发票") || bucket[0] || null;
+}
+
+function buildOcrInvoiceTypeEvidence(matched, candidates = [], referenceEntries = []) {
+  const targetSourceUrls = collectMatchedSourceUrls(matched, candidates);
+  const targetInvoiceNumbers = collectMatchedInvoiceNumbers(matched, candidates);
+  const entries = (Array.isArray(referenceEntries) ? referenceEntries : [])
+    .filter((item) => cleanText(item?.role || "") === "invoice")
+    .map((item) => {
+      const text = cleanText(item?.text || "");
+      const label = normalizeInvoiceSubtypeLabel(text);
+      return {
+        label,
+        raw: label,
+        sourceName: cleanText(item?.sourceName || item?.attachmentName || ""),
+        sourceUrl: cleanText(item?.sourceUrl || ""),
+        invoiceNumbers: extractLongNumericTokens(item?.attachmentName, item?.sourceName, item?.text)
+      };
+    })
+    .filter((item) => item.label);
+
+  if (entries.length === 0) {
+    return null;
+  }
+
+  const sourceMatchedEntries = targetSourceUrls.length > 0
+    ? entries.filter((item) => item.sourceUrl && targetSourceUrls.includes(item.sourceUrl))
+    : [];
+  const invoiceMatchedEntries = targetInvoiceNumbers.length > 0
+    ? entries.filter((item) => item.invoiceNumbers.some((token) => targetInvoiceNumbers.includes(token)))
+    : [];
+
+  if (matched?.multiInvoiceAggregate) {
+    const relevantEntries = dedupeOcrInvoiceTypeEvidence(
+      sourceMatchedEntries.length > 0 || invoiceMatchedEntries.length > 0
+        ? [...sourceMatchedEntries, ...invoiceMatchedEntries]
+        : entries
+    );
+    if (relevantEntries.length === 0) {
+      return null;
+    }
+    if (
+      targetInvoiceNumbers.length > 0 &&
+      targetInvoiceNumbers.every((token) =>
+        relevantEntries.some((item) => item.label === "增值税专用发票" && item.invoiceNumbers.includes(token))
+      )
+    ) {
+      return {
+        label: "增值税专用发票",
+        raw: "OCR多张发票均识别为增值税专用发票",
+        sourceName: "OCR发票附件",
+        sourceUrl: "",
+        invoiceNumbers: targetInvoiceNumbers
+      };
+    }
+    return pickSingleOcrInvoiceTypeEvidence(relevantEntries);
+  }
+
+  return (
+    pickSingleOcrInvoiceTypeEvidence(sourceMatchedEntries) ||
+    pickSingleOcrInvoiceTypeEvidence(invoiceMatchedEntries) ||
+    pickSingleOcrInvoiceTypeEvidence(entries)
+  );
+}
+
+export function buildInvoiceTypeCheck(matched, pageInvoiceContext = {}, candidates = [], referenceEntries = []) {
   const isMultiInvoiceAggregate = !!matched?.multiInvoiceAggregate;
-  const invoiceEvidence = isMultiInvoiceAggregate
-    ? matched
-    : [matched, ...(Array.isArray(candidates) ? candidates : [])]
-        .filter(Boolean)
-        .find((item) =>
-          firstNonEmpty(
-            item?.invoiceTypeLabel,
-            normalizeInvoiceSubtypeLabel(item?.snippet || ""),
-            pickFirstNormalizedValue(item?.invoiceTypeCandidates || [], normalizeInvoiceSubtypeLabel).label
-          )
-        );
-  const directInvoiceTypeLabel = isMultiInvoiceAggregate
-    ? matched?.invoiceTypeAllSpecial
-      ? "增值税专用发票"
-      : ""
-    : firstNonEmpty(
-        invoiceEvidence?.invoiceTypeLabel,
-        pickFirstNormalizedValue(invoiceEvidence?.invoiceTypeCandidates || [], normalizeInvoiceSubtypeLabel).label,
-        normalizeInvoiceSubtypeLabel(invoiceEvidence?.snippet || ""),
-        pageInvoiceContext?.invoiceSubtypeLabel,
-        normalizeInvoiceSubtypeLabel(matched?.snippet || "")
-      );
-  const inferredInvoiceTypeLabel = directInvoiceTypeLabel || isMultiInvoiceAggregate
+  const ocrInvoiceEvidence = buildOcrInvoiceTypeEvidence(matched, candidates, referenceEntries);
+  const ocrInvoiceTypeLabel = firstNonEmpty(ocrInvoiceEvidence?.label);
+  const inferredInvoiceTypeLabel = ocrInvoiceTypeLabel || isMultiInvoiceAggregate
     ? ""
     : inferInvoiceSubtypeFromPageContext(pageInvoiceContext);
-  const invoiceTypeLabel = firstNonEmpty(directInvoiceTypeLabel, inferredInvoiceTypeLabel);
+  const invoiceTypeLabel = ocrInvoiceTypeLabel;
   const pageInvoiceLabel = firstNonEmpty(pageInvoiceContext?.pageInvoiceLabel);
   const status = matched && isInvoiceTypePass(invoiceTypeLabel, pageInvoiceLabel) ? "pass" : "warn";
   const detailParts = [
@@ -718,40 +829,33 @@ function buildInvoiceTypeCheck(matched, pageInvoiceContext = {}, candidates = []
   if (pageInvoiceContext?.deductibleTaxAmount) {
     detailParts.push(`有效抵扣税额：${pageInvoiceContext.deductibleTaxAmount}`);
   }
+  if (ocrInvoiceEvidence?.sourceName) {
+    detailParts.push(`票面OCR来源：${ocrInvoiceEvidence.sourceName}`);
+  }
   if (inferredInvoiceTypeLabel) {
-    detailParts.push("票面类型来源：页面字段兜底");
+    detailParts.push(`页面字段推断：${inferredInvoiceTypeLabel}（仅作提示，不作为通过依据）`);
   }
   if (isMultiInvoiceAggregate) {
     detailParts.push(`发票张数：${matched?.invoiceCount || 0}`);
-    if (!matched?.invoiceTypeAllSpecial) {
-      detailParts.push("票种要求：每张发票均需识别为增值税专用发票");
+    if (!invoiceTypeLabel) {
+      detailParts.push("票种要求：每张参与核对的发票都需有OCR识别为增值税专用发票");
     }
   }
   if (matched?.snippet) {
     detailParts.push(`命中来源：${matched.snippet}`);
   }
-  if (invoiceEvidence?.sourceName && invoiceEvidence?.sourceName !== matched?.sourceName) {
-    detailParts.push(`票面补充来源：${invoiceEvidence.sourceName}`);
-  }
 
   return {
     invoiceTypeLabel: invoiceTypeLabel || "未识别",
-    invoiceTypeRaw: isMultiInvoiceAggregate
-      ? firstNonEmpty(matched?.invoiceTypeRaw)
-      : firstNonEmpty(
-          invoiceEvidence?.invoiceTypeRaw,
-          ...(Array.isArray(invoiceEvidence?.invoiceTypeCandidates) ? invoiceEvidence.invoiceTypeCandidates : []),
-          matched?.invoiceTypeRaw,
-          ...(Array.isArray(matched?.invoiceTypeCandidates) ? matched.invoiceTypeCandidates : []),
-          pageInvoiceContext?.invoiceSubtypeRaw
-        ),
+    invoiceTypeRaw: firstNonEmpty(ocrInvoiceEvidence?.raw),
     pageInvoiceLabel: pageInvoiceLabel || "未识别",
     pageInvoiceRaw: pageInvoiceContext?.pageInvoiceRaw || "",
     linkedInvoiceCorrectness: pageInvoiceContext?.linkedInvoiceCorrectness || "",
     deductibleTaxAmount: pageInvoiceContext?.deductibleTaxAmount || "",
+    inferredInvoiceTypeLabel,
     status,
-    sourceName: matched?.sourceName || "",
-    sourceUrl: matched?.sourceUrl || "",
+    sourceName: firstNonEmpty(ocrInvoiceEvidence?.sourceName, matched?.sourceName),
+    sourceUrl: firstNonEmpty(ocrInvoiceEvidence?.sourceUrl, matched?.sourceUrl),
     snippet: detailParts.join("；")
   };
 }
@@ -3411,13 +3515,21 @@ function buildAmountVerification(target, inventories, matched, invoiceTypeCheck)
 
   if (matched) {
     const invoiceTypePass = invoiceTypeCheck?.status === "pass";
+    const pageShowsVatInvoice = invoiceTypeCheck?.pageInvoiceLabel === "增值税发票";
+    const ocrInvoiceTypeLabel = firstNonEmpty(invoiceTypeCheck?.invoiceTypeLabel);
     const statement = matched.multiInvoiceAggregate
       ? invoiceTypePass
         ? `已按${matched.sourceName}核对到相同金额，且每张发票均为增值税专用发票、页面显示为增值税发票`
-        : `已按${matched.sourceName}核对到相同金额，但请确认每张发票票种`
+        : pageShowsVatInvoice
+          ? `已按${matched.sourceName}核对到相同金额，但只有页面显示为增值税发票还不够，需每张参与核对的发票都经OCR识别为增值税专用发票`
+          : `已按${matched.sourceName}核对到相同金额，但请确认每张发票票种`
       : invoiceTypePass
         ? `已在${matched.sourceName}中找到相同金额，且票面为增值税专用发票、页面显示为增值税发票`
-        : `已在${matched.sourceName}中找到相同金额，但请确认发票类型`;
+        : pageShowsVatInvoice
+          ? ocrInvoiceTypeLabel && ocrInvoiceTypeLabel !== "未识别"
+            ? `已在${matched.sourceName}中找到相同金额，但OCR识别票面为${ocrInvoiceTypeLabel}，未达到增值税专用发票通过条件`
+            : `已在${matched.sourceName}中找到相同金额，但只有页面显示为增值税发票还不够，需OCR识别出增值税专用发票`
+          : `已在${matched.sourceName}中找到相同金额，但请确认发票类型`;
     return createVerificationItem(
       "amount",
       "金额一致",

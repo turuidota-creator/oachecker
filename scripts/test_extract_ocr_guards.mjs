@@ -22,6 +22,7 @@ assert.equal(normalizeError("请先在当前浏览器中登录 OA"), "请先在�
 const extractSource = fs.readFileSync(path.join(extensionRoot, "bg", "extract.js"), "utf8");
 const ocrBridgeSource = fs.readFileSync(path.join(extensionRoot, "bg", "ocr_bridge.js"), "utf8");
 const analyzerSource = fs.readFileSync(path.join(extensionRoot, "bg", "analyzer.js"), "utf8");
+const collectorSource = fs.readFileSync(path.join(extensionRoot, "page", "collector.js"), "utf8");
 const listPageSource = fs.readFileSync(path.join(extensionRoot, "list_page.js"), "utf8");
 
 assert.ok(extractSource.includes('let text = parts.join("\\n");'), "PDF text extraction should use real newline joins");
@@ -35,6 +36,8 @@ assert.ok(
   "PDF OCR merge should not use literal backslash-n"
 );
 assert.ok(extractSource.includes('pushCanvas("red-removed", canvas);'), "red-stamp removal variant should exist");
+assert.ok(extractSource.includes('pushCanvas("top-title-red-ink", canvas, "title");'), "title red-ink crop should exist");
+assert.ok(extractSource.includes('pushCanvas("top-title-line-red-ink", canvas, "title");'), "title line crop should exist");
 assert.ok(extractSource.includes('pushCanvas("mid-right", canvas, "numeric");'), "mid-right crop should exist");
 assert.ok(
   extractSource.includes('pushCanvas("bottom-full-threshold", canvas, "numeric");'),
@@ -52,12 +55,21 @@ assert.ok(
   ocrBridgeSource.includes('tessedit_char_whitelist: "0123456789.,-() "'),
   "numeric worker whitelist should be self-consistent"
 );
+assert.ok(
+  ocrBridgeSource.includes('tessedit_pageseg_mode: "7"'),
+  "title OCR worker should use single-line page segmentation"
+);
 assert.ok(ocrBridgeSource.includes("const extractRecognizedText = (result) => {"), "OCR confidence filter should exist");
 assert.ok(extractSource.includes('"标签页 PDF 解析失败"'), "PDF bridge failure message should be UTF-8 Chinese");
 assert.ok(extractSource.includes('"标签页 OCR 解析失败"'), "OCR bridge failure message should be UTF-8 Chinese");
 assert.ok(listPageSource.includes('"扩展通信失败"'), "extension communication fallback should be UTF-8 Chinese");
 assert.ok(analyzerSource.includes("/费用|服务|报价/"), "contract fallback keyword regex should be UTF-8 Chinese");
 assert.ok(analyzerSource.includes("/无金额上限|不设上限|上限不限|无封顶|"), "cap amount regex should be UTF-8 Chinese");
+assert.ok(collectorSource.includes("function normalizeCollectedFieldValue"), "collector should normalize option-only field values");
+assert.ok(
+  collectorSource.includes("/关联发票是否正确/.test(normalizedLabel) && /正确.*不正确/.test(compactValue)"),
+  "collector should guard against option-only linked-invoice values"
+);
 
 const mojibakeMarkers = [
   "\u93CD\u56E9",

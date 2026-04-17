@@ -66,6 +66,12 @@ function compactOcrKeywordText(value) {
   return cleanText(value || "").replace(/\s+/g, "");
 }
 
+function compactOcrHanKeywordText(value) {
+  return cleanText(normalizeOcrNumericSource(value))
+    .replace(/[A-Za-z0-9`~!@#$%^&*()_+\-=\[\]{}\\|;:'",.<>/?，。！？、（）【】《》：；“”‘’￥¥]+/g, "")
+    .replace(/\s+/g, "");
+}
+
 export function parseAmount(value) {
   const normalized = normalizeOcrNumberishText(value)
     .replaceAll(",", "")
@@ -410,13 +416,27 @@ export function normalizeInvoiceSubtypeLabel(value) {
     return "";
   }
   const compactText = compactOcrKeywordText(text);
+  const compactHanText = compactOcrHanKeywordText(text);
 
   const matched = [];
+  const looksLikeOrdinaryInvoice =
+    /普通发票/.test(text) ||
+    /普通发票/.test(compactText) ||
+    /普通发票/.test(compactHanText) ||
+    /普票/.test(text);
+  const looksLikeSpecialInvoiceFromFragments =
+    !looksLikeOrdinaryInvoice && (
+      /(?:电子发票|电.{0,10}(?:子.{0,4})?发(?:.{0,4}票)?).{0,36}(?:专.{0,8}用.{0,8}(?:发票|票)|用.{0,6}发.{0,6}票)/.test(text) ||
+      /(?:电子发票|电发票|电发).{0,24}(?:专用发票|专用票|用发票)/.test(compactText) ||
+      /(?:电子发票|电发票|电发).{0,16}(?:专用发票|专用票|用发票)/.test(compactHanText)
+    );
+
   if (
     /(?:电子发票\s*[（(]?\s*)?增值税专用发票/.test(text) ||
     /增值税\s*专用\s*发票/.test(text) ||
     /(?:电子发票[（(]?)?增值税专用发票/.test(compactText) ||
-    /专票/.test(text)
+    /专票/.test(text) ||
+    looksLikeSpecialInvoiceFromFragments
   ) {
     matched.push("增值税专用发票");
   }

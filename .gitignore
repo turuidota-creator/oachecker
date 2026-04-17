@@ -2,6 +2,7 @@
 Thumbs.db
 
 node_modules/
+dist/
 
 single_case_test_output/
 _archive/
@@ -15,6 +16,29 @@ tmp_*.png
 
 __pycache__/
 *.pyc
+*.log
+*.sqlite
+*.db
+*.db-journal
+
+**/Cookies
+**/Cookies-journal
+**/Trust Tokens
+**/Trust Tokens-journal
+**/Vpn Tokens
+**/Vpn Tokens-journal
+**/Sessions/
+**/Network/
+**/Local Storage/
+**/Session Storage/
+**/Code Cache/
+**/GPUCache/
+
+*_token/
+*_token2/
+*secret*
+*password*
+*credential*
 
 .idea/
 .vscode/

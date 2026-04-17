@@ -1,0 +1,24 @@
+OA 付款审核插件 Git 更新日志
+
+共享盘路径：\\10.1.0.230\财务部\总账组\OA审批插件
+插件版本：0.1.1
+当前分支：4月10日BETA2
+当前提交：4eb98e3
+更新时间：2026-04-17 15:40:52
+
+说明：
+1. 这个文件只用于查看当前共享盘插件对应的 Git 更新记录。
+2. 浏览器加载扩展时请选择“OA审批插件”这个文件夹本身，不需要打开本文件。
+3. 本文件随插件发布同步更新；如果重新同步共享盘，请从本地扩展根目录同步，避免手工放置的文件被覆盖。
+
+最近提交：
+4eb98e3 | 2026-04-17 15:40 | 修复 OCR 发票识别并更新发布包
+faa4ba8 | 2026-04-17 13:43 | fix: 清理乱码文案和旧 OCR 路径
+d0a6741 | 2026-04-17 11:30 | fix: 修复多发票合计误判
+4234abc | 2026-04-16 17:37 | docs: refresh audit workflow notes
+136c129 | 2026-04-16 17:31 | fix: stabilize detail audit entry and cache replay
+825f11b | 2026-04-14 23:27 | feat: add OCR bridge and polish release UI
+9bc4588 | 2026-04-14 10:43 | Remove AI summary path and keep local summary interface
+fc32913 | 2026-04-14 10:09 | 4月14日阶段版本
+52fe15a | 2026-04-10 18:42 | 4月10日BETA1版本
+8270c25 | 2026-04-10 11:32 | Initial master baseline

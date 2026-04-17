@@ -220,7 +220,7 @@
       }
       for (let index = 0; index + 1 < cells.length; index += 2) {
         const label = cells[index]?.labelText || "";
-        const value = cells[index + 1]?.valueText || cells[index + 1]?.labelText || "";
+        const value = normalizeCollectedFieldValue(label, cells[index + 1]?.valueText || cells[index + 1]?.labelText || "");
         if (label && value && label !== value) {
           pairs.push({ label, value });
         }
@@ -246,7 +246,7 @@
         const valueNode =
           node.querySelector(".value, .el-form-item__content, .ant-form-item-control-input, .content") || node;
         const label = cleanText(labelNode?.textContent);
-        const value = extractFieldDisplayValue(valueNode);
+        const value = normalizeCollectedFieldValue(label, extractFieldDisplayValue(valueNode));
         if (!label || !value || label === value) {
           continue;
         }
@@ -330,7 +330,7 @@
           continue;
         }
 
-        const value = values.join(" / ");
+        const value = normalizeCollectedFieldValue(label, values.join(" / "));
         if (!value || label === value) {
           continue;
         }
@@ -359,7 +359,7 @@
             }
             const values = extractControlValues(column);
             const fallbackText = extractFieldDisplayValue(column);
-            const value = values.length > 0 ? values.join(" / ") : fallbackText;
+            const value = normalizeCollectedFieldValue(label, values.length > 0 ? values.join(" / ") : fallbackText);
             if (!value || value === label) {
               return null;
             }
@@ -415,9 +415,13 @@
     return { pairs: pruneLowQualityFieldPairs(pairs), subformRows };
   }
 
+  function compactChoiceFieldValue(value) {
+    return cleanText(value || "").replace(/[\s/|,，、；;]+/g, "");
+  }
+
   function isOptionOnlyFieldValue(label, value) {
     const normalizedLabel = cleanText(label || "");
-    const compactValue = cleanText(value || "").replace(/\s+/g, "");
+    const compactValue = compactChoiceFieldValue(value);
     if (!normalizedLabel || !compactValue) {
       return false;
     }
@@ -451,6 +455,14 @@
     }
 
     return false;
+  }
+
+  function normalizeCollectedFieldValue(label, value) {
+    const text = cleanText(value || "");
+    if (!text) {
+      return "";
+    }
+    return isOptionOnlyFieldValue(label, text) ? "" : text;
   }
 
   function pruneLowQualityFieldPairs(pairs) {

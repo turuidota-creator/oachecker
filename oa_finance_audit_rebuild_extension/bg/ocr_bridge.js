@@ -79,8 +79,8 @@ async function bootstrapOcrBridgeInPage(config, bridgeKey, idleMs) {
     return createWorker;
   };
 
-  const workerByMode = { general: null, numeric: null };
-  const queueByMode = { general: Promise.resolve(), numeric: Promise.resolve() };
+  const workerByMode = { general: null, numeric: null, title: null };
+  const queueByMode = { general: Promise.resolve(), numeric: Promise.resolve(), title: Promise.resolve() };
 
   const bridge = {
     activeCount: 0,
@@ -130,6 +130,20 @@ async function bootstrapOcrBridgeInPage(config, bridgeKey, idleMs) {
         return numericWorker;
       }
 
+      if (mode === "title") {
+        const titleWorker = await createWorker("chi_sim+eng", 1, {
+          workerPath: config.workerUrl,
+          corePath: config.coreUrl,
+          langPath: config.langPath
+        });
+        await titleWorker.setParameters({
+          preserve_interword_spaces: "0",
+          tessedit_pageseg_mode: "7"
+        });
+        workerByMode.title = titleWorker;
+        return titleWorker;
+      }
+
       const generalWorker = await createWorker("chi_sim+eng", 1, {
         workerPath: config.workerUrl,
         corePath: config.coreUrl,
@@ -140,7 +154,11 @@ async function bootstrapOcrBridgeInPage(config, bridgeKey, idleMs) {
       return generalWorker;
     },
     async recognize(dataUrl, mode = "general") {
-      const normalizedMode = mode === "numeric" ? "numeric" : "general";
+      const normalizedMode = mode === "numeric"
+        ? "numeric"
+        : mode === "title"
+          ? "title"
+          : "general";
       const task = async () => {
         bridge.activeCount += 1;
         bridge.touch();
@@ -169,7 +187,7 @@ async function bootstrapOcrBridgeInPage(config, bridgeKey, idleMs) {
         clearTimeout(bridge.idleTimer);
         bridge.idleTimer = null;
       }
-      for (const mode of ["general", "numeric"]) {
+      for (const mode of ["general", "numeric", "title"]) {
         const worker = workerByMode[mode];
         workerByMode[mode] = null;
         if (!worker) {

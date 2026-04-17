@@ -487,6 +487,19 @@ async function extractImageTextSafeViaBridge(data, name = "image") {
               pixels[index + 2] = threshold;
             }
           };
+          const emphasizeRedInk = (pixels, thresholdValue = 218) => {
+            for (let index = 0; index < pixels.length; index += 4) {
+              const red = pixels[index];
+              const green = pixels[index + 1];
+              const blue = pixels[index + 2];
+              const gray = toGray(red, green, blue);
+              const isRedInk = red > 105 && red > green * 1.12 && red > blue * 1.12;
+              const nextValue = isRedInk ? 0 : (gray > thresholdValue ? 255 : 0);
+              pixels[index] = nextValue;
+              pixels[index + 1] = nextValue;
+              pixels[index + 2] = nextValue;
+            }
+          };
 
           {
             const { canvas } = makeCanvas();
@@ -530,6 +543,30 @@ async function extractImageTextSafeViaBridge(data, name = "image") {
             whitenRedPixels(imageData.data, true);
             context.putImageData(imageData, 0, 0);
             pushCanvas("top-title-red-removed", canvas);
+          }
+
+          {
+            const { canvas, context } = makeCropCanvas(0.18, 0.0, 0.64, 0.22);
+            const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
+            emphasizeRedInk(imageData.data, 220);
+            context.putImageData(imageData, 0, 0);
+            pushCanvas("top-title-red-ink", canvas, "title");
+          }
+
+          {
+            const { canvas, context } = makeCropCanvas(0.23, 0.0, 0.48, 0.15);
+            const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
+            emphasizeRedInk(imageData.data, 224);
+            context.putImageData(imageData, 0, 0);
+            pushCanvas("top-title-band-red-ink", canvas, "title");
+          }
+
+          {
+            const { canvas, context } = makeCropCanvas(0.20, 0.02, 0.56, 0.12);
+            const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
+            emphasizeRedInk(imageData.data, 228);
+            context.putImageData(imageData, 0, 0);
+            pushCanvas("top-title-line-red-ink", canvas, "title");
           }
 
           {
