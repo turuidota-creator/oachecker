@@ -454,7 +454,7 @@
       chrome.runtime.sendMessage(message, (response) => {
         const runtimeError = chrome.runtime.lastError;
         if (runtimeError) {
-          reject(new Error(runtimeError.message || "鎵╁睍閫氫俊澶辫触"));
+          reject(new Error(runtimeError.message || "扩展通信失败"));
           return;
         }
         resolve(response || null);
@@ -972,7 +972,11 @@
     if (/\?{3,}/.test(text)) {
       return true;
     }
-    return /[�]|[鍀-鿿]/.test(text);
+    if (/[\uFFFD]/.test(text)) {
+      return true;
+    }
+    const markers = text.match(/[\u93C0\u8235\uE0D9\u9359\u95AB\u8FAB\u93C8\u7459\u6FB6\u7490\u95B2\u93B5\u9365\u6960\u8930\u58A0\u6D60\u6E6D\u93BB\u7DF5]/g) || [];
+    return markers.length >= 2;
   }
 
   function prettifySourceName(sourceName, sourceUrl) {
@@ -1673,58 +1677,6 @@
     state.cleanupFns.push(() => window.removeEventListener("hashchange", handleUrlMaybeChanged));
     state.cleanupFns.push(cleanupDetailAutoReviewEntry);
   }
-
-  /* const VERIFICATION_LABEL_MAP = {
-    amount: "閲戦涓€鑷?,
-    company: "鏀舵鍏徃鍚嶇О涓€鑷?,
-    account: "鏀舵璐﹀彿涓€鑷?
-  };
-  const VERIFICATION_STATEMENT_MAP = {
-    amount: {
-      pass: (value) => value ? `宸插懡涓竴鑷撮噾棰濓細${value}` : "宸插懡涓竴鑷撮噾棰?,
-      fail: () => "宸插彂鐜颁笉涓€鑷撮噾棰濓紝璇蜂汉宸ュ鏍?,
-      fallback: () => "鏆傛湭鎷垮埌鍙‘璁ょ殑涓€鑷撮噾棰濊瘉鎹?
-    },
-    company: {
-      pass: (value) => value ? `宸插懡涓竴鑷存敹娆惧叕鍙革細${value}` : "宸插懡涓竴鑷存敹娆惧叕鍙?,
-      fail: () => "宸插彂鐜颁笉涓€鑷存敹娆惧叕鍙革紝璇蜂汉宸ュ鏍?,
-      fallback: () => "鏆傛湭鎷垮埌鍙‘璁ょ殑涓€鑷存敹娆惧叕鍙歌瘉鎹?
-    },
-    account: {
-      pass: (value) => value ? `宸插懡涓竴鑷存敹娆捐处鍙凤細${value}` : "宸插懡涓竴鑷存敹娆捐处鍙?,
-      fail: () => "宸插彂鐜颁笉涓€鑷存敹娆捐处鍙凤紝璇蜂汉宸ュ鏍?,
-      fallback: () => "鏆傛湭鎷垮埌鍙‘璁ょ殑涓€鑷存敹娆捐处鍙疯瘉鎹?
-    }
-  };
-  const INDEX_FALLBACK_KEY = ["amount", "company", "account"];
-
-  function formatVerificationLabelMapped(item, index) {
-    const key = cleanText(item?.key);
-    return (
-      VERIFICATION_LABEL_MAP[key] ||
-      VERIFICATION_LABEL_MAP[INDEX_FALLBACK_KEY[index]] ||
-      cleanText(item?.label) ||
-      "鏍稿椤?"
-    );
-  }
-
-  function formatVerificationStatementMapped(item, label) {
-    const matchedValue = cleanText(item?.matchedValue);
-    const status = cleanText(item?.status);
-    const key = cleanText(item?.key) || INDEX_FALLBACK_KEY[Object.values(VERIFICATION_LABEL_MAP).indexOf(label)] || "";
-    const templates = VERIFICATION_STATEMENT_MAP[key];
-    if (templates) {
-      if (status === "pass") return templates.pass(matchedValue);
-      if (status === "fail") return templates.fail();
-    }
-    const statement = cleanText(item?.statement);
-    if (statement && !isLikelyBrokenText(statement)) {
-      return statement;
-    }
-    return templates?.fallback() || "鏆傛湭鐢熸垚璇存槑";
-  }
-
-  */
 
   const VERIFICATION_LABEL_MAP_SAFE = {
     amount: "金额一致",

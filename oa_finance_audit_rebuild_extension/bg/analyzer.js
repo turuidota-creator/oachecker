@@ -1509,43 +1509,6 @@ function mapDomesticPrQuarterToken(value) {
   }
 }
 
-/* function buildPrPaymentMissingDocs(flowType, invoiceStatusSignal) {
-  if (flowType !== "pr_payment") {
-    return {
-      missingDomesticPrDoc: null,
-      missingPurchaseOrderDoc: null,
-      missingAcceptanceDoc: null
-    };
-  }
-
-  const relationHints = invoiceStatusSignal ? [`鍙戠エ璇存槑锛?{invoiceStatusSignal}`] : [];
-  return {
-    missingDomesticPrDoc: createMissingSourceDocument({
-      kind: "domestic_pr",
-      title: "鍥藉唴PR",
-      statement: "褰撳墠浠樻鍗曟湭鎻愪緵鍙洿鎺ユ墦寮€鐨勫浗鍐匬R鍏ュ彛锛屼笖椤靛唴涔熸湭鎻愬彇鍒癙R瀛愯〃",
-      relationHints,
-      notes: ["浠呭睍绀猴紝涓嶈嚜鍔ㄥ垽鏂?, "鏈塒R浠樻浼樺厛璇诲彇鐪熷疄PR璇︽儏锛屽叾娆″洖閫€椤靛唴PR瀛愯〃"]
-    }),
-    missingPurchaseOrderDoc: createMissingSourceDocument({
-      kind: "purchase_order",
-      title: "閲囪喘璁㈠崟",
-      statement: "褰撳墠浠樻鍗曟湭鎻愪緵閲囪喘璁㈠崟鍏ュ彛锛屾湁PR浠樻閫氬父浠ラ〉鍐匬R鎴栭檮浠朵綔涓轰富瑕佹潵婧?",
-      relationHints,
-      notes: ["浠呭睍绀猴紝涓嶈嚜鍔ㄥ垽鏂?]
-    }),
-    missingAcceptanceDoc: createMissingSourceDocument({
-      kind: "acceptance",
-      title: "楠屾敹鍗?",
-      statement: "褰撳墠浠樻鍗曟湭鎻愪緵楠屾敹鍏ュ彛锛岃缁撳悎浠樻椤甸檮浠舵垨鍏宠仈娴佺▼浜哄伐鍒ゆ柇",
-      relationHints,
-      notes: ["浠呭睍绀猴紝涓嶈嚜鍔ㄥ垽鏂?]
-    })
-  };
-}
-
-*/
-
 function buildPrPaymentMissingDocs(flowType, invoiceStatusSignal) {
   if (flowType !== "pr_payment") {
     return {
@@ -3341,12 +3304,12 @@ function deriveFallbackContractTerms(referenceEntries, target) {
     referenceEntries,
     (sentence) =>
       /monthly|rent|fee/i.test(sentence) &&
-      (/璐圭敤|鏈嶅姟|鎶ヤ环/.test(sentence) || amountMatchesPayment(sentence, target?.paymentAmount))
+      (/费用|服务|报价/.test(sentence) || amountMatchesPayment(sentence, target?.paymentAmount))
   );
   const amountSentence =
     findContractReferenceSentence(
       referenceEntries,
-      (sentence) => amountMatchesPayment(sentence, target?.paymentAmount) && /璐圭敤|鏈堢|鏈堣垂|鎶ヤ环|鍚◣|鏈嶅姟/.test(sentence)
+      (sentence) => amountMatchesPayment(sentence, target?.paymentAmount) && /费用|月租|月费|报价|含税|服务/.test(sentence)
     );
   const termSentence = findContractReferenceSentence(
     referenceEntries,
@@ -3667,7 +3630,7 @@ function pickPreferredTaxRate(localValue, llmValue) {
 function pickPreferredCapAmount(localValue, llmValue) {
   const localText = cleanText(localValue || "");
   const llmText = cleanText(llmValue || "");
-  const capPattern = /鏃犻噾棰濅笂闄恷涓嶈涓婇檺|涓婇檺涓嶉檺|鏃犲皝椤秥(?:(涓婇檺|灏侀《|鏈€楂榺涓嶈秴杩噟绱|鎬婚).{0,24}(楼|锟浜烘皯甯亅\d[\d,]*(?:\.\d+)?\s*(?:鍏億涓囧厓|浜垮厓)))/;
+  const capPattern = /无金额上限|不设上限|上限不限|无封顶|(?:(上限|封顶|最高|不超过|累计|总额).{0,24}(?:人民币|RMB|CNY|￥|¥)?\s*\d[\d,]*(?:\.\d+)?\s*(?:元|万元|亿元)?)/i;
   const localIsCap = capPattern.test(localText);
   const llmIsCap = capPattern.test(llmText);
 

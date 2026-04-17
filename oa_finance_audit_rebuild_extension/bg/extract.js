@@ -102,211 +102,6 @@ async function extractPdfText(data) {
   return extractPdfTextViaBridge(tabId, data);
 }
 
-async function extractPdfTextInTab(tabId, data) {
-  const base64 = uint8ArrayToBase64(data);
-  const moduleUrl = chrome.runtime.getURL("node_modules/pdfjs-dist/legacy/build/pdf.mjs");
-  const workerUrl = chrome.runtime.getURL("node_modules/pdfjs-dist/legacy/build/pdf.worker.mjs");
-  const cMapUrl = chrome.runtime.getURL("node_modules/pdfjs-dist/cmaps/");
-  const standardFontDataUrl = chrome.runtime.getURL("node_modules/pdfjs-dist/standard_fonts/");
-  const tesseractModuleUrl = chrome.runtime.getURL("node_modules/tesseract.js/dist/tesseract.esm.min.js");
-  const tesseractWorkerUrl = chrome.runtime.getURL("node_modules/tesseract.js/dist/worker.min.js");
-  const tesseractCoreUrl = chrome.runtime.getURL("node_modules/tesseract.js-core");
-  return new Promise((resolve, reject) => {
-    chrome.scripting.executeScript(
-      {
-        target: { tabId },
-        world: "ISOLATED",
-        func: async (
-          inputBase64,
-          pdfModuleUrl,
-          pdfWorkerUrl,
-          injectedCMapUrl,
-          injectedStandardFontDataUrl,
-          injectedTesseractModuleUrl,
-          injectedTesseractWorkerUrl,
-          injectedTesseractCoreUrl,
-          langPath
-        ) => {
-          let ocrWorker = null;
-          try {
-            const flattenItems = (items) => {
-              const parts = [];
-              for (const item of items || []) {
-                if (!item || typeof item.str !== "string") continue;
-                parts.push(item.str);
-                parts.push(item.hasEOL ? "\n" : " ");
-              }
-              return parts.join("");
-            };
-            const renderPageToDataUrl = async (page) => {
-              const viewport = page.getViewport({ scale: 2 });
-              const canvas = document.createElement("canvas");
-              canvas.width = Math.max(1, Math.floor(viewport.width));
-              canvas.height = Math.max(1, Math.floor(viewport.height));
-              const context = canvas.getContext("2d", { alpha: false });
-              await page.render({ canvasContext: context, viewport }).promise;
-              return canvas.toDataURL("image/png");
-            };
-            const extractRecognizedText = (result) => {
-              const data = result?.data || {};
-              const lines = Array.isArray(data.lines) ? data.lines : [];
-              const filteredLines = lines
-                .filter((line) => Number(line?.confidence || 0) >= 30)
-                .map((line) => String(line?.text || "").trim())
-                .filter(Boolean);
-              if (filteredLines.length > 0) {
-                return filteredLines.join("\n");
-              }
-
-              const words = Array.isArray(data.words) ? data.words : [];
-              const filteredWords = words
-                .filter((word) => Number(word?.confidence || 0) >= 40)
-                .map((word) => String(word?.text || "").trim())
-                .filter(Boolean);
-              if (filteredWords.length >= 3) {
-                return filteredWords.join(" ");
-              }
-
-              const confidence = Number(data.confidence || 0);
-              return confidence >= 25 ? String(data.text || "").trim() : "";
-            };
-            const runOcr = async (dataUrl) => {
-              if (!ocrWorker) {
-                const moduleNs = await import(injectedTesseractModuleUrl);
-                const tesseractApi = moduleNs?.createWorker
-                  ? moduleNs
-                  : moduleNs?.default?.createWorker
-                    ? moduleNs.default
-                    : moduleNs?.default || moduleNs;
-                const createWorker = tesseractApi?.createWorker;
-                if (typeof createWorker !== "function") {
-                  throw new Error("Tesseract createWorker unavailable");
-                }
-                ocrWorker = await createWorker("chi_sim+eng", 1, {
-                  workerPath: injectedTesseractWorkerUrl,
-                  corePath: injectedTesseractCoreUrl,
-                  langPath
-                });
-                await ocrWorker.setParameters({ preserve_interword_spaces: "1" });
-              }
-              const result = await ocrWorker.recognize(dataUrl);
-              return extractRecognizedText(result);
-            };
-            const hasUsefulPdfText = (value) => {
-              const raw = String(value || "");
-              const stripped = raw.replace(/\s+/g, "");
-              if (stripped.length < 80) {
-                return false;
-              }
-              const usefulChars = stripped.match(/[\u4e00-\u9fa5A-Za-z0-9¥￥]/g) || [];
-              const usefulRatio = usefulChars.length / Math.max(1, stripped.length);
-              const lineCount = raw
-                .split(/\n+/)
-                .map((line) => String(line || "").trim())
-                .filter(Boolean).length;
-              const digitCount = (stripped.match(/\d/g) || []).length;
-              const hasKeyword = /(合同|协议|发票|金额|税额|付款|验收|账号|银行|供应商|公司|invoice|amount|tax|bank|account)/i.test(raw);
-              return usefulRatio >= 0.35 && (hasKeyword || lineCount >= 3 || digitCount >= 4);
-            };
-            const buildOcrPageNumbers = (numPages) => {
-              if (!Number.isFinite(numPages) || numPages <= 0) return [];
-              if (numPages <= 8) {
-                return Array.from({ length: numPages }, (_, index) => index + 1);
-              }
-              const picks = new Set([1, 2, 3, numPages - 2, numPages - 1, numPages]);
-              return Array.from(picks)
-                .filter((pageNo) => pageNo >= 1 && pageNo <= numPages)
-                .sort((left, right) => left - right);
-            };
-            const binary = atob(inputBase64 || "");
-            const bytes = new Uint8Array(binary.length);
-            for (let index = 0; index < binary.length; index += 1) {
-              bytes[index] = binary.charCodeAt(index);
-            }
-
-            const pdfjs = await import(pdfModuleUrl);
-            if (pdfjs?.GlobalWorkerOptions) {
-              pdfjs.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
-            }
-            if (typeof pdfjs?.setVerbosityLevel === "function" && pdfjs?.VerbosityLevel) {
-              pdfjs.setVerbosityLevel(pdfjs.VerbosityLevel.ERRORS);
-            }
-            const loadingTask = pdfjs.getDocument({
-              data: bytes,
-              cMapUrl: injectedCMapUrl,
-              cMapPacked: true,
-              standardFontDataUrl: injectedStandardFontDataUrl,
-              verbosity: pdfjs?.VerbosityLevel?.ERRORS ?? 0,
-              useSystemFonts: true,
-              isEvalSupported: false
-            });
-            const pdf = await loadingTask.promise;
-            const parts = [];
-            for (let page = 1; page <= Math.min(pdf.numPages, 4); page += 1) {
-              const current = await pdf.getPage(page);
-              const content = await current.getTextContent();
-              parts.push(flattenItems(content.items || []));
-            }
-            let text = parts.join("\n");
-            if (!hasUsefulPdfText(text)) {
-              const ocrParts = [];
-              for (const page of buildOcrPageNumbers(pdf.numPages)) {
-                const current = await pdf.getPage(page);
-                const dataUrl = await renderPageToDataUrl(current);
-                const ocrText = await runOcr(dataUrl);
-                if (ocrText) ocrParts.push(ocrText);
-              }
-              if (ocrParts.length) {
-                text = [text, ...ocrParts].filter(Boolean).join("\n");
-              }
-            }
-            return { ok: true, text };
-          } catch (error) {
-            return {
-              ok: false,
-              error: error?.stack || error?.message || String(error)
-            };
-          } finally {
-            if (ocrWorker) {
-              try {
-                await ocrWorker.terminate();
-              } catch (_error) {}
-            }
-          }
-        },
-        args: [
-          base64,
-          moduleUrl,
-          workerUrl,
-          cMapUrl,
-          standardFontDataUrl,
-          tesseractModuleUrl,
-          tesseractWorkerUrl,
-          tesseractCoreUrl,
-          OCR_LANG_PATH
-        ]
-      },
-      (results) => {
-        const runtimeError = chrome.runtime.lastError;
-        if (runtimeError) {
-          reject(new Error(runtimeError.message || "标签页 PDF 解析失败"));
-          return;
-        }
-        const payload = results?.[0]?.result;
-        if (!payload?.ok) {
-          reject(new Error(payload?.error || "标签页 PDF 解析失败"));
-          return;
-        }
-        if (typeof payload.text !== "string") {
-          reject(new Error("标签页 PDF 解析没有返回文本"));
-          return;
-        }
-        resolve(payload.text);
-      }
-    );
-  });
-}
-
 async function extractPdfTextViaBridge(tabId, data) {
   await initOcrBridge(tabId);
   const base64 = uint8ArrayToBase64(data);
@@ -334,14 +129,59 @@ async function extractPdfTextViaBridge(tabId, data) {
           }
           return parts.join("");
         };
-        const renderPageToDataUrl = async (page) => {
-          const viewport = page.getViewport({ scale: 2 });
+        const renderPageToCanvas = async (page, scale = 2.4) => {
+          const viewport = page.getViewport({ scale });
           const canvas = document.createElement("canvas");
           canvas.width = Math.max(1, Math.floor(viewport.width));
           canvas.height = Math.max(1, Math.floor(viewport.height));
           const context = canvas.getContext("2d", { alpha: false });
+          context.fillStyle = "#fff";
+          context.fillRect(0, 0, canvas.width, canvas.height);
           await page.render({ canvasContext: context, viewport }).promise;
-          return canvas.toDataURL("image/png");
+          return canvas;
+        };
+        const cropCanvas = (sourceCanvas, leftRatio, topRatio, widthRatio, heightRatio, upscale = 1.6) => {
+          const cropX = Math.max(0, Math.floor(sourceCanvas.width * leftRatio));
+          const cropY = Math.max(0, Math.floor(sourceCanvas.height * topRatio));
+          const cropWidth = Math.max(1, Math.min(sourceCanvas.width - cropX, Math.floor(sourceCanvas.width * widthRatio)));
+          const cropHeight = Math.max(1, Math.min(sourceCanvas.height - cropY, Math.floor(sourceCanvas.height * heightRatio)));
+          const canvas = document.createElement("canvas");
+          canvas.width = Math.max(1, Math.floor(cropWidth * upscale));
+          canvas.height = Math.max(1, Math.floor(cropHeight * upscale));
+          const context = canvas.getContext("2d", { alpha: false, willReadFrequently: true });
+          context.fillStyle = "#fff";
+          context.fillRect(0, 0, canvas.width, canvas.height);
+          context.drawImage(sourceCanvas, cropX, cropY, cropWidth, cropHeight, 0, 0, canvas.width, canvas.height);
+          return { canvas, context };
+        };
+        const boostForAccountOcr = (context, width, height) => {
+          const imageData = context.getImageData(0, 0, width, height);
+          const pixels = imageData.data;
+          for (let index = 0; index < pixels.length; index += 4) {
+            const gray = Math.round(pixels[index] * 0.299 + pixels[index + 1] * 0.587 + pixels[index + 2] * 0.114);
+            const boosted = Math.max(0, Math.min(255, Math.round((gray - 150) * 1.9 + 150)));
+            const normalized = boosted > 218 ? 255 : boosted < 94 ? 0 : boosted;
+            pixels[index] = normalized;
+            pixels[index + 1] = normalized;
+            pixels[index + 2] = normalized;
+          }
+          context.putImageData(imageData, 0, 0);
+        };
+        const buildPdfOcrVariants = async (page) => {
+          const fullCanvas = await renderPageToCanvas(page, 2.6);
+          const variants = [{ label: "full-page", mode: "general", dataUrl: fullCanvas.toDataURL("image/png") }];
+          const accountRegions = [
+            [0.12, 0.30, 0.62, 0.22],
+            [0.14, 0.36, 0.52, 0.14],
+            [0.18, 0.39, 0.40, 0.10]
+          ];
+          accountRegions.forEach((region, index) => {
+            const { canvas, context } = cropCanvas(fullCanvas, ...region, 2);
+            variants.push({ label: `account-zone-${index + 1}`, mode: "general", dataUrl: canvas.toDataURL("image/png") });
+            boostForAccountOcr(context, canvas.width, canvas.height);
+            variants.push({ label: `account-zone-${index + 1}-numeric`, mode: "numeric", dataUrl: canvas.toDataURL("image/png") });
+          });
+          return variants;
         };
         const hasUsefulPdfText = (value) => {
           const raw = String(value || "");
@@ -349,7 +189,7 @@ async function extractPdfTextViaBridge(tabId, data) {
           if (stripped.length < 80) {
             return false;
           }
-          const usefulChars = stripped.match(/[\u4e00-\u9fa5A-Za-z0-9楼锟]/g) || [];
+          const usefulChars = stripped.match(/[\u4e00-\u9fa5A-Za-z0-9¥￥]/g) || [];
           const usefulRatio = usefulChars.length / Math.max(1, stripped.length);
           const lineCount = raw
             .split(/\n+/)
@@ -369,12 +209,12 @@ async function extractPdfTextViaBridge(tabId, data) {
             .filter((pageNo) => pageNo >= 1 && pageNo <= numPages)
             .sort((left, right) => left - right);
         };
-        const runOcr = async (dataUrl) => {
+        const runOcr = async (dataUrl, mode = "general") => {
           const bridge = globalThis?.[bridgeKey];
           if (!bridge) {
             throw new Error("OCR bridge not initialized");
           }
-          return bridge.recognize(dataUrl, "general");
+          return bridge.recognize(dataUrl, mode);
         };
         const binary = atob(inputBase64 || "");
         const bytes = new Uint8Array(binary.length);
@@ -410,10 +250,12 @@ async function extractPdfTextViaBridge(tabId, data) {
           const ocrParts = [];
           for (const page of buildOcrPageNumbers(pdf.numPages)) {
             const current = await pdf.getPage(page);
-            const dataUrl = await renderPageToDataUrl(current);
-            const ocrText = await runOcr(dataUrl);
-            if (ocrText) {
-              ocrParts.push(ocrText);
+            const variants = await buildPdfOcrVariants(current);
+            for (const variant of variants) {
+              const ocrText = await runOcr(variant.dataUrl, variant.mode);
+              if (ocrText) {
+                ocrParts.push(ocrText);
+              }
             }
           }
           if (ocrParts.length) {
@@ -429,25 +271,82 @@ async function extractPdfTextViaBridge(tabId, data) {
       }
     },
     [base64, moduleUrl, workerUrl, cMapUrl, standardFontDataUrl, OCR_BRIDGE_KEY],
-    "鏍囩椤?PDF 瑙ｆ瀽澶辫触"
+    "标签页 PDF 解析失败"
   );
   if (typeof payload.text !== "string") {
-    throw new Error("鏍囩椤?PDF 瑙ｆ瀽娌℃湁杩斿洖鏂囨湰");
+    throw new Error("标签页 PDF 解析没有返回文本");
   }
   return payload.text;
 }
 
-function extractDocxText(data) {
+export function extractDocxText(data) {
   try {
     const files = unzipSync(data);
     return Object.entries(files || {})
       .filter(([name]) => /^word\/(?:document|header\d+|footer\d+)\.xml$/i.test(name))
-      .map(([, content]) => extractXmlText(strFromU8(content)))
+      .map(([, content]) => extractVisibleWordXmlText(strFromU8(content)))
       .filter(Boolean)
       .join("\n");
   } catch (_error) {
     return "";
   }
+}
+
+function extractVisibleWordXmlText(xmlText) {
+  const source = stripHiddenWordXml(String(xmlText || "").replace(/\r/g, ""));
+  if (!source) {
+    return "";
+  }
+
+  const parts = [];
+  const tokenPattern =
+    /<(?:\w+:)?tab\b[^>]*\/>|<(?:\w+:)?(?:br|cr)\b[^>]*\/>|<\/(?:\w+:)?(?:p|tr|tbl)\b[^>]*>|<\/(?:\w+:)?tc\b[^>]*>|<(?:\w+:)?t\b[^>]*>([\s\S]*?)<\/(?:\w+:)?t>/gi;
+
+  let match;
+  while ((match = tokenPattern.exec(source))) {
+    const [token, textValue] = match;
+    if (typeof textValue === "string") {
+      parts.push(decodeXmlEntities(textValue));
+      continue;
+    }
+
+    if (/<(?:\w+:)?tab\b/i.test(token) || /<\/(?:\w+:)?tc\b/i.test(token)) {
+      parts.push("\t");
+      continue;
+    }
+
+    parts.push("\n");
+  }
+
+  return cleanText(parts.join(""));
+}
+
+function stripHiddenWordXml(xmlText) {
+  return String(xmlText || "")
+    .replace(/<(?:\w+:)?del\b[\s\S]*?<\/(?:\w+:)?del>/gi, " ")
+    .replace(/<(?:\w+:)?moveFrom\b[\s\S]*?<\/(?:\w+:)?moveFrom>/gi, " ")
+    .replace(/<(?:\w+:)?instrText\b[\s\S]*?<\/(?:\w+:)?instrText>/gi, " ")
+    .replace(/<(?:\w+:)?(?:commentRangeStart|commentRangeEnd|commentReference|annotationRef)\b[^>]*\/>/gi, " ");
+}
+
+function decodeXmlEntities(value) {
+  return String(value || "").replace(/&(#x?[0-9a-fA-F]+|amp|lt|gt|quot|apos);/g, (match, entity) => {
+    const normalized = String(entity || "").toLowerCase();
+    if (normalized === "amp") return "&";
+    if (normalized === "lt") return "<";
+    if (normalized === "gt") return ">";
+    if (normalized === "quot") return '"';
+    if (normalized === "apos") return "'";
+    if (normalized.startsWith("#x")) {
+      const codePoint = Number.parseInt(normalized.slice(2), 16);
+      return Number.isFinite(codePoint) ? String.fromCodePoint(codePoint) : match;
+    }
+    if (normalized.startsWith("#")) {
+      const codePoint = Number.parseInt(normalized.slice(1), 10);
+      return Number.isFinite(codePoint) ? String.fromCodePoint(codePoint) : match;
+    }
+    return match;
+  });
 }
 
 function extractSpreadsheetText(data) {
@@ -496,299 +395,11 @@ async function extractZipReferenceTexts(data) {
   }
 }
 
-async function extractImageTextSafe(data, name = "image") {
-  if (!data || data.byteLength < 128) return "";
-  const tabId = getCurrentPageTabId();
-  if (!Number.isInteger(tabId)) {
-    throw new Error("未找到当前标签页，无法执行图片 OCR");
-  }
-  const mimeType = /\.png(?:$|\?)/i.test(String(name || "")) ? "image/png" : "image/jpeg";
-  const base64 = uint8ArrayToBase64(data);
-  const moduleUrl = chrome.runtime.getURL("node_modules/tesseract.js/dist/tesseract.esm.min.js");
-  const workerUrl = chrome.runtime.getURL("node_modules/tesseract.js/dist/worker.min.js");
-  const coreUrl = chrome.runtime.getURL("node_modules/tesseract.js-core");
-
-  return new Promise((resolve, reject) => {
-    chrome.scripting.executeScript(
-      {
-        target: { tabId },
-        world: "ISOLATED",
-        func: async (inputBase64, inputMimeType, tesseractModuleUrl, tesseractWorkerUrl, tesseractCoreUrl, langPath) => {
-          let generalWorker = null;
-          let numericWorker = null;
-          try {
-            const loadImageFromBlob = (blob) =>
-              new Promise((resolve, reject) => {
-                const objectUrl = URL.createObjectURL(blob);
-                const image = new Image();
-                image.onload = () => {
-                  URL.revokeObjectURL(objectUrl);
-                  resolve(image);
-                };
-                image.onerror = () => {
-                  URL.revokeObjectURL(objectUrl);
-                  reject(new Error("Image decode failed"));
-                };
-                image.src = objectUrl;
-              });
-            const mergeTexts = (parts) => {
-              const unique = [];
-              for (const value of parts) {
-                const text = String(value || "").trim();
-                if (!text || unique.includes(text)) continue;
-                unique.push(text);
-              }
-              return unique.join("\n");
-            };
-            const extractRecognizedText = (result) => {
-              const data = result?.data || {};
-              const lines = Array.isArray(data.lines) ? data.lines : [];
-              const filteredLines = lines
-                .filter((line) => Number(line?.confidence || 0) >= 30)
-                .map((line) => String(line?.text || "").trim())
-                .filter(Boolean);
-              if (filteredLines.length > 0) {
-                return filteredLines.join("\n");
-              }
-
-              const words = Array.isArray(data.words) ? data.words : [];
-              const filteredWords = words
-                .filter((word) => Number(word?.confidence || 0) >= 40)
-                .map((word) => String(word?.text || "").trim())
-                .filter(Boolean);
-              if (filteredWords.length >= 3) {
-                return filteredWords.join(" ");
-              }
-
-              const confidence = Number(data.confidence || 0);
-              return confidence >= 25 ? String(data.text || "").trim() : "";
-            };
-            const createTesseractWorker = async (langs) => {
-              const moduleNs = await import(tesseractModuleUrl);
-              const tesseractApi = moduleNs?.createWorker
-                ? moduleNs
-                : moduleNs?.default?.createWorker
-                  ? moduleNs.default
-                  : moduleNs?.default || moduleNs;
-              const createWorker = tesseractApi?.createWorker;
-              if (typeof createWorker !== "function") {
-                throw new Error("Tesseract createWorker unavailable");
-              }
-              return createWorker(langs, 1, {
-                workerPath: tesseractWorkerUrl,
-                corePath: tesseractCoreUrl,
-                langPath
-              });
-            };
-            const buildVariants = async (blob) => {
-              const image = await loadImageFromBlob(blob);
-              const sourceWidth = Math.max(1, image.naturalWidth || image.width || 1);
-              const sourceHeight = Math.max(1, image.naturalHeight || image.height || 1);
-              const scale = Math.min(2.2, Math.max(1.6, 1800 / Math.max(sourceWidth, sourceHeight)));
-              const width = Math.max(1, Math.floor(sourceWidth * scale));
-              const height = Math.max(1, Math.floor(sourceHeight * scale));
-              const variants = [];
-              const makeCanvas = () => {
-                const canvas = document.createElement("canvas");
-                canvas.width = width;
-                canvas.height = height;
-                const context = canvas.getContext("2d", { willReadFrequently: true });
-                context.drawImage(image, 0, 0, width, height);
-                return { canvas, context };
-              };
-              const pushCanvas = (label, canvas, mode = "general") => {
-                variants.push({ label, mode, dataUrl: canvas.toDataURL("image/png") });
-              };
-              const makeCropCanvas = (leftRatio, topRatio, widthRatio, heightRatio) => {
-                const canvas = document.createElement("canvas");
-                const cropX = Math.max(0, Math.floor(sourceWidth * leftRatio));
-                const cropY = Math.max(0, Math.floor(sourceHeight * topRatio));
-                const cropWidth = Math.max(1, Math.floor(sourceWidth * widthRatio));
-                const cropHeight = Math.max(1, Math.floor(sourceHeight * heightRatio));
-                canvas.width = Math.max(1, Math.floor(cropWidth * Math.max(2, scale)));
-                canvas.height = Math.max(1, Math.floor(cropHeight * Math.max(2, scale)));
-                const context = canvas.getContext("2d", { willReadFrequently: true });
-                context.drawImage(image, cropX, cropY, cropWidth, cropHeight, 0, 0, canvas.width, canvas.height);
-                return { canvas, context };
-              };
-              const toGray = (red, green, blue) => Math.round(red * 0.299 + green * 0.587 + blue * 0.114);
-              const whitenRedPixels = (pixels, preserveContrast = false) => {
-                for (let index = 0; index < pixels.length; index += 4) {
-                  const red = pixels[index];
-                  const green = pixels[index + 1];
-                  const blue = pixels[index + 2];
-                  if (red > 120 && red > green * 1.35 && red > blue * 1.35) {
-                    pixels[index] = 255;
-                    pixels[index + 1] = 255;
-                    pixels[index + 2] = 255;
-                    continue;
-                  }
-                  const gray = toGray(red, green, blue);
-                  const nextValue = preserveContrast
-                    ? Math.min(255, Math.max(0, Math.round((gray - 128) * 1.45 + 128)))
-                    : gray;
-                  pixels[index] = nextValue;
-                  pixels[index + 1] = nextValue;
-                  pixels[index + 2] = nextValue;
-                }
-              };
-              const applyThreshold = (pixels, thresholdValue) => {
-                for (let index = 0; index < pixels.length; index += 4) {
-                  const gray = toGray(pixels[index], pixels[index + 1], pixels[index + 2]);
-                  const threshold = gray > thresholdValue ? 255 : 0;
-                  pixels[index] = threshold;
-                  pixels[index + 1] = threshold;
-                  pixels[index + 2] = threshold;
-                }
-              };
-
-              {
-                const { canvas } = makeCanvas();
-                pushCanvas("original", canvas);
-              }
-
-              {
-                const { canvas, context } = makeCanvas();
-                const imageData = context.getImageData(0, 0, width, height);
-                const pixels = imageData.data;
-                for (let index = 0; index < pixels.length; index += 4) {
-                  const gray = Math.round(pixels[index] * 0.299 + pixels[index + 1] * 0.587 + pixels[index + 2] * 0.114);
-                  const boosted = Math.min(255, Math.max(0, Math.round((gray - 128) * 1.55 + 128)));
-                  pixels[index] = boosted;
-                  pixels[index + 1] = boosted;
-                  pixels[index + 2] = boosted;
-                }
-                context.putImageData(imageData, 0, 0);
-                pushCanvas("grayscale-boost", canvas);
-              }
-
-              {
-                const { canvas, context } = makeCanvas();
-                const imageData = context.getImageData(0, 0, width, height);
-                whitenRedPixels(imageData.data, true);
-                context.putImageData(imageData, 0, 0);
-                pushCanvas("red-removed", canvas);
-              }
-
-              {
-                const { canvas, context } = makeCanvas();
-                const imageData = context.getImageData(0, 0, width, height);
-                applyThreshold(imageData.data, 182);
-                context.putImageData(imageData, 0, 0);
-                pushCanvas("threshold", canvas);
-              }
-
-              {
-                const { canvas, context } = makeCropCanvas(0.18, 0.0, 0.64, 0.22);
-                const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
-                whitenRedPixels(imageData.data, true);
-                context.putImageData(imageData, 0, 0);
-                pushCanvas("top-title-red-removed", canvas);
-              }
-
-              {
-                const { canvas } = makeCropCanvas(0.46, 0.55, 0.52, 0.25);
-                pushCanvas("bottom-right", canvas, "numeric");
-              }
-
-              {
-                const { canvas } = makeCropCanvas(0.30, 0.40, 0.68, 0.35);
-                pushCanvas("mid-right", canvas, "numeric");
-              }
-
-              {
-                const { canvas, context } = makeCropCanvas(0.40, 0.48, 0.58, 0.32);
-                const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
-                applyThreshold(imageData.data, 176);
-                context.putImageData(imageData, 0, 0);
-                pushCanvas("bottom-right-threshold", canvas, "numeric");
-              }
-
-              {
-                const { canvas, context } = makeCropCanvas(0.0, 0.50, 1.0, 0.30);
-                const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
-                applyThreshold(imageData.data, 178);
-                context.putImageData(imageData, 0, 0);
-                pushCanvas("bottom-full-threshold", canvas, "numeric");
-              }
-
-              return variants;
-            };
-            const binary = atob(inputBase64 || "");
-            const bytes = new Uint8Array(binary.length);
-            for (let index = 0; index < binary.length; index += 1) {
-              bytes[index] = binary.charCodeAt(index);
-            }
-
-            generalWorker = await createTesseractWorker("chi_sim+eng");
-            await generalWorker.setParameters({ preserve_interword_spaces: "1" });
-
-            numericWorker = await createTesseractWorker("eng");
-            await numericWorker.setParameters({
-              preserve_interword_spaces: "1",
-              tessedit_char_whitelist: "0123456789.,¥￥()（）小写合计",
-              tessedit_pageseg_mode: "6"
-            });
-
-            await numericWorker.setParameters({
-              preserve_interword_spaces: "1",
-              tessedit_char_whitelist: "0123456789.,-() ",
-              tessedit_pageseg_mode: "6"
-            });
-
-            const variants = await buildVariants(new Blob([bytes], { type: inputMimeType }));
-            const texts = [];
-            for (const variant of variants) {
-              const activeWorker = variant.mode === "numeric" ? numericWorker : generalWorker;
-              const result = await activeWorker.recognize(variant.dataUrl);
-              const recognizedText = extractRecognizedText(result);
-              if (recognizedText) {
-                texts.push(recognizedText);
-              }
-            }
-            return { ok: true, text: mergeTexts(texts) };
-          } catch (error) {
-            return {
-              ok: false,
-              error: error?.stack || error?.message || String(error)
-            };
-          } finally {
-            if (generalWorker) {
-              try {
-                await generalWorker.terminate();
-              } catch (_error) {}
-            }
-            if (numericWorker) {
-              try {
-                await numericWorker.terminate();
-              } catch (_error) {}
-            }
-          }
-        },
-        args: [base64, mimeType, moduleUrl, workerUrl, coreUrl, OCR_LANG_PATH]
-      },
-      (results) => {
-        const runtimeError = chrome.runtime.lastError;
-        if (runtimeError) {
-          reject(new Error(runtimeError.message || "标签页 OCR 解析失败"));
-          return;
-        }
-        const payload = results?.[0]?.result;
-        if (!payload?.ok) {
-          reject(new Error(payload?.error || "标签页 OCR 解析失败"));
-          return;
-        }
-        resolve(cleanText(payload.text || ""));
-      }
-    );
-  });
-}
-
 async function extractImageTextSafeViaBridge(data, name = "image") {
   if (!data || data.byteLength < 128) return "";
   const tabId = getCurrentPageTabId();
   if (!Number.isInteger(tabId)) {
-    throw new Error("鏈壘鍒板綋鍓嶆爣绛鹃〉锛屾棤娉曟墽琛屽浘鐗?OCR");
+    throw new Error("未找到当前标签页，无法执行图片 OCR");
   }
   await initOcrBridge(tabId);
   const mimeType = /\.png(?:$|\?)/i.test(String(name || "")) ? "image/png" : "image/jpeg";
@@ -976,7 +587,7 @@ async function extractImageTextSafeViaBridge(data, name = "image") {
       }
     },
     [base64, mimeType, OCR_BRIDGE_KEY],
-    "鏍囩椤?OCR 瑙ｆ瀽澶辫触"
+    "标签页 OCR 解析失败"
   );
   return mergeUniqueTexts(String(payload.text || "").split(/\n+/));
 }

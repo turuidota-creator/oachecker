@@ -18,6 +18,9 @@ assert.equal(parseAmount("￥1,234.50元整"), 1234.5, "should strip currency/un
 assert.equal(normalizeAccount("6217 OOOO 1234 l678"), "6217000012341678", "should tolerate OCR account glyph drift");
 
 const extractSource = fs.readFileSync(path.join(extensionRoot, "bg", "extract.js"), "utf8");
+const ocrBridgeSource = fs.readFileSync(path.join(extensionRoot, "bg", "ocr_bridge.js"), "utf8");
+const analyzerSource = fs.readFileSync(path.join(extensionRoot, "bg", "analyzer.js"), "utf8");
+const listPageSource = fs.readFileSync(path.join(extensionRoot, "list_page.js"), "utf8");
 
 assert.ok(extractSource.includes('let text = parts.join("\\n");'), "PDF text extraction should use real newline joins");
 assert.ok(
@@ -36,9 +39,42 @@ assert.ok(
   "bottom-full numeric crop should exist"
 );
 assert.ok(
-  extractSource.includes('tessedit_char_whitelist: "0123456789.,-() "'),
+  !extractSource.includes("function extractPdfTextInTab"),
+  "legacy in-tab PDF OCR path should stay removed"
+);
+assert.ok(
+  !extractSource.includes("function extractImageTextSafe("),
+  "legacy direct image OCR path should stay removed"
+);
+assert.ok(
+  ocrBridgeSource.includes('tessedit_char_whitelist: "0123456789.,-() "'),
   "numeric worker whitelist should be self-consistent"
 );
-assert.ok(extractSource.includes("const extractRecognizedText = (result) => {"), "OCR confidence filter should exist");
+assert.ok(ocrBridgeSource.includes("const extractRecognizedText = (result) => {"), "OCR confidence filter should exist");
+assert.ok(extractSource.includes('"标签页 PDF 解析失败"'), "PDF bridge failure message should be UTF-8 Chinese");
+assert.ok(extractSource.includes('"标签页 OCR 解析失败"'), "OCR bridge failure message should be UTF-8 Chinese");
+assert.ok(listPageSource.includes('"扩展通信失败"'), "extension communication fallback should be UTF-8 Chinese");
+assert.ok(analyzerSource.includes("/费用|服务|报价/"), "contract fallback keyword regex should be UTF-8 Chinese");
+assert.ok(analyzerSource.includes("/无金额上限|不设上限|上限不限|无封顶|"), "cap amount regex should be UTF-8 Chinese");
+
+const mojibakeMarkers = [
+  "\u93CD\u56E9",
+  "\u7459\uFF46\u703D",
+  "\u7490\u572D\u6564",
+  "\u93C8\u5D85\u59DF",
+  "\u93B5\u2541\u774D",
+  "\u95AB\u6C2B\u4FCA",
+  "\u6FB6\u8FAB\u89E6",
+  "\u93C8\uE045\u58D8"
+];
+for (const [fileName, source] of [
+  ["bg/extract.js", extractSource],
+  ["bg/analyzer.js", analyzerSource],
+  ["list_page.js", listPageSource]
+]) {
+  for (const marker of mojibakeMarkers) {
+    assert.equal(source.includes(marker), false, `${fileName} should not contain mojibake marker ${JSON.stringify(marker)}`);
+  }
+}
 
 console.log("extract/common OCR guard checks passed");
