@@ -52,10 +52,11 @@ import { buildContractSummaryProviderMeta, generateContractSummary } from "./con
 import { extractMailEvidenceFromAttachment, extractReferenceTextsFromAttachment } from "./extract.js";
 import { acquireOcrBridge, releaseOcrBridge } from "./ocr_bridge.js";
 
-export const BUILD_TAG = "rebuild-phase5-ocr-special-title-2026-04-17";
+export const BUILD_TAG = "rebuild-phase5-pr-contract-page-2026-04-20";
 
 const GENERIC_PROCESS_CODE_RE = /\b[A-Z]{2,10}-\d{8,}\b/i;
 const DOMESTIC_PR_CODE_RE = /\bGNPR-\d{8,}\b/i;
+const CONTRACT_PROCESS_CODE_RE = /\b(?:CYHT|CYNCHT|HT)-\d{8,}\b/i;
 const PURCHASE_ORDER_CODE_RE = /\bCYNCDD-\d{8,}\b/i;
 const PR_PAYMENT_CODE_RE = /^GNTYYFK-\d{8,}$/i;
 const PURCHASE_PAYMENT_CODE_RE = /^DDFK-\d{8,}$/i;
@@ -88,30 +89,37 @@ export async function analyzePageSnapshot(snapshot, tabId, onProgress = null) {
   const rootRef = parseProcessRef(snapshot?.pageUrl || "", "payment");
   const rootDetail = rootRef?.mode === "flowable" ? await fetchFlowableDetail(rootRef, baseUrl) : null;
   const rootFacts = rootDetail ? extractFlowableFacts(rootDetail) : {};
-  const inlineDomesticPrRefs = await resolveInlineDomesticPrRefs(snapshot, baseUrl, onProgress);
+  const inlineDomesticPrRefs = await resolveInlineDomesticPrRefs(snapshot, baseUrl, onProgress, rootRef?.detailId || "");
   const snapshotWithResolvedPr = inlineDomesticPrRefs.length > 0
     ? {
         ...snapshot,
         relatedLinks: enrichRelatedLinks(snapshot?.relatedLinks || [], inlineDomesticPrRefs)
       }
     : snapshot;
-  const target = mergePaymentTarget(snapshotWithResolvedPr?.paymentTarget || {}, rootFacts);
-  const flowType = detectPaymentFlowType(snapshotWithResolvedPr, target);
+  const inlineContractRefs = await resolveInlineContractRefs(snapshotWithResolvedPr, baseUrl, onProgress, rootRef?.detailId || "");
+  const snapshotWithResolvedRefs = inlineContractRefs.length > 0
+    ? {
+        ...snapshotWithResolvedPr,
+        relatedLinks: enrichRelatedLinks(snapshotWithResolvedPr?.relatedLinks || [], inlineContractRefs)
+      }
+    : snapshotWithResolvedPr;
+  const target = mergePaymentTarget(snapshotWithResolvedRefs?.paymentTarget || {}, rootFacts, snapshotWithResolvedRefs);
+  const flowType = detectPaymentFlowType(snapshotWithResolvedRefs, target);
   const structuredInvoiceSources = rootDetail
     ? await buildFlowableInvoiceEvidenceList(rootDetail, baseUrl).catch(() => [])
     : [];
   const enrichedSnapshot = rootDetail
     ? {
-        ...snapshotWithResolvedPr,
+        ...snapshotWithResolvedRefs,
         flowType,
-        attachments: dedupeAttachments([...(snapshotWithResolvedPr?.attachments || []), ...buildFlowableAttachmentList(rootDetail)]),
-        relatedLinks: enrichRelatedLinks(snapshotWithResolvedPr?.relatedLinks || [], [
+        attachments: dedupeAttachments([...(snapshotWithResolvedRefs?.attachments || []), ...buildFlowableAttachmentList(rootDetail)]),
+        relatedLinks: enrichRelatedLinks(snapshotWithResolvedRefs?.relatedLinks || [], [
           ...extractKnownRefs(rootDetail, rootRef?.detailId || ""),
           ...discoverProcessRefs(rootDetail, rootRef?.detailId || "")
         ])
       }
     : {
-        ...snapshotWithResolvedPr,
+        ...snapshotWithResolvedRefs,
         flowType
       };
   const pageInvoiceContext = derivePageInvoiceContext(enrichedSnapshot, rootDetail, structuredInvoiceSources);
@@ -413,7 +421,8 @@ export async function analyzePageSnapshot(snapshot, tabId, onProgress = null) {
   }
 }
 
-function mergePaymentTarget(primary, fallback) {
+function mergePaymentTarget(primary, fallback, snapshot = null) {
+  const snapshotFallback = buildPaymentTargetSnapshotFallback(snapshot);
   const flowType = firstNonEmpty(primary.flowType, primary.paymentFlowType);
   return {
     ...primary,
@@ -421,11 +430,56 @@ function mergePaymentTarget(primary, fallback) {
     paymentFlowType: flowType,
     processCode: firstNonEmpty(primary.processCode, fallback.processCode),
     processTitle: firstNonEmpty(primary.processTitle, fallback.processTitle),
-    paymentAmount: firstNonEmpty(primary.paymentAmount, fallback.paymentAmount, fallback.invoiceTotal),
-    payeeCompany: firstNonEmpty(primary.payeeCompany, fallback.supplier, fallback.invoiceSupplier),
-    payeeAccount: firstNonEmpty(primary.payeeAccount, fallback.accountNo, fallback.invoiceAccountNo),
-    payeeBank: firstNonEmpty(primary.payeeBank, fallback.bankName),
+    paymentAmount: firstNonEmpty(primary.paymentAmount, snapshotFallback.paymentAmount, fallback.paymentAmount, fallback.invoiceTotal),
+    payeeCompany: firstNonEmpty(primary.payeeCompany, snapshotFallback.payeeCompany, fallback.supplier, fallback.invoiceSupplier),
+    payeeAccount: firstLikelyBankAccount(
+      primary.payeeAccount,
+      snapshotFallback.payeeAccount,
+      fallback.accountNo,
+      fallback.invoiceAccountNo
+    ),
+    payeeBank: firstNonEmpty(primary.payeeBank, snapshotFallback.payeeBank, fallback.bankName),
     paymentDate: firstNonEmptyDate(primary.paymentDate, fallback.paymentDate)
+  };
+}
+
+function buildPaymentTargetSnapshotFallback(snapshot) {
+  const entries = collectSnapshotFieldEntries(snapshot);
+  return {
+    paymentAmount: findFieldValueFromPairs(
+      entries,
+      "打款金额确认",
+      "人民币打款金额ABS",
+      "人民币打款金额CBS",
+      "人民币打款金额",
+      "付款小写金额",
+      "人民币金额",
+      "本次付款金额",
+      "实际付款金额",
+      "付款金额"
+    ),
+    payeeCompany: findFieldValueFromPairs(
+      entries,
+      "收款公司",
+      "收款单位",
+      "供应商名称",
+      "供应商",
+      "合同相对方",
+      "对方公司"
+    ),
+    payeeAccount: firstLikelyBankAccount(
+      ...findFieldValuesFromPairs(
+        entries,
+        "收款账号",
+        "银行账号",
+        "开户账号",
+        "收款账户",
+        "银行账户",
+        "账户号",
+        "供应商账号"
+      )
+    ),
+    payeeBank: findFieldValueFromPairs(entries, "银行开户行", "开户行", "开户银行", "收款银行", "银行名称")
   };
 }
 
@@ -1723,7 +1777,92 @@ function buildInlinePrRowHints(item) {
   return hints;
 }
 
-async function resolveInlineDomesticPrRefs(snapshot, baseUrl, onProgress) {
+function extractContractProcessCode(value) {
+  const matched = cleanText(value || "").match(CONTRACT_PROCESS_CODE_RE);
+  return matched?.[0] ? matched[0].toUpperCase() : "";
+}
+
+function getInlineContractItems(snapshot) {
+  const entries = collectSnapshotFieldEntries(snapshot);
+  const hasContractFlag = findFieldValueFromPairs(entries, "是否有合同");
+  const title = firstNonEmpty(
+    findFieldValueFromPairs(entries, "合同用章申请", "合同名称", "合同标题", "合同流程标题", "合同申请"),
+    findFieldValueFromPairs(entries, "相关合同", "采购合同", "框架协议")
+  );
+  const counterparty = findFieldValueFromPairs(entries, "合同相对方", "供应商名称", "乙方", "对方公司");
+  const amount = findFieldValueFromPairs(entries, "合同总额", "合同总金额", "合同金额");
+  const seen = new Set();
+  const results = [];
+
+  for (const entry of entries) {
+    const label = cleanText(entry?.label || "");
+    const value = cleanText(entry?.value || "");
+    if (!value) {
+      continue;
+    }
+    if (!/合同|协议/.test(label) && !CONTRACT_PROCESS_CODE_RE.test(value)) {
+      continue;
+    }
+
+    const processCode = extractContractProcessCode(value);
+    if (!processCode || seen.has(processCode)) {
+      continue;
+    }
+    seen.add(processCode);
+    results.push({
+      processCode,
+      title,
+      counterparty,
+      amount,
+      hasContractFlag,
+      sourceLabel: label
+    });
+  }
+
+  return results;
+}
+
+function buildInlineContractRowHints(item) {
+  const hints = [];
+  const pushHint = (key, value) => {
+    const text = cleanText(value || "");
+    if (!text) {
+      return;
+    }
+    hints.push({ key, value: text });
+  };
+
+  pushHint("合同流程编号", item?.processCode);
+  pushHint("合同名称", item?.title);
+  pushHint("合同相对方", item?.counterparty);
+  pushHint("合同金额", item?.amount);
+  pushHint("是否有合同", item?.hasContractFlag);
+  return hints;
+}
+
+function withSourceInstId(ref, sourceInstId) {
+  const source = cleanText(sourceInstId || "");
+  if (!ref || ref.mode !== "flowable" || ref.sourceInstId || !source || ref.detailId === source) {
+    return ref;
+  }
+
+  try {
+    const parsed = new URL(ref.detailUrl);
+    parsed.searchParams.set("sourceInstId", source);
+    return {
+      ...ref,
+      detailUrl: parsed.toString(),
+      sourceInstId: source
+    };
+  } catch (_error) {
+    return {
+      ...ref,
+      sourceInstId: source
+    };
+  }
+}
+
+async function resolveInlineDomesticPrRefs(snapshot, baseUrl, onProgress, sourceInstId = "") {
   const inlineItems = getInlineDomesticPrItems(snapshot);
   const refs = [];
   const seenCodes = new Set();
@@ -1736,7 +1875,7 @@ async function resolveInlineDomesticPrRefs(snapshot, baseUrl, onProgress) {
 
     reportProgress(onProgress, "domestic-pr-resolve", "正在反查国内PR流程", item.processCode);
     try {
-      const ref = await resolveProcessCodeRef(item.processCode, "domestic_pr", baseUrl);
+      const ref = withSourceInstId(await resolveProcessCodeRef(item.processCode, "domestic_pr", baseUrl), sourceInstId);
       if (!ref) {
         continue;
       }
@@ -1747,6 +1886,36 @@ async function resolveInlineDomesticPrRefs(snapshot, baseUrl, onProgress) {
       });
     } catch (_error) {
       // Keep the inline PR item as a fallback display source.
+    }
+  }
+
+  return refs;
+}
+
+async function resolveInlineContractRefs(snapshot, baseUrl, onProgress, sourceInstId = "") {
+  const inlineItems = getInlineContractItems(snapshot);
+  const refs = [];
+  const seenCodes = new Set();
+
+  for (const item of inlineItems) {
+    if (!item.processCode || seenCodes.has(item.processCode)) {
+      continue;
+    }
+    seenCodes.add(item.processCode);
+
+    reportProgress(onProgress, "contract-resolve", "正在反查合同流程", item.processCode);
+    try {
+      const ref = withSourceInstId(await resolveProcessCodeRef(item.processCode, "contract", baseUrl), sourceInstId);
+      if (!ref) {
+        continue;
+      }
+      refs.push({
+        ...ref,
+        titleHint: firstNonEmpty(item.title, ref.titleHint, item.processCode),
+        rowHints: buildInlineContractRowHints(item)
+      });
+    } catch (_error) {
+      // Keep any explicit link or attachment source as a fallback if reverse lookup fails.
     }
   }
 
@@ -2834,28 +3003,60 @@ async function analyzeContractLinks(relatedLinks, target, baseUrl, onProgress) {
   try {
     if (ref.mode === "flowable") {
       const detail = await fetchFlowableDetail(ref, baseUrl);
+      const flowablePageSnapshot = await collectPageSnapshotFromUrl(ref.detailUrl).catch(() => null);
+      const pagePairs = Array.isArray(flowablePageSnapshot?.fieldPairs) ? flowablePageSnapshot.fieldPairs : [];
       const baseFacts = {
-        processCode: firstNonEmpty(detail.processCode, detail.flowFormData?.EXTARGETNODEID),
-        processTitle: firstNonEmpty(detail.flowFormData?.processTitleInput, detail.flowFormData?.NCBILLCODE),
-        counterpartyCompany: firstNonEmpty(detail.flowFormData?.HT010),
+        processCode: firstNonEmpty(
+          detail.processCode,
+          detail.flowFormData?.EXTARGETNODEID,
+          findFieldValueFromPairs(pagePairs, "合同流程编号", "合同编号", "流程编号")
+        ),
+        processTitle: firstNonEmpty(
+          detail.flowFormData?.processTitleInput,
+          detail.flowFormData?.NCBILLCODE,
+          findFieldValueFromPairs(pagePairs, "合同用章申请", "合同名称", "合同标题", "流程标题")
+        ),
+        counterpartyCompany: firstNonEmpty(
+          detail.flowFormData?.HT010,
+          findFieldValueFromPairs(pagePairs, "合同相对方", "供应商名称", "乙方", "对方公司")
+        ),
         contractAccountNo: firstLikelyBankAccount(
           detail.flowFormData?.HT013,
           detail.flowFormData?.HT014,
           detail.flowFormData?.ACCOUNT,
-          detail.flowFormData?.bankAccount
+          detail.flowFormData?.bankAccount,
+          findFieldValueFromPairs(pagePairs, "收款账号", "银行账号", "开户账号", "收款账户", "银行账户", "账户号")
         ),
-        effectiveStart: firstNonEmptyDate(detail.flowFormData?.HT032),
-        effectiveEnd: firstNonEmptyDate(detail.flowFormData?.HT033),
+        effectiveStart: firstNonEmptyDate(
+          detail.flowFormData?.HT032,
+          findFieldValueFromPairs(pagePairs, "合同开始日期", "合同开始日", "开始日", "生效日期", "生效日")
+        ),
+        effectiveEnd: firstNonEmptyDate(
+          detail.flowFormData?.HT033,
+          findFieldValueFromPairs(pagePairs, "合同结束日期", "合同结束日", "结束日期", "截止日期", "终止日期")
+        ),
         paymentTerms: firstMeaningfulText(
           detail.flowFormData?.HT030,
           detail.flowFormData?.HT031,
           detail.flowFormData?.HT034,
-          detail.flowFormData?.HT035
+          detail.flowFormData?.HT035,
+          findFieldValueFromPairs(pagePairs, "付款条件", "付款方式", "结算方式", "付款条款", "验收标准")
         ),
-        sourceName: firstNonEmpty(detail.flowFormData?.processTitleInput, detail.processCode, contractLink.title),
+        sourceName: normalizeRelatedSourceName(
+          flowablePageSnapshot,
+          contractLink.title,
+          ref,
+          detail.flowFormData?.processTitleInput,
+          findFieldValueFromPairs(pagePairs, "合同用章申请", "合同名称", "合同标题", "流程标题"),
+          detail.processCode
+        ),
         sourceUrl: ref.detailUrl
       };
-      return analyzeContractDetail(ref, buildFlowableAttachmentList(detail), baseFacts, target, "合同页", onProgress);
+      const flowableAttachments = mergeAttachmentCandidates(
+        buildFlowableAttachmentList(detail),
+        Array.isArray(flowablePageSnapshot?.attachments) ? flowablePageSnapshot.attachments : []
+      );
+      return analyzeContractDetail(ref, flowableAttachments, baseFacts, target, "合同页", onProgress, flowablePageSnapshot);
     }
 
       const detail = await fetchHistoryDetail(ref, baseUrl);

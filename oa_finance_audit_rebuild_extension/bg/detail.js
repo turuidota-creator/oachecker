@@ -2,6 +2,7 @@ import {
   BASE_URL,
   cleanText,
   filenameFromUrl,
+  firstLikelyBankAccount,
   firstNonEmpty,
   firstNonEmptyDate,
   normalizeUrl
@@ -260,17 +261,43 @@ export function buildAttachmentTitles(detail) {
 export function extractFlowableFacts(detail) {
   const flow = detail.flowFormData || {};
   const invoiceRefs = Array.isArray(flow.fpSubform) ? flow.fpSubform : [];
+  const flowAccountNo = firstLikelyBankAccount(
+    flow.ACCOUNT,
+    flow.accountNo,
+    flow.bankAccount,
+    flow.bankNo,
+    flow.BANKACCOUNT,
+    flow.BANK_ACCOUNT,
+    flow.COLLECTIONACCOUNT,
+    flow.PAYEEACCOUNT,
+    findFlowFieldValue(
+      flow,
+      [
+        /(?:^|_)(?:account|bankAccount|bankNo|accountNo)(?:$|_)/i,
+        /收款账号|银行账号|开户账号|银行账户|收款账户|账户号|供应商账号/
+      ],
+      isFlowBankAccountValue
+    )
+  );
+  const flowBankName = firstNonEmpty(
+    flow.BANK,
+    flow.bankName,
+    flow.BANKNAME,
+    flow.OPENBANK,
+    flow.COLLECTIONBANK,
+    findFlowFieldValue(flow, [/bank(?:Name)?|openBank/i, /银行开户行|开户行|开户银行|收款银行|银行名称/])
+  );
   return {
     processCode: firstNonEmpty(detail.processCode, flow.EXTARGETNODEID),
     processTitle: firstNonEmpty(flow.processTitleInput, flow.NCBILLCODE),
     supplier: firstNonEmpty(flow.SUPPLIER, flow.NAMEOFSUPPLIER, flow.COLLECTIONSUPPLIERNAME),
-    accountNo: firstNonEmpty(flow.ACCOUNT),
-    bankName: firstNonEmpty(flow.BANK),
+    accountNo: flowAccountNo,
+    bankName: flowBankName,
     paymentDate: firstNonEmptyDate(flow.PAYDATE, flow.PAYMENTDATE, flow.CREATEDATE, detail.processCode, flow.processTitleInput),
     paymentAmount: firstNonEmpty(flow.RMBAMOUNT, flow.PAYAMOUNTLOW, flow.cMoney),
     invoiceTotal: firstNonEmpty(flow.kaipiaojine, flow.hsje),
     invoiceSupplier: firstNonEmpty(invoiceRefs[0]?.gysmc, flow.NAMEOFSUPPLIER, flow.COLLECTIONSUPPLIERNAME),
-    invoiceAccountNo: firstNonEmpty(invoiceRefs[0]?.bankAccount, invoiceRefs[0]?.accountNo, flow.bankNo),
+    invoiceAccountNo: firstLikelyBankAccount(invoiceRefs[0]?.bankAccount, invoiceRefs[0]?.accountNo, flow.bankNo),
     invoiceRefs: invoiceRefs.map((row) => {
       const invoiceTypeCandidates = collectInvoiceTypeCandidates(row);
       return {
@@ -294,7 +321,8 @@ export function extractKnownRefs(detail, currentDetailId) {
     ...extractRefsFromRows(flow.formtable_main_154_dt1, "domestic_pr", currentDetailId),
     ...extractRefsFromRows(flow.formtable_main_154_dt4, "contract", currentDetailId),
     ...extractRefsFromRows(flow.formtable_main_154_dt5, "purchase_order", currentDetailId),
-    ...extractRefsFromRows(flow.formtable_main_154_dt6, "acceptance", currentDetailId)
+    ...extractRefsFromRows(flow.formtable_main_154_dt6, "acceptance", currentDetailId),
+    ...extractRefsFromLikelyFlowRows(flow, currentDetailId)
   ];
   return dedupeRefs(refs);
 }
@@ -305,7 +333,7 @@ export function discoverProcessRefs(detail, currentDetailId) {
     if (typeof value !== "string") return;
     for (const match of value.matchAll(PROCESS_LINK_RE)) {
       const relation = relationFromContext(value);
-      const ref = parseProcessRef(match[0], relation);
+      const ref = withFallbackSourceInstId(parseProcessRef(match[0], relation), currentDetailId);
       if (ref && ref.detailId !== currentDetailId) refs.push(ref);
     }
   });
@@ -336,6 +364,38 @@ function historyFieldText(value) {
   if (typeof value === "string") return cleanText(value);
   if (Array.isArray(value)) return value.map((item) => historyFieldText(item)).filter(Boolean).join(" ");
   if (typeof value === "object") return firstNonEmpty(value.value, value.fieldValue, value.text);
+  return "";
+}
+
+function flowFieldText(value) {
+  if (value == null) return "";
+  if (typeof value === "string" || typeof value === "number") return cleanText(value);
+  if (typeof value === "object" && !Array.isArray(value)) {
+    return firstNonEmpty(value.value, value.fieldValue, value.text, value.label);
+  }
+  return "";
+}
+
+function isFlowBankAccountValue(value) {
+  return !!firstLikelyBankAccount(value);
+}
+
+function findFlowFieldValue(flow, keyPatterns, predicate = null) {
+  for (const [key, value] of Object.entries(flow || {})) {
+    const keyText = decodeMaybeUriComponent(key);
+    if (!(keyPatterns || []).some((pattern) => pattern.test(keyText))) {
+      continue;
+    }
+
+    const text = flowFieldText(value);
+    if (!text) {
+      continue;
+    }
+    if (typeof predicate === "function" && !predicate(text)) {
+      continue;
+    }
+    return text;
+  }
   return "";
 }
 
@@ -452,7 +512,7 @@ function extractRefsFromRows(rows, relation, currentDetailId) {
         continue;
       }
       for (const match of value.matchAll(PROCESS_LINK_RE)) {
-        const ref = parseProcessRef(match[0], relation);
+        const ref = withFallbackSourceInstId(parseProcessRef(match[0], relation), currentDetailId);
         if (ref && ref.detailId !== currentDetailId) {
           refs.push({
             ...ref,
@@ -464,6 +524,72 @@ function extractRefsFromRows(rows, relation, currentDetailId) {
     }
   }
   return refs;
+}
+
+function extractRefsFromLikelyFlowRows(flow, currentDetailId) {
+  const refs = [];
+  for (const [tableKey, rows] of Object.entries(flow || {})) {
+    if (!Array.isArray(rows)) {
+      continue;
+    }
+
+    for (const row of rows) {
+      if (!row || typeof row !== "object" || Array.isArray(row)) {
+        continue;
+      }
+
+      const rowHints = collectRowHints(row);
+      const rowContext = [
+        tableKey,
+        ...Object.keys(row || {}),
+        ...rowHints.flatMap((item) => [item.key, item.value])
+      ].join(" ");
+      const relation = relationFromContext(rowContext);
+      if (relation === "related") {
+        continue;
+      }
+
+      const titleHint = pickRefTitleHint(rowHints, relation);
+      for (const value of Object.values(row || {})) {
+        if (typeof value !== "string") {
+          continue;
+        }
+        for (const match of value.matchAll(PROCESS_LINK_RE)) {
+          const ref = withFallbackSourceInstId(parseProcessRef(match[0], relation), currentDetailId);
+          if (ref && ref.detailId !== currentDetailId) {
+            refs.push({
+              ...ref,
+              titleHint,
+              rowHints
+            });
+          }
+        }
+      }
+    }
+  }
+  return refs;
+}
+
+function withFallbackSourceInstId(ref, currentDetailId) {
+  const sourceInstId = cleanText(currentDetailId || "");
+  if (!ref || ref.mode !== "flowable" || ref.sourceInstId || !sourceInstId || ref.detailId === sourceInstId) {
+    return ref;
+  }
+
+  try {
+    const parsed = new URL(ref.detailUrl);
+    parsed.searchParams.set("sourceInstId", sourceInstId);
+    return {
+      ...ref,
+      detailUrl: parsed.toString(),
+      sourceInstId
+    };
+  } catch (_error) {
+    return {
+      ...ref,
+      sourceInstId
+    };
+  }
 }
 
 function mergeRefMeta(left, right) {

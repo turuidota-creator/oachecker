@@ -50,6 +50,28 @@ runTest("extractKnownRefs keeps full contract link from flow form rows", () => {
   assert.equal(refs[0].sourceInstId, paymentDetailId);
 });
 
+runTest("extractKnownRefs fills missing sourceInstId for related flow links", () => {
+  const blankSourceUrl =
+    `http://oa.cyou-inc.com/workflow/process/detail/${contractDetailId}?sourceInstId=`;
+  const refs = extractKnownRefs(
+    {
+      flowFormData: {
+        formtable_main_154_dt4: [
+          {
+            htlink: blankSourceUrl,
+            Num3: "CYHT-202604100002",
+            CGHTTitle: "畅游合同用章申请"
+          }
+        ]
+      }
+    },
+    paymentDetailId
+  );
+  assert.equal(refs.length, 1);
+  assert.equal(refs[0].sourceInstId, paymentDetailId);
+  assert.match(refs[0].detailUrl, new RegExp(`sourceInstId=${paymentDetailId}`));
+});
+
 runTest("discoverProcessRefs keeps query string when scanning text blobs", () => {
   const refs = discoverProcessRefs(
     {
