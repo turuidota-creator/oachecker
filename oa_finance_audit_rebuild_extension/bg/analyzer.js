@@ -52,7 +52,7 @@ import { buildContractSummaryProviderMeta, generateContractSummary } from "./con
 import { extractMailEvidenceFromAttachment, extractReferenceTextsFromAttachment } from "./extract.js";
 import { acquireOcrBridge, releaseOcrBridge } from "./ocr_bridge.js";
 
-export const BUILD_TAG = "rebuild-phase5-pr-contract-page-2026-04-20";
+export const BUILD_TAG = "rebuild-phase5-payee-account-cache-2026-04-21";
 
 const GENERIC_PROCESS_CODE_RE = /\b[A-Z]{2,10}-\d{8,}\b/i;
 const DOMESTIC_PR_CODE_RE = /\bGNPR-\d{8,}\b/i;

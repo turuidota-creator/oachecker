@@ -198,7 +198,7 @@ function isFreshCacheEntry(entry) {
   if (!entry || typeof entry !== "object") {
     return false;
   }
-  if (entry.buildTag && entry.buildTag !== BUILD_TAG) {
+  if (entry.buildTag !== BUILD_TAG) {
     return false;
   }
   if (entry.cacheSchema !== CACHE_SCHEMA_VERSION) {

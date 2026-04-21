@@ -191,3 +191,23 @@
 - 现象：`GNTYYFK-202604140005` 付款页能看到 `银行账号` 和 `合同流程编号 CYHT-202604100002`，但分析结果曾显示“未提供合同入口”；直接反查合同流程后又会因缺少来源上下文报“没有权限查看该流程”。
 - 原则：PR 付款页里的合同编号、合同子表 URL、纯 URL 关联项都要归并成 `contract`；打开 flowable 合同页时必须补 `sourceInstId=付款单实例ID`，并且 flowable 合同也要读取页面快照作为 API 字段的兜底。
 - 动作：补齐合同编号反查、整行上下文识别、`sourceInstId` 回填和 flowable 合同页 DOM 快照；付款目标的收款账号/开户行再从页面字段对兜底，避免 API 固定字段为空时掉空。
+
+### 2026-04-20 公开样票 OCR 探针
+- 现象：从 OA 流程里拆出 OCR 后，用公开增值税发票样票回放，清晰电子普票和电子专票能识别票种；低清纸票、双联卷票、带尺寸标注的设计说明图会把标题识别成碎片，无法稳定归一化到专票/普票。
+- 原则：附件 OCR 的通过条件仍要保守，不能因为页面或样票里出现“发票”二字就放绿；公开样票与 OA 原始附件的清晰度、裁剪方式差异很大，测试必须保留来源、预处理变体和完整报告便于复盘。
+- 动作：新增 `scripts/probe_public_invoice_ocr.mjs`，复用当前 Tesseract worker 参数和票种归一化逻辑，按扩展里的图片预处理变体生成独立 OCR 回放，结果输出到 `tmp_public_invoice_ocr/report.json`；后续优化应优先增强顶部标题区裁剪/放大/去章策略。
+
+### 2026-04-20 调试入口要沉淀成脚本命令
+- 现象：OCR 探针和守卫测试如果只靠手写 `node ../scripts/...`，很容易在后续排查时忘命令、跑错目录或遗漏参数。
+- 原则：常用回归入口应挂到 `package.json` scripts；一次性探针可以继续放 `scripts/`，但项目入口要能从扩展目录稳定调用。
+- 动作：扩展包新增 `npm test`、`npm run test:ocr-guards`、`npm run probe:public-ocr`，让 OCR 守卫和公开样票回放都有固定命令。
+
+### 2026-04-20 OCR 外部轮子优先级
+- 现象：继续只调 Tesseract.js 预处理，对低清发票和复杂版式的收益有限；社区已有 PaddleOCR、PaddleOCR-json、RapidOCR-json、client-side-ocr 等离线方案，以及腾讯云/百度/华为等增值税发票专用 API。
+- 原则：扩展内置 OCR 仍应保持轻量和保守；如需提升识别率，优先接“可选外部 OCR 后端”，不要把大型模型直接塞进 Chrome 扩展包。
+- 动作：短期优先验证 PaddleOCR-json/RapidOCR-json 这类 Windows 离线 JSON 引擎；中期可评估 PaddleOCR PP-OCRv5/PP-StructureV3 本地服务；若允许联网和付费，再考虑商业增值税发票 OCR API 作为高准确率后备。
+
+### 2026-04-21 详情页缓存必须强校验 buildTag
+- 现象：`GNTYYFK-202604140005` 页面字段已能采到 `银行账号=1907066219022111254`，本地现跑也能通过账号核对；用户仍看到未识别时，最可能是当天旧缓存被详情页/列表页回放。
+- 原则：分析结果缓存必须要求 `entry.buildTag === BUILD_TAG`，不能让缺少 `buildTag` 的历史缓存继续算新缓存；涉及字段识别修复时要同步 bump `BUILD_TAG` 和扩展版本。
+- 动作：收紧 `background.js` 缓存新鲜度判断，bump `BUILD_TAG` 到 `rebuild-phase5-payee-account-cache-2026-04-21`，并新增缓存守卫测试，防止旧缓存绕过字段修复。
