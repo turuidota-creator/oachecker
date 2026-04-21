@@ -1,10 +1,10 @@
 OA 付款审核插件 Git 更新日志
 
 共享盘路径：\\10.1.0.230\财务部\总账组\OA审批插件
-插件版本：0.1.3
+插件版本：0.1.4
 当前分支：codex/performance-ocr-contract-attachments
-当前发布基线提交：1c7b87c
-更新时间：2026-04-21 18:03:13
+当前发布基线提交：c9b6db5
+更新时间：2026-04-21 18:40:22
 
 说明：
 1. 这个文件只用于查看当前共享盘插件对应的 Git 更新记录。
@@ -12,18 +12,21 @@ OA 付款审核插件 Git 更新日志
 3. 本文件随插件发布同步更新；如果重新同步共享盘，请从本地扩展根目录同步，避免手工放置的文件被覆盖。
 
 本次发布重点：
-1. 图片 OCR 改为按证据缺口早停，发票图保留票面类型 OCR，金额/公司已有结构化证据时跳过重复全图 OCR。
-2. 关联流程读取增加受控并发槽，合同和国内 PR 优先启动，验收/采购订单排队。
-3. 合同详情、附件阶段、OCR 计划补充内部计时，便于定位真实性能瓶颈。
-4. 版本号同步升级到 0.1.3。
+1. History 合同链接补齐 `sourceInstId`，避免 PR 付款单打开历史合同时报“当前用户无权限”。
+2. History 详情 API 请求同步携带 `sourceInstId`，API 失败时仍尝试隐藏 Tab 兜底采集合同页。
+3. 收款账号提示区分“付款页账号已识别”和“外部材料未命中同账号”，避免误读为付款页账号丢失。
+4. 版本号同步升级到 0.1.4，并更新缓存 `BUILD_TAG`。
 
 回归验证：
 1. node --check bg/extract.js 通过。
 2. node --check bg/analyzer.js 通过。
-3. npm test 通过。
-4. 4 个真实 OA 单据回归状态无回退，图片 OCR 变体数实际下降。
+3. node --check bg/detail.js 通过。
+4. npm test 通过。
+5. `GNTYYFK-202604200001` 回放：付款页账号识别为 `110922785710109`，合同 URL 已带 `sourceInstId=668706556262617088`，合同页状态为 `read_ok`；账号仍需人工确认，因为发票/合同/附件未找到同账号外部证据。
 
 最近提交：
+c9b6db5 | 2026-04-21 18:40 | fix: preserve sourceInstId for history contracts
+59628d9 | 2026-04-21 18:05 | docs: update 0.1.3 release sync notes
 1c7b87c | 2026-04-21 17:38 | perf: add evidence-based OCR early stop
 1bfb05e | 2026-04-21 14:49 | perf: add staged OCR and contract timing
 15d1cbc | 2026-04-21 11:51 | chore: checkpoint audit UI and lessons
@@ -31,6 +34,3 @@ OA 付款审核插件 Git 更新日志
 f00010e | 2026-04-20 17:10 | fix pr payment contract detail collection
 0677426 | 2026-04-17 18:41 | fix: tighten invoice OCR rules and prep private repo
 4eb98e3 | 2026-04-17 15:40 | 修复 OCR 发票识别并更新发布包
-faa4ba8 | 2026-04-17 13:43 | fix: 清理乱码文案和旧 OCR 路径
-d0a6741 | 2026-04-17 11:30 | fix: 修复多发票合计误判
-4234abc | 2026-04-16 17:37 | docs: refresh audit workflow notes
