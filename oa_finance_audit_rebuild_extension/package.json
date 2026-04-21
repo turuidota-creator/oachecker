@@ -1,6 +1,6 @@
 {
   "name": "oa-finance-audit-rebuild-extension",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Rebuild workspace for the OA finance audit extension.",
   "main": "background.js",
   "scripts": {

@@ -406,7 +406,7 @@ async function extractImageTextSafeViaBridge(data, name = "image", target = {}, 
   const base64 = uint8ArrayToBase64(data);
   const payload = await executeInTab(
     tabId,
-    async (inputBase64, inputMimeType, bridgeKey, ocrTarget) => {
+    async (inputBase64, inputMimeType, bridgeKey, ocrOptions) => {
       try {
         const loadImageFromBlob = (blob) =>
           new Promise((resolve, reject) => {
@@ -608,6 +608,9 @@ async function extractImageTextSafeViaBridge(data, name = "image", target = {}, 
           throw new Error("OCR bridge not initialized");
         }
         const variants = await buildVariants(new Blob([bytes], { type: inputMimeType }));
+        const ocrTarget = ocrOptions?.target || {};
+        const ocrIntent = String(ocrOptions?.intent || "full");
+        const evidence = ocrOptions?.evidence || {};
         const normalizeAccount = (value) =>
           String(value || "")
             .replace(/[Oo]/g, "0")
@@ -641,6 +644,21 @@ async function extractImageTextSafeViaBridge(data, name = "image", target = {}, 
             amountMatched: amountMatchesTarget(combined, ocrTarget?.paymentAmount),
             accountMatched: accountMatchesTarget(combined, ocrTarget?.payeeAccount)
           };
+        };
+        const detectInvoiceTypeLabel = (results) => {
+          const combined = results.map((item) => item?.text || "").join("\n");
+          const compact = combined.replace(/\s+/g, "");
+          const hanOnly = combined.replace(/[^\u4e00-\u9fa5]/g, "");
+          const looksOrdinary = /增值税.{0,20}普通发票|普通发票|普票/.test(combined) ||
+            /增值税.{0,12}普通发票|普通发票|普票/.test(compact) ||
+            /增值税普通发票|普通发票|普票/.test(hanOnly);
+          if (looksOrdinary) {
+            return "普通发票";
+          }
+          const looksSpecial = /增值税.{0,20}专用发票|专用发票|专票|用发票/.test(combined) ||
+            /增值税.{0,12}专用发票|专用发票|专票|用发票/.test(compact) ||
+            /电子?发票.{0,18}用发|电子?发.{0,18}用发|电.{0,16}发.{0,16}用发|增值税专用发票|专用发票|专票/.test(hanOnly);
+          return looksSpecial ? "增值税专用发票" : "";
         };
         const ocrTimings = [];
         const runVariant = async (variant) => {
@@ -688,31 +706,113 @@ async function extractImageTextSafeViaBridge(data, name = "image", target = {}, 
         const numericVariants = variants.filter((variant) => variant.mode === "numeric");
         const generalPrimaryVariants = variants.filter((variant) => ["original", "grayscale-boost"].includes(variant.label));
         const generalFallbackVariants = variants.filter((variant) => ["red-removed", "threshold"].includes(variant.label));
-        const titleTask = runGroup(titleVariants);
-        const generalPrimaryResults = await runGroup(generalPrimaryVariants);
-        const primaryMatches = evaluateTargetMatches(generalPrimaryResults);
         const hasTargetAmount = !!String(ocrTarget?.paymentAmount || "").trim();
         const hasTargetAccount = !!String(ocrTarget?.payeeAccount || "").trim();
-        const shouldRunGeneralFallback =
-          !hasTargetAmount ||
-          !hasTargetAccount ||
-          !primaryMatches.amountMatched ||
-          !primaryMatches.accountMatched;
-        const shouldRunNumeric =
-          !hasTargetAccount ||
-          !primaryMatches.accountMatched ||
-          (hasTargetAmount && !primaryMatches.amountMatched);
-        const [generalFallbackResults, numericResults, titleResults] = await Promise.all([
-          shouldRunGeneralFallback ? runGroup(generalFallbackVariants) : [],
-          shouldRunNumeric ? runGroup(numericVariants) : [],
-          titleTask
-        ]);
+        const knownAmountMatched = !!evidence?.amountMatched;
+        const knownCompanyMatched = !!evidence?.companyMatched;
+        const knownAccountMatched = !!evidence?.accountMatched;
+        const executedGroups = [];
+        const skippedGroups = [];
+
+        let titleResults = [];
+        let generalPrimaryResults = [];
+        let generalFallbackResults = [];
+        let numericResults = [];
+        let primaryMatches = { amountMatched: false, accountMatched: false };
+        let shouldRunGeneralPrimary = true;
+        let shouldRunGeneralFallback = true;
+        let shouldRunNumeric = true;
+        let invoiceTypeHint = "";
+
+        if (ocrIntent === "invoice-gap-fill") {
+          executedGroups.push("title");
+          titleResults = await runGroup(titleVariants);
+          const titleInvoiceType = detectInvoiceTypeLabel(titleResults);
+          const titleHasInvoiceType = !!titleInvoiceType;
+          shouldRunGeneralPrimary = !knownAmountMatched || !knownCompanyMatched || !titleHasInvoiceType;
+          if (shouldRunGeneralPrimary) {
+            executedGroups.push("general-primary");
+            generalPrimaryResults = await runGroup(generalPrimaryVariants);
+            primaryMatches = evaluateTargetMatches(generalPrimaryResults);
+          } else {
+            skippedGroups.push({
+              group: "general-primary",
+              reason: "结构化金额/公司已命中，且 title OCR 已识别票种"
+            });
+          }
+
+          invoiceTypeHint = detectInvoiceTypeLabel([...titleResults, ...generalPrimaryResults]);
+          const primaryHasInvoiceType = !!invoiceTypeHint;
+          const amountResolved = knownAmountMatched || primaryMatches.amountMatched;
+          shouldRunGeneralFallback =
+            !primaryHasInvoiceType ||
+            (hasTargetAmount && !amountResolved) ||
+            !knownCompanyMatched;
+          shouldRunNumeric = hasTargetAccount && !knownAccountMatched;
+        } else if (ocrIntent === "account-proof") {
+          skippedGroups.push({
+            group: "title",
+            reason: "账户证明图片不需要票种 OCR"
+          });
+          shouldRunGeneralPrimary = true;
+          executedGroups.push("general-primary");
+          generalPrimaryResults = await runGroup(generalPrimaryVariants);
+          primaryMatches = evaluateTargetMatches(generalPrimaryResults);
+          shouldRunGeneralFallback = hasTargetAccount && !(knownAccountMatched || primaryMatches.accountMatched);
+          shouldRunNumeric = hasTargetAccount && !(knownAccountMatched || primaryMatches.accountMatched);
+        } else {
+          executedGroups.push("title", "general-primary");
+          const titleTask = runGroup(titleVariants);
+          generalPrimaryResults = await runGroup(generalPrimaryVariants);
+          primaryMatches = evaluateTargetMatches(generalPrimaryResults);
+          titleResults = await titleTask;
+          shouldRunGeneralFallback =
+            !hasTargetAmount ||
+            !hasTargetAccount ||
+            !primaryMatches.amountMatched ||
+            !primaryMatches.accountMatched;
+          shouldRunNumeric =
+            !hasTargetAccount ||
+            !primaryMatches.accountMatched ||
+            (hasTargetAmount && !primaryMatches.amountMatched);
+        }
+
+        const deferredTasks = [];
+        if (shouldRunGeneralFallback) {
+          executedGroups.push("general-fallback");
+          deferredTasks.push(runGroup(generalFallbackVariants));
+        } else {
+          skippedGroups.push({
+            group: "general-fallback",
+            reason: "当前证据缺口不需要 general fallback OCR"
+          });
+          deferredTasks.push(Promise.resolve([]));
+        }
+        if (shouldRunNumeric) {
+          executedGroups.push("numeric");
+          deferredTasks.push(runGroup(numericVariants));
+        } else {
+          skippedGroups.push({
+            group: "numeric",
+            reason: knownAccountMatched ? "账号已由其他来源命中" : "当前 OCR intent 不需要 numeric OCR"
+          });
+          deferredTasks.push(Promise.resolve([]));
+        }
+        [generalFallbackResults, numericResults] = await Promise.all(deferredTasks);
         const ocrResults = [
           ...generalPrimaryResults,
           ...generalFallbackResults,
           ...titleResults,
           ...numericResults
         ];
+        if (invoiceTypeHint) {
+          ocrResults.push({
+            label: "invoice-type-hint",
+            sourceVariant: "invoice-type-hint",
+            mode: "title",
+            text: `OCR票种提示：${invoiceTypeHint}`
+          });
+        }
         return {
           ok: true,
           text: ocrResults.map((item) => item.text).join("\n"),
@@ -726,8 +826,16 @@ async function extractImageTextSafeViaBridge(data, name = "image", target = {}, 
             generalFallbackVariantCount: generalFallbackVariants.length,
             shouldRunGeneralFallback,
             shouldRunNumeric,
+            shouldRunGeneralPrimary,
             primaryAmountMatched: primaryMatches.amountMatched,
             primaryAccountMatched: primaryMatches.accountMatched,
+            knownAmountMatched,
+            knownCompanyMatched,
+            knownAccountMatched,
+            invoiceTypeHint,
+            ocrIntent,
+            executedGroups,
+            skippedGroups,
             executedVariantCount: ocrTimings.length
           }
         };
@@ -743,8 +851,12 @@ async function extractImageTextSafeViaBridge(data, name = "image", target = {}, 
       mimeType,
       OCR_BRIDGE_KEY,
       {
-        paymentAmount: target?.paymentAmount || "",
-        payeeAccount: target?.payeeAccount || ""
+        target: {
+          paymentAmount: target?.paymentAmount || "",
+          payeeAccount: target?.payeeAccount || ""
+        },
+        intent: options?.ocrIntent || "full",
+        evidence: options?.ocrEvidence || {}
       }
     ],
     "标签页 OCR 解析失败"

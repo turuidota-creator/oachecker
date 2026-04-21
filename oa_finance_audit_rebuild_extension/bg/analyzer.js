@@ -164,11 +164,26 @@ function createAnalysisRuntime(timings = null) {
   return {
     attachmentTextCache: new Map(),
     limitAttachmentWork: createLimiter(3),
+    limitRelatedProcessWork: createLimiter(2),
     timings
   };
 }
 
-async function getAttachmentReferenceEntries(attachment, runtime = null, target = null) {
+function runRelatedProcessWork(runtime, label, task) {
+  const run = async () => {
+    runtime?.timings?.mark("related-process-slot-start", { taskLabel: label });
+    try {
+      return await task();
+    } finally {
+      runtime?.timings?.mark("related-process-slot-end", { taskLabel: label });
+    }
+  };
+  return typeof runtime?.limitRelatedProcessWork === "function"
+    ? runtime.limitRelatedProcessWork(run)
+    : run();
+}
+
+async function getAttachmentReferenceEntries(attachment, runtime = null, target = null, extractionOptions = {}) {
   const url = cleanText(attachment?.url || "");
   if (!url) {
     return { entries: [], downloaded: false, fromCache: false };
@@ -191,7 +206,11 @@ async function getAttachmentReferenceEntries(attachment, runtime = null, target 
       contentType: cleanText(binary.contentType || attachment?.contentType || ""),
       byteLength: bytes.byteLength
     };
-    const extractOptions = { target };
+    const extractOptions = {
+      target,
+      ocrIntent: extractionOptions?.ocrIntent || "full",
+      ocrEvidence: extractionOptions?.ocrEvidence || {}
+    };
     if (runtime?.timings) {
       extractOptions.onTiming = (label, detail = {}) => {
         runtime.timings.mark(label, {
@@ -227,6 +246,38 @@ async function getAttachmentReferenceEntries(attachment, runtime = null, target 
   });
   runtime.attachmentTextCache.set(url, task);
   return { ...(await task), fromCache: false };
+}
+
+function buildAttachmentExtractionOptions(attachment, matches = {}, knownMatches = {}) {
+  const role = classifyAttachmentRole(attachment);
+  const amountMatched = !!(matches?.amount || knownMatches?.amount);
+  const companyMatched = !!(matches?.company || knownMatches?.company);
+  const accountMatched = !!(matches?.account || knownMatches?.account);
+  const ocrEvidence = {
+    amountMatched,
+    companyMatched,
+    accountMatched,
+    role
+  };
+
+  if (role === "invoice") {
+    return {
+      ocrIntent: "invoice-gap-fill",
+      ocrEvidence
+    };
+  }
+
+  if (role === "bank_notice") {
+    return {
+      ocrIntent: "account-proof",
+      ocrEvidence
+    };
+  }
+
+  return {
+    ocrIntent: "full",
+    ocrEvidence
+  };
 }
 
 export async function analyzePageSnapshot(snapshot, tabId, onProgress = null) {
@@ -330,6 +381,19 @@ export async function analyzePageSnapshot(snapshot, tabId, onProgress = null) {
     attachments: normalizedAttachments,
     structuredInvoices: structuredInvoiceSources
   });
+  const invoiceStatusSignal =
+    flowType === "pr_payment"
+      ? findSnapshotSignal(enrichedSnapshot, [/暂未取得发票|未取得发票|发票后补|发票在附件|发票附件/i], "")
+      : "";
+  const contractStatusSignal =
+    flowType === "pr_payment"
+      ? findSnapshotSignal(enrichedSnapshot, [/充值无合同|无合同|暂未签订合同|无需合同|框架协议/i], "")
+      : "";
+  const { missingDomesticPrDoc, missingPurchaseOrderDoc, missingAcceptanceDoc } = buildPrPaymentMissingDocs(
+    flowType,
+    invoiceStatusSignal
+  );
+
   const pageAttachmentAnalysisTask = timings.time(
     "page-attachment-analysis",
     () => analyzeAttachmentList(
@@ -357,71 +421,12 @@ export async function analyzePageSnapshot(snapshot, tabId, onProgress = null) {
   );
   const contractResultTask = timings.time(
     "contract-analysis",
-    () => analyzeContractLinks(enrichedSnapshot?.relatedLinks || [], target, baseUrl, onProgress, analysisRuntime),
-    { linkCount: inventories.contractLinks.length }
-  );
-  const [pageAttachmentAnalysis, contractResult] = await Promise.all([pageAttachmentAnalysisTask, contractResultTask]);
-  const invoiceStatusSignal =
-    flowType === "pr_payment"
-      ? findSnapshotSignal(enrichedSnapshot, [/暂未取得发票|未取得发票|发票后补|发票在附件|发票附件/i], "")
-      : "";
-  const contractStatusSignal =
-    flowType === "pr_payment"
-      ? findSnapshotSignal(enrichedSnapshot, [/充值无合同|无合同|暂未签订合同|无需合同|框架协议/i], "")
-      : "";
-  /* const missingDomesticPrDoc =
-    flowType === "pr_payment"
-      ? createMissingSourceDocument({
-          kind: "domestic_pr",
-          title: "国内PR",
-          statement: "当前付款单未提供可直接打开的国内PR入口，且页内也未提取到PR子表",
-          relationHints: invoiceStatusSignal ? [`发票说明：${invoiceStatusSignal}`] : [],
-          notes: ["仅展示，不自动判断", "有PR付款优先读取真实PR详情，其次回退页内PR子表"]
-        })
-      : null;
-  const missingPurchaseOrderDoc =
-    flowType === "pr_payment"
-      ? createMissingSourceDocument({
-          kind: "purchase_order",
-          title: "采购订单",
-          statement: "当前付款单未提供采购订单入口，有PR付款通常以页内PR或附件作为主要来源",
-          relationHints: invoiceStatusSignal ? [`发票说明：${invoiceStatusSignal}`] : [],
-          notes: ["仅展示，不自动判断"]
-        })
-      : null;
-  const missingAcceptanceDoc =
-    flowType === "pr_payment"
-      ? createMissingSourceDocument({
-          kind: "acceptance",
-          title: "验收单",
-          statement: "当前付款单未提供验收入口，请结合付款页附件或关联流程人工判断",
-          relationHints: invoiceStatusSignal ? [`发票说明：${invoiceStatusSignal}`] : [],
-          notes: ["仅展示，不自动判断"]
-        })
-      : null;
-
-  */
-  const { missingDomesticPrDoc, missingPurchaseOrderDoc, missingAcceptanceDoc } = buildPrPaymentMissingDocs(
-    flowType,
-    invoiceStatusSignal
-  );
-
-  reportProgress(
-    onProgress,
-    "acceptance-link",
-    "正在核对附件",
-    inventories.acceptanceLinks.length > 0 ? `已发现 ${inventories.acceptanceLinks.length} 个验收入口` : "尚未发现明确验收入口"
-  );
-  const acceptanceDocsTask = timings.time(
-    "acceptance-docs-analysis",
-    () => analyzeAcceptanceMailLinksMulti(
-      enrichedSnapshot?.relatedLinks || [],
-      target,
-      baseUrl,
-      onProgress,
-      { missingDocument: missingAcceptanceDoc }
+    () => runRelatedProcessWork(
+      analysisRuntime,
+      "contract-analysis",
+      () => analyzeContractLinks(enrichedSnapshot?.relatedLinks || [], target, baseUrl, onProgress, analysisRuntime)
     ),
-    { linkCount: inventories.acceptanceLinks.length }
+    { linkCount: inventories.contractLinks.length, concurrencyLimit: 2 }
   );
 
   reportProgress(
@@ -432,17 +437,43 @@ export async function analyzePageSnapshot(snapshot, tabId, onProgress = null) {
   );
   const domesticPrDocsTask = timings.time(
     "domestic-pr-docs-analysis",
-    () => analyzeDomesticPrLinksMulti(
-      enrichedSnapshot?.relatedLinks || [],
-      target,
-      baseUrl,
-      onProgress,
-      {
-        snapshot: enrichedSnapshot,
-        missingDocument: missingDomesticPrDoc
-      }
+    () => runRelatedProcessWork(
+      analysisRuntime,
+      "domestic-pr-docs-analysis",
+      () => analyzeDomesticPrLinksMulti(
+        enrichedSnapshot?.relatedLinks || [],
+        target,
+        baseUrl,
+        onProgress,
+        {
+          snapshot: enrichedSnapshot,
+          missingDocument: missingDomesticPrDoc
+        }
+      )
     ),
-    { linkCount: inventories.domesticPrLinks.length }
+    { linkCount: inventories.domesticPrLinks.length, concurrencyLimit: 2 }
+  );
+
+  reportProgress(
+    onProgress,
+    "acceptance-link",
+    "正在核对附件",
+    inventories.acceptanceLinks.length > 0 ? `已发现 ${inventories.acceptanceLinks.length} 个验收入口` : "尚未发现明确验收入口"
+  );
+  const acceptanceDocsTask = timings.time(
+    "acceptance-docs-analysis",
+    () => runRelatedProcessWork(
+      analysisRuntime,
+      "acceptance-docs-analysis",
+      () => analyzeAcceptanceMailLinksMulti(
+        enrichedSnapshot?.relatedLinks || [],
+        target,
+        baseUrl,
+        onProgress,
+        { missingDocument: missingAcceptanceDoc }
+      )
+    ),
+    { linkCount: inventories.acceptanceLinks.length, concurrencyLimit: 2 }
   );
 
   reportProgress(
@@ -453,18 +484,24 @@ export async function analyzePageSnapshot(snapshot, tabId, onProgress = null) {
   );
   const purchaseOrderResultTask = timings.time(
     "purchase-order-analysis",
-    () => analyzePurchaseOrderLinks(
-      enrichedSnapshot?.relatedLinks || [],
-      target,
-      baseUrl,
-      onProgress,
-      { missingDocument: missingPurchaseOrderDoc }
+    () => runRelatedProcessWork(
+      analysisRuntime,
+      "purchase-order-analysis",
+      () => analyzePurchaseOrderLinks(
+        enrichedSnapshot?.relatedLinks || [],
+        target,
+        baseUrl,
+        onProgress,
+        { missingDocument: missingPurchaseOrderDoc }
+      )
     ),
-    { linkCount: inventories.purchaseOrderLinks.length }
+    { linkCount: inventories.purchaseOrderLinks.length, concurrencyLimit: 2 }
   );
-  const [acceptanceDocs, domesticPrDocs, purchaseOrderResult] = await Promise.all([
-    acceptanceDocsTask,
+  const [pageAttachmentAnalysis, contractResult, domesticPrDocs, acceptanceDocs, purchaseOrderResult] = await Promise.all([
+    pageAttachmentAnalysisTask,
+    contractResultTask,
     domesticPrDocsTask,
+    acceptanceDocsTask,
     purchaseOrderResultTask
   ]);
 
@@ -3610,7 +3647,8 @@ async function analyzeAttachmentList(attachments, target, sourceLabelPrefix, onP
         );
 
         try {
-          const result = await getAttachmentReferenceEntries(attachment, options?.runtime, target);
+          const extractionOptions = buildAttachmentExtractionOptions(attachment, matches, options?.knownMatches || {});
+          const result = await getAttachmentReferenceEntries(attachment, options?.runtime, target, extractionOptions);
           if (result.downloaded) {
             stats.downloadedCount += 1;
           }

@@ -246,3 +246,13 @@
 - 现象：同一批 OA 案例端到端对比只有约 2% 变化，但总耗时包含 Edge 启动、登录、页面固定等待、截图和浏览器关闭，容易掩盖合同、附件、OCR 子阶段的真实变化。
 - 原则：回放脚本负责记录外层阶段，扩展 `debug.timings` 负责记录内部分析阶段；两层数据都写入单案 `result.json`，不要只看一条总耗时。
 - 动作：`scripts/test_rebuild_single_case.py` 输出 `timings.entries`，`analyzer.js` 输出 `analysis.debug.timings`；附件阶段细分 `attachment-fetch/extract/batch`，图片 OCR 再记录 `image-ocr-plan` 和每个 `image-ocr-variant`。
+
+### 2026-04-21 关联流程提速优先调启动波次
+- 现象：`DDFK-202604100023` 内部分析约 13.5s，其中合同约 3.6s、国内 PR 约 7.3s；原链路先等付款页附件和合同完成，再启动国内 PR/验收/采购订单，导致最长 PR 阶段被排到第二波。
+- 原则：不省略合同、PR、验收、采购订单读取时，可以先调整启动时机；关联流程读取必须有独立并发槽，避免详情 API 和隐藏 Tab 同时打满 OA。
+- 动作：在单次 `analysisRuntime` 内增加 `limitRelatedProcessWork=2`，合同和国内 PR 优先拿槽，验收与采购订单排队执行；计时里用 `related-process-slot-start/end` 观察真实排队情况。
+
+### 2026-04-21 图片 OCR 早停必须按证据缺口
+- 现象：多张发票图片单据会为每张图片执行 title/general/numeric 全变体，即使金额和公司已经由结构化发票明细命中，仍会重复跑重 OCR。
+- 原则：金额核对不能省，但应优先使用结构化发票证据；发票图片必须保留 title OCR 识别票种，只有金额/公司/账号仍有缺口时才补全图或 numeric OCR。
+- 动作：给图片 OCR 增加 `ocrIntent` 与 `ocrEvidence`，发票图走 `invoice-gap-fill`，账户证明图走 `account-proof`，未知图片保留 `full` 旧逻辑；`image-ocr-plan` 记录执行和跳过的 group。
