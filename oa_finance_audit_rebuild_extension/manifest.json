@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "OA 付款审核",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "财务付款审核插件。",
   "permissions": [
     "storage",

@@ -52,7 +52,7 @@ import { buildContractSummaryProviderMeta, generateContractSummary } from "./con
 import { extractMailEvidenceFromAttachment, extractReferenceTextsFromAttachment } from "./extract.js";
 import { acquireOcrBridge, releaseOcrBridge } from "./ocr_bridge.js";
 
-export const BUILD_TAG = "rebuild-phase5-payee-account-cache-2026-04-21";
+export const BUILD_TAG = "rebuild-phase5-payee-account-history-sourceinst-2026-04-21";
 
 const GENERIC_PROCESS_CODE_RE = /\b[A-Z]{2,10}-\d{8,}\b/i;
 const DOMESTIC_PR_CODE_RE = /\bGNPR-\d{8,}\b/i;
@@ -2080,7 +2080,7 @@ function buildInlineContractRowHints(item) {
 
 function withSourceInstId(ref, sourceInstId) {
   const source = cleanText(sourceInstId || "");
-  if (!ref || ref.mode !== "flowable" || ref.sourceInstId || !source || ref.detailId === source) {
+  if (!ref || ref.sourceInstId || !source || ref.detailId === source) {
     return ref;
   }
 
@@ -3287,17 +3287,31 @@ async function analyzeContractLinks(relatedLinks, target, baseUrl, onProgress, r
         : analyzeContractDetail(ref, flowableAttachments, baseFacts, target, "合同页", onProgress, flowablePageSnapshot, { runtime });
     }
 
-      const detail = runtime?.timings
-        ? await runtime.timings.time("contract-history-api", () => fetchHistoryDetail(ref, baseUrl), {
-            detailId: ref.detailId || ""
+      let detail = null;
+      let historyApiError = "";
+      const loadHistoryDetail = async () => {
+        try {
+          return await fetchHistoryDetail(ref, baseUrl);
+        } catch (error) {
+          historyApiError = normalizeError(error);
+          return null;
+        }
+      };
+      detail = runtime?.timings
+        ? await runtime.timings.time("contract-history-api", loadHistoryDetail, {
+            detailId: ref.detailId || "",
+            sourceInstIdPreserved: !!ref.sourceInstId
           })
-        : await fetchHistoryDetail(ref, baseUrl);
+        : await loadHistoryDetail();
       const historyPageSnapshot = runtime?.timings
         ? await runtime.timings.time("contract-history-tab-snapshot", () => collectPageSnapshotFromUrl(ref.detailUrl).catch(() => null), {
             detailId: ref.detailId || "",
             sourceInstIdPreserved: !!ref.sourceInstId
           })
         : await collectPageSnapshotFromUrl(ref.detailUrl).catch(() => null);
+      if (!detail && !historyPageSnapshot) {
+        throw new Error(historyApiError || "历史合同详情读取失败");
+      }
       const mainForm = detail?.formData?.mainForm || {};
       const baseFacts = {
         processCode: firstNonEmpty(findHistoryField(mainForm, "合同编号", "采购合同编号")),
@@ -3331,7 +3345,7 @@ async function analyzeContractLinks(relatedLinks, target, baseUrl, onProgress, r
         sourceUrl: ref.detailUrl
       };
       const historyAttachments = mergeAttachmentCandidates(
-        buildHistoryAttachmentList(detail),
+        detail ? buildHistoryAttachmentList(detail) : [],
         Array.isArray(historyPageSnapshot?.attachments) ? historyPageSnapshot.attachments : []
       );
       return runtime?.timings
@@ -4176,11 +4190,11 @@ function buildAccountVerification(target, inventories, matched) {
     "收款账号一致",
     "warn",
     hasInvoice
-      ? "发票来源未命中收款账号，验收页及合同页附件作为补充来源"
+      ? "付款页已识别收款账号，但发票/合同/附件未找到同账号，需人工确认"
       : hasFallback
-        ? "已发现合同侧账号，但发票来源未命中收款账号"
-        : "尚未发现可用于核实收款账号的外部来源",
-    "",
+        ? "付款页已识别收款账号，但合同/附件未找到同账号，需人工确认"
+        : "付款页已识别收款账号，但尚未发现可用于核实账号的外部来源",
+    "付款单页",
     "",
     target.payeeAccount,
     `付款单收款账号：${target.payeeAccount}`

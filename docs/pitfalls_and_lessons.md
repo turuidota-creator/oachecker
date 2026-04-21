@@ -127,6 +127,12 @@
 - 原则：发布同步前先查本文件的共享目录约定，并以用户给出的 UNC 路径为准；除非明确要求归档 zip，否则不要只同步压缩包。
 - 动作：正式发布时更新源扩展根的 `git更新日志.txt`，再把 `oa_finance_audit_rebuild_extension/` 展开内容同步到内网共享目录并校验 `manifest.json` 版本。
 
+### 2026-04-21 History 合同也要补 sourceInstId
+
+- 现象：`GNTYYFK-202604200001` 的付款页能识别收款账号 `110922785710109`，但 history 合同链接缺少 `sourceInstId` 时会报“当前用户无权限”，导致合同侧账号/条款完全不能参与核对。
+- 原则：`sourceInstId` 不是 flowable 专属；history 合同、合同编号反查、从表链接和正文扫描出来的关联流程都要保留付款单实例上下文。账号校验文案也要区分“付款页账号已识别”和“外部材料未命中同账号”。
+- 动作：`parseProcessRef` 读取 history URL 的 `sourceInstId`，`withSourceInstId`/`withFallbackSourceInstId` 对 history 同样补参，history API 请求带上 `sourceInstId`；补充 process link 回归测试并更新 `BUILD_TAG`。
+
 ### 2026-04-16 PR付款链路核查
 
 - 现象：容易把 PR付款当成独立落后模块；实际 `GNTYYFK-*` 和 `DDFK-*` 共享同一套主分析、缓存和 OCR 管线。

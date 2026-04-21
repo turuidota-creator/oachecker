@@ -1,12 +1,13 @@
 {
   "name": "oa-finance-audit-rebuild-extension",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Rebuild workspace for the OA finance audit extension.",
   "main": "background.js",
   "scripts": {
-    "test": "npm run test:ocr-guards && npm run test:cache-guards",
+    "test": "npm run test:ocr-guards && npm run test:cache-guards && npm run test:process-links",
     "test:ocr-guards": "node ../scripts/test_extract_ocr_guards.mjs",
     "test:cache-guards": "node ../scripts/test_cache_guards.mjs",
+    "test:process-links": "node ../scripts/test_process_link_refs.mjs",
     "probe:public-ocr": "node ../scripts/probe_public_invoice_ocr.mjs"
   },
   "keywords": [

@@ -92,12 +92,13 @@ export function parseProcessRef(url, relation) {
 
   const historyMatch = normalized.match(HISTORY_LINK_RE);
   if (historyMatch) {
+    const parsed = new URL(normalized);
     return {
       mode: "history",
       detailId: historyMatch[1],
       detailUrl: normalized,
       relation,
-      sourceInstId: ""
+      sourceInstId: parsed.searchParams.get("sourceInstId") || ""
     };
   }
 
@@ -232,6 +233,7 @@ export async function buildFlowableInvoiceEvidenceList(detail, baseUrl) {
 
 export async function fetchHistoryDetail(ref, baseUrl) {
   const params = new URLSearchParams({ requestId: ref.detailId, source: "monitor" });
+  if (ref.sourceInstId) params.set("sourceInstId", ref.sourceInstId);
   const payload = await fetchJson(`${baseUrl}/cyouNeiOaServer/history/flow/detail?${params.toString()}`);
   if (payload.code !== 200) throw new Error(payload.msg || "读取历史流程详情失败");
   return payload.data || {};
@@ -572,7 +574,7 @@ function extractRefsFromLikelyFlowRows(flow, currentDetailId) {
 
 function withFallbackSourceInstId(ref, currentDetailId) {
   const sourceInstId = cleanText(currentDetailId || "");
-  if (!ref || ref.mode !== "flowable" || ref.sourceInstId || !sourceInstId || ref.detailId === sourceInstId) {
+  if (!ref || ref.sourceInstId || !sourceInstId || ref.detailId === sourceInstId) {
     return ref;
   }
 
