@@ -1156,6 +1156,14 @@
     return periodMeta.short ? `${baseTitle} ${periodMeta.short}` : baseTitle;
   }
 
+  function buildDomesticPrAmountEntries(fields) {
+    return [
+      { label: "PR总额", value: usefulSourceName(fields?.prAmount) },
+      { label: "本次提交", value: usefulSourceName(fields?.prCurrentSubmitAmount) },
+      { label: "待提金额", value: usefulSourceName(fields?.prPendingAmount) }
+    ].filter((item) => hasMeaningfulText(item.value));
+  }
+
   function buildRelatedHoverLines(doc) {
     if (!doc) {
       return [];
@@ -1167,6 +1175,10 @@
       if (hasMeaningfulText(periodMeta.text || periodMeta.short)) {
         lines.push(`费用期间：${periodMeta.text || periodMeta.short}`);
       }
+      buildDomesticPrAmountEntries(doc.fields).forEach((item) => {
+        const label = item.label === "本次提交" ? "PR本次提交金额" : item.label === "待提金额" ? "PR未提交付款金额" : item.label;
+        lines.push(`${label}：${item.value}`);
+      });
       if (hasMeaningfulText(doc.fields?.relatedTitle)) {
         lines.push(`相关流程：${doc.fields.relatedTitle}`);
       }
@@ -1178,12 +1190,6 @@
       }
       if (hasMeaningfulText(doc.fields?.prStatus)) {
         lines.push(`PR状态：${doc.fields.prStatus}`);
-      }
-      if (hasMeaningfulText(doc.fields?.prCurrentSubmitAmount)) {
-        lines.push(`PR本次提交金额：${doc.fields.prCurrentSubmitAmount}`);
-      }
-      if (hasMeaningfulText(doc.fields?.prPendingAmount)) {
-        lines.push(`PR未提交付款金额：${doc.fields.prPendingAmount}`);
       }
       return lines;
     }
@@ -1384,6 +1390,9 @@
     if (doc.kind === "domestic_pr") {
       const periodMeta = buildDomesticPrPeriodMeta(doc);
       pushKvRow(rows, "费用期间", periodMeta.text || periodMeta.short);
+      buildDomesticPrAmountEntries(doc.fields).forEach((item) => {
+        pushKvRow(rows, item.label, item.value);
+      });
       if (hasMeaningfulText(doc.fields?.requirementSummary || doc.fields?.relatedTitle || doc.fields?.costPurpose || doc.fields?.purposeText)) {
         pushKvRow(rows, "需求描述", summarizeDisplayText(doc.fields?.requirementSummary || doc.fields?.relatedTitle || doc.fields?.costPurpose || doc.fields?.purposeText, 180));
       } else {
@@ -1391,7 +1400,6 @@
       }
       pushKvRow(rows, "PR单号", usefulSourceName(doc.fields?.processCode));
       pushKvRow(rows, "PR状态", usefulSourceName(doc.fields?.prStatus));
-      pushKvRow(rows, "本次提交", usefulSourceName(doc.fields?.prCurrentSubmitAmount));
       pushKvRow(rows, "费用归属部门", summarizeDisplayText(doc.fields?.costDept, 120));
     }
 

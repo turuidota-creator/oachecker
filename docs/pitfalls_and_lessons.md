@@ -211,3 +211,13 @@
 - 现象：`GNTYYFK-202604140005` 页面字段已能采到 `银行账号=1907066219022111254`，本地现跑也能通过账号核对；用户仍看到未识别时，最可能是当天旧缓存被详情页/列表页回放。
 - 原则：分析结果缓存必须要求 `entry.buildTag === BUILD_TAG`，不能让缺少 `buildTag` 的历史缓存继续算新缓存；涉及字段识别修复时要同步 bump `BUILD_TAG` 和扩展版本。
 - 动作：收紧 `background.js` 缓存新鲜度判断，bump `BUILD_TAG` 到 `rebuild-phase5-payee-account-cache-2026-04-21`，并新增缓存守卫测试，防止旧缓存绕过字段修复。
+
+### 2026-04-21 OCR 分组并行要改调用端而不是桥接层
+- 现象：OCR bridge 已经按 `general/numeric/title` 维护独立 worker 和 `queueByMode`，图片附件慢的主因是 `extract.js` 对 11 个图片变体逐个 `await bridge.recognize(...)`。
+- 原则：同一 OCR 模式内仍要串行保护 Tesseract worker，跨 `general/title/numeric` 模式可以并行启动；票种 title 变体不能因金额或账号已命中而省略，且每条 OCR 文本要保留 `sourceVariant`/`mode` 后再去重合并。
+- 动作：实施分组并行时，先把 `top-title-red-removed` 从默认 general 归入 title mode；general 先跑原图和灰度增强，red-removed/threshold 与 numeric 区域按命中结果补跑，最终只在金额、账号、稳定票种和全部 title 变体完成后允许短路。
+
+### 2026-04-21 合同 Tab 和附件并发优化要保守判定
+- 现象：flowable 合同分支当前总是 `fetchFlowableDetail` 后再开隐藏 Tab 采 DOM 快照，附件分析则逐个下载解析；这两处都是详情页耗时大头。
+- 原则：只有 API 已覆盖合同相对方、账号核对所需字段、合同期限/付款条款和附件列表时才能跳过 Tab；`collectPageSnapshotFromUrl(ref.detailUrl)` 必须保留 `sourceInstId`。附件并发应使用单次分析内的全局信号量，不能让付款页附件和合同附件各自开 3 并发后叠加打满 OA。
+- 动作：`extractFlowableFacts` 不能直接作为合同充分性唯一依据，需补合同字段如 `HT010/HT013/HT014/HT032/HT033/HT030-HT035`；解析结果缓存只做单次分析内瞬态文本缓存，不写入 storage，不缓存 COS 签名 URL 或二进制。

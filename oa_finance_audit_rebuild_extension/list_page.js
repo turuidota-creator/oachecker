@@ -1229,10 +1229,11 @@
         const meta = joinMeaningfulTexts(
           [
             cleanText(item?.fields?.processCode),
+            cleanText(item?.fields?.prAmount) ? `PR总额：${cleanText(item?.fields?.prAmount)}` : "",
             cleanText(item?.fields?.prCurrentSubmitAmount) ? `本次提交：${cleanText(item?.fields?.prCurrentSubmitAmount)}` : "",
             cleanText(item?.fields?.prStatus) ? `状态：${cleanText(item?.fields?.prStatus)}` : ""
           ],
-          3,
+          4,
           " ｜ "
         );
         const title = cleanText(item?.fields?.processCode) || `PR ${index + 1}`;
