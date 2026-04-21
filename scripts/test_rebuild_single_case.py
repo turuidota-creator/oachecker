@@ -26,6 +26,16 @@ USERNAME = "turui"
 PASSWORD = "1qaz@WSX#EDC"
 
 
+def record_timing(timings: List[Dict[str, Any]], label: str, started_at: float, **extra: Any) -> None:
+    timings.append(
+        {
+            "label": label,
+            "durationMs": round((time.perf_counter() - started_at) * 1000, 1),
+            **extra,
+        }
+    )
+
+
 def login_page(page: Any, username: str, password: str) -> None:
     page.goto(f"{BASE_URL}/index", wait_until="domcontentloaded", timeout=60000)
     page.wait_for_timeout(2000)
@@ -70,10 +80,17 @@ def collect_panel_state(page: Any) -> Dict[str, Any]:
     )
 
 
-def wait_for_analysis(page: Any) -> Dict[str, Any]:
+def wait_for_analysis(page: Any, timings: List[Dict[str, Any]]) -> Dict[str, Any]:
+    started_at = time.perf_counter()
     page.wait_for_selector("#oa-finance-rebuild-root", timeout=60000)
-    page.locator("#oa-finance-rebuild-root .oa-finance-rebuild-run").click()
+    record_timing(timings, "analysis-root-wait", started_at)
 
+    started_at = time.perf_counter()
+    page.locator("#oa-finance-rebuild-root .oa-finance-rebuild-run").click()
+    record_timing(timings, "analysis-button-click", started_at)
+
+    wait_status = "ok"
+    started_at = time.perf_counter()
     try:
         page.wait_for_function(
             """
@@ -85,24 +102,38 @@ def wait_for_analysis(page: Any) -> Dict[str, Any]:
             timeout=240000,
         )
     except PlaywrightTimeoutError:
-        pass
+        wait_status = "timeout"
+    record_timing(timings, "analysis-json-wait", started_at, status=wait_status)
 
+    started_at = time.perf_counter()
     page.wait_for_timeout(3000)
-    return collect_panel_state(page)
+    record_timing(timings, "analysis-post-wait", started_at)
+
+    started_at = time.perf_counter()
+    panel_state = collect_panel_state(page)
+    record_timing(timings, "analysis-panel-collect", started_at)
+    return panel_state
 
 
 def main() -> int:
+    script_started_at = time.perf_counter()
     target_url = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_TARGET_URL
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     output_dir = OUTPUT_ROOT / f"run_{timestamp}"
     output_dir.mkdir(parents=True, exist_ok=True)
+    timings: List[Dict[str, Any]] = []
+
+    started_at = time.perf_counter()
+    profile_removed = PROFILE_DIR.exists()
     if PROFILE_DIR.exists():
         shutil.rmtree(PROFILE_DIR)
+    record_timing(timings, "profile-reset", started_at, removed=profile_removed)
 
     console_logs: List[Dict[str, str]] = []
     page_errors: List[str] = []
 
     with sync_playwright() as playwright:
+        started_at = time.perf_counter()
         context = playwright.chromium.launch_persistent_context(
             str(PROFILE_DIR),
             headless=False,
@@ -116,26 +147,46 @@ def main() -> int:
             ],
             viewport={"width": 1600, "height": 1200},
         )
+        record_timing(timings, "browser-launch", started_at)
+
+        started_at = time.perf_counter()
         page = context.pages[0] if context.pages else context.new_page()
+        record_timing(timings, "page-create", started_at)
 
         page.on("console", lambda msg: console_logs.append({"type": msg.type, "text": msg.text}))
         page.on("pageerror", lambda exc: page_errors.append(str(exc)))
 
+        started_at = time.perf_counter()
         login_page(page, USERNAME, PASSWORD)
-        page.goto(target_url, wait_until="domcontentloaded", timeout=120000)
-        page.wait_for_timeout(5000)
+        record_timing(timings, "login", started_at, finalUrl=page.url)
 
-        panel_state = wait_for_analysis(page)
+        started_at = time.perf_counter()
+        page.goto(target_url, wait_until="domcontentloaded", timeout=120000)
+        record_timing(timings, "target-goto", started_at, finalUrl=page.url)
+
+        started_at = time.perf_counter()
+        page.wait_for_timeout(5000)
+        record_timing(timings, "target-settle-wait", started_at)
+
+        panel_state = wait_for_analysis(page, timings)
         screenshot_path = output_dir / "panel.png"
+
+        started_at = time.perf_counter()
         page.screenshot(path=str(screenshot_path), full_page=True)
+        record_timing(timings, "screenshot", started_at)
+
+        started_at = time.perf_counter()
         context.close()
+        record_timing(timings, "browser-close", started_at)
 
     analysis = None
+    started_at = time.perf_counter()
     if panel_state.get("analysisJson"):
-      try:
-        analysis = json.loads(panel_state["analysisJson"])
-      except json.JSONDecodeError:
-        analysis = None
+        try:
+            analysis = json.loads(panel_state["analysisJson"])
+        except json.JSONDecodeError:
+            analysis = None
+    record_timing(timings, "analysis-json-parse", started_at, parsed=analysis is not None)
 
     result = {
         "url": target_url,
@@ -144,6 +195,10 @@ def main() -> int:
         "console_logs": console_logs,
         "page_errors": page_errors,
         "screenshot": str(screenshot_path),
+        "timings": {
+            "totalDurationMs": round((time.perf_counter() - script_started_at) * 1000, 1),
+            "entries": timings,
+        },
     }
 
     (output_dir / "result.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")

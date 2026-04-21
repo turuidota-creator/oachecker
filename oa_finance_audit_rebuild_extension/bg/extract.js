@@ -6,11 +6,11 @@ import { initOcrBridge, OCR_BRIDGE_KEY } from "./ocr_bridge.js";
 
 const OCR_LANG_PATH = chrome.runtime.getURL("assets/tessdata");
 
-export async function extractReferenceTextsFromAttachment(attachment, bytes, contentType = "") {
+export async function extractReferenceTextsFromAttachment(attachment, bytes, contentType = "", options = {}) {
   const kind = detectAttachmentKind(attachment, bytes, contentType);
   if (!kind) return [];
   if (kind === "zip") return extractZipReferenceTexts(bytes);
-  const text = await extractAttachmentReferenceText(attachment, bytes, kind);
+  const text = await extractAttachmentReferenceText(attachment, bytes, kind, options);
   return text ? [{ name: attachment?.name || "attachment", text }] : [];
 }
 
@@ -80,7 +80,7 @@ function mergeUniqueTexts(values) {
   return unique.join("\n");
 }
 
-async function extractAttachmentReferenceText(attachment, bytes, kind) {
+async function extractAttachmentReferenceText(attachment, bytes, kind, options = {}) {
   if (kind === "pdf") return extractPdfText(bytes);
   if (kind === "docx") return extractDocxText(bytes);
   if (kind === "spreadsheet") return extractSpreadsheetText(bytes);
@@ -88,7 +88,7 @@ async function extractAttachmentReferenceText(attachment, bytes, kind) {
   if (kind === "plain") return decodeBytesSmart(bytes);
   if (kind === "xml") return extractXmlText(decodeBytesSmart(bytes));
   if (kind === "rtf") return extractRtfText(bytes);
-  if (kind === "image") return extractImageTextSafeViaBridge(bytes, attachment?.name || "image");
+  if (kind === "image") return extractImageTextSafeViaBridge(bytes, attachment?.name || "image", options?.target || {}, options);
   if (kind === "eml") return (await extractEmlEvidence(bytes))?.text || "";
   if (kind === "msg") return (await extractMsgEvidenceHeuristically(bytes, attachment?.name || "mail.msg"))?.text || "";
   return "";
@@ -395,7 +395,7 @@ async function extractZipReferenceTexts(data) {
   }
 }
 
-async function extractImageTextSafeViaBridge(data, name = "image") {
+async function extractImageTextSafeViaBridge(data, name = "image", target = {}, options = {}) {
   if (!data || data.byteLength < 128) return "";
   const tabId = getCurrentPageTabId();
   if (!Number.isInteger(tabId)) {
@@ -406,7 +406,7 @@ async function extractImageTextSafeViaBridge(data, name = "image") {
   const base64 = uint8ArrayToBase64(data);
   const payload = await executeInTab(
     tabId,
-    async (inputBase64, inputMimeType, bridgeKey) => {
+    async (inputBase64, inputMimeType, bridgeKey, ocrTarget) => {
       try {
         const loadImageFromBlob = (blob) =>
           new Promise((resolve, reject) => {
@@ -542,7 +542,7 @@ async function extractImageTextSafeViaBridge(data, name = "image") {
             const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
             whitenRedPixels(imageData.data, true);
             context.putImageData(imageData, 0, 0);
-            pushCanvas("top-title-red-removed", canvas);
+            pushCanvas("top-title-red-removed", canvas, "title");
           }
 
           {
@@ -608,14 +608,129 @@ async function extractImageTextSafeViaBridge(data, name = "image") {
           throw new Error("OCR bridge not initialized");
         }
         const variants = await buildVariants(new Blob([bytes], { type: inputMimeType }));
-        const texts = [];
-        for (const variant of variants) {
-          const recognizedText = await bridge.recognize(variant.dataUrl, variant.mode);
-          if (recognizedText) {
-            texts.push(recognizedText);
+        const normalizeAccount = (value) =>
+          String(value || "")
+            .replace(/[Oo]/g, "0")
+            .replace(/[Iil|]/g, "1")
+            .replace(/[Ss]/g, "5")
+            .replace(/[^\d]/g, "");
+        const parseAmount = (value) => {
+          const match = String(value || "")
+            .replaceAll(",", "")
+            .replace(/[¥￥元圆整\s]/g, "")
+            .match(/-?\d+(?:\.\d+)?/);
+          return match ? Number.parseFloat(match[0]) : 0;
+        };
+        const amountMatchesTarget = (text, amount) => {
+          const targetAmount = parseAmount(amount);
+          if (!targetAmount) {
+            return false;
           }
-        }
-        return { ok: true, text: texts.join("\n") };
+          const tokens = String(text || "").match(/-?\d[\d,\s]*(?:\.\d+)?/g) || [];
+          return tokens.some((token) => Math.abs(parseAmount(token) - targetAmount) < 0.01);
+        };
+        const accountMatchesTarget = (text, account) => {
+          const targetAccount = normalizeAccount(account);
+          return targetAccount && targetAccount.length >= 6
+            ? normalizeAccount(text).includes(targetAccount)
+            : false;
+        };
+        const evaluateTargetMatches = (results) => {
+          const combined = results.map((item) => item?.text || "").join("\n");
+          return {
+            amountMatched: amountMatchesTarget(combined, ocrTarget?.paymentAmount),
+            accountMatched: accountMatchesTarget(combined, ocrTarget?.payeeAccount)
+          };
+        };
+        const ocrTimings = [];
+        const runVariant = async (variant) => {
+          const startedAt = Date.now();
+          try {
+            const recognizedText = await bridge.recognize(variant.dataUrl, variant.mode);
+            ocrTimings.push({
+              sourceVariant: variant.label,
+              mode: variant.mode || "general",
+              durationMs: Date.now() - startedAt,
+              status: "ok",
+              textLength: String(recognizedText || "").length
+            });
+            if (recognizedText) {
+              return {
+                label: variant.label,
+                sourceVariant: variant.label,
+                mode: variant.mode || "general",
+                text: recognizedText
+              };
+            }
+            return null;
+          } catch (error) {
+            ocrTimings.push({
+              sourceVariant: variant.label,
+              mode: variant.mode || "general",
+              durationMs: Date.now() - startedAt,
+              status: "error",
+              error: error?.message || String(error)
+            });
+            throw error;
+          }
+        };
+        const runGroup = async (group) => {
+          const results = [];
+          for (const variant of group) {
+            const result = await runVariant(variant);
+            if (result) {
+              results.push(result);
+            };
+          }
+          return results;
+        };
+        const titleVariants = variants.filter((variant) => variant.mode === "title");
+        const numericVariants = variants.filter((variant) => variant.mode === "numeric");
+        const generalPrimaryVariants = variants.filter((variant) => ["original", "grayscale-boost"].includes(variant.label));
+        const generalFallbackVariants = variants.filter((variant) => ["red-removed", "threshold"].includes(variant.label));
+        const titleTask = runGroup(titleVariants);
+        const generalPrimaryResults = await runGroup(generalPrimaryVariants);
+        const primaryMatches = evaluateTargetMatches(generalPrimaryResults);
+        const hasTargetAmount = !!String(ocrTarget?.paymentAmount || "").trim();
+        const hasTargetAccount = !!String(ocrTarget?.payeeAccount || "").trim();
+        const shouldRunGeneralFallback =
+          !hasTargetAmount ||
+          !hasTargetAccount ||
+          !primaryMatches.amountMatched ||
+          !primaryMatches.accountMatched;
+        const shouldRunNumeric =
+          !hasTargetAccount ||
+          !primaryMatches.accountMatched ||
+          (hasTargetAmount && !primaryMatches.amountMatched);
+        const [generalFallbackResults, numericResults, titleResults] = await Promise.all([
+          shouldRunGeneralFallback ? runGroup(generalFallbackVariants) : [],
+          shouldRunNumeric ? runGroup(numericVariants) : [],
+          titleTask
+        ]);
+        const ocrResults = [
+          ...generalPrimaryResults,
+          ...generalFallbackResults,
+          ...titleResults,
+          ...numericResults
+        ];
+        return {
+          ok: true,
+          text: ocrResults.map((item) => item.text).join("\n"),
+          ocrResults,
+          ocrTimings,
+          ocrPlan: {
+            variantCount: variants.length,
+            titleVariantCount: titleVariants.length,
+            numericVariantCount: numericVariants.length,
+            generalPrimaryVariantCount: generalPrimaryVariants.length,
+            generalFallbackVariantCount: generalFallbackVariants.length,
+            shouldRunGeneralFallback,
+            shouldRunNumeric,
+            primaryAmountMatched: primaryMatches.amountMatched,
+            primaryAccountMatched: primaryMatches.accountMatched,
+            executedVariantCount: ocrTimings.length
+          }
+        };
       } catch (error) {
         return {
           ok: false,
@@ -623,9 +738,25 @@ async function extractImageTextSafeViaBridge(data, name = "image") {
         };
       }
     },
-    [base64, mimeType, OCR_BRIDGE_KEY],
+    [
+      base64,
+      mimeType,
+      OCR_BRIDGE_KEY,
+      {
+        paymentAmount: target?.paymentAmount || "",
+        payeeAccount: target?.payeeAccount || ""
+      }
+    ],
     "标签页 OCR 解析失败"
   );
+  if (typeof options?.onTiming === "function") {
+    if (payload.ocrPlan) {
+      options.onTiming("image-ocr-plan", payload.ocrPlan);
+    }
+    for (const timing of payload.ocrTimings || []) {
+      options.onTiming("image-ocr-variant", timing);
+    }
+  }
   return mergeUniqueTexts(String(payload.text || "").split(/\n+/));
 }
 

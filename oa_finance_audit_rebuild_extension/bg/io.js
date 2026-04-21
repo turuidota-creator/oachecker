@@ -115,12 +115,12 @@ export async function collectPageSnapshotFromUrl(url) {
 
   try {
     await waitForTabLoad(tabId, 120000);
-    await delay(1500);
+    await delay(800);
     await executeScriptFile(tabId, "page/collector.js");
     let bestSnapshot = null;
     let bestScore = -1;
 
-    for (let attempt = 0; attempt < 12; attempt += 1) {
+    for (let attempt = 0; attempt < 6; attempt += 1) {
       const snapshot = await executeScriptFunction(tabId, () => {
         return globalThis.OAFinanceRebuildCollector?.collectPageSnapshot?.() || null;
       });
@@ -136,11 +136,11 @@ export async function collectPageSnapshotFromUrl(url) {
         bestScore = score;
       }
 
-      if ((snapshot?.subformRows?.length || 0) > 0 || (snapshot?.fieldPairs?.length || 0) >= 12) {
+      if ((snapshot?.subformRows?.length || 0) > 0 || (snapshot?.fieldPairs?.length || 0) >= 6) {
         return snapshot;
       }
 
-      await delay(1000);
+      await delay(800);
     }
 
     return bestSnapshot;

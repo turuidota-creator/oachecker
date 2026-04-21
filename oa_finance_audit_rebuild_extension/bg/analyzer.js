@@ -77,26 +77,198 @@ function reportProgress(onProgress, phase, text, detail = "") {
   }
 }
 
+function createTimingRecorder() {
+  const origin = Date.now();
+  const entries = [];
+  const elapsed = () => Date.now() - origin;
+
+  const push = (entry) => {
+    entries.push({
+      at: new Date().toISOString(),
+      atMs: elapsed(),
+      ...entry
+    });
+  };
+
+  return {
+    mark(label, detail = {}) {
+      push({
+        type: "mark",
+        label,
+        ...detail
+      });
+    },
+    async time(label, task, detail = {}) {
+      const startedAtMs = elapsed();
+      try {
+        const value = await task();
+        push({
+          type: "duration",
+          label,
+          startedAtMs,
+          durationMs: elapsed() - startedAtMs,
+          status: "ok",
+          ...detail
+        });
+        return value;
+      } catch (error) {
+        push({
+          type: "duration",
+          label,
+          startedAtMs,
+          durationMs: elapsed() - startedAtMs,
+          status: "error",
+          error: normalizeError(error),
+          ...detail
+        });
+        throw error;
+      }
+    },
+    snapshot() {
+      return {
+        totalMs: elapsed(),
+        entries: entries.slice()
+      };
+    }
+  };
+}
+
+function createLimiter(concurrency) {
+  const limit = Math.max(1, Number(concurrency) || 1);
+  const queue = [];
+  let activeCount = 0;
+
+  const runNext = () => {
+    if (activeCount >= limit || queue.length === 0) {
+      return;
+    }
+    const item = queue.shift();
+    activeCount += 1;
+    Promise.resolve()
+      .then(item.task)
+      .then(item.resolve, item.reject)
+      .finally(() => {
+        activeCount = Math.max(0, activeCount - 1);
+        runNext();
+      });
+  };
+
+  return (task) =>
+    new Promise((resolve, reject) => {
+      queue.push({ task, resolve, reject });
+      runNext();
+    });
+}
+
+function createAnalysisRuntime(timings = null) {
+  return {
+    attachmentTextCache: new Map(),
+    limitAttachmentWork: createLimiter(3),
+    timings
+  };
+}
+
+async function getAttachmentReferenceEntries(attachment, runtime = null, target = null) {
+  const url = cleanText(attachment?.url || "");
+  if (!url) {
+    return { entries: [], downloaded: false, fromCache: false };
+  }
+
+  const runExtraction = async () => {
+    const timingDetail = {
+      attachmentName: cleanText(attachment?.name || ""),
+      contentType: cleanText(attachment?.contentType || "")
+    };
+    const binary = runtime?.timings
+      ? await runtime.timings.time("attachment-fetch", () => fetchBinary(url), timingDetail)
+      : await fetchBinary(url);
+    const bytes = binary?.bytes || null;
+    if (!bytes || bytes.byteLength < 64) {
+      return { entries: [], downloaded: false };
+    }
+    const extractDetail = {
+      ...timingDetail,
+      contentType: cleanText(binary.contentType || attachment?.contentType || ""),
+      byteLength: bytes.byteLength
+    };
+    const extractOptions = { target };
+    if (runtime?.timings) {
+      extractOptions.onTiming = (label, detail = {}) => {
+        runtime.timings.mark(label, {
+          ...extractDetail,
+          ...detail
+        });
+      };
+    }
+    const entries = runtime?.timings
+      ? await runtime.timings.time(
+          "attachment-extract",
+          () => extractReferenceTextsFromAttachment(attachment, bytes, binary.contentType || "", extractOptions),
+          extractDetail
+        )
+      : await extractReferenceTextsFromAttachment(attachment, bytes, binary.contentType || "", extractOptions);
+    return { entries, downloaded: true };
+  };
+
+  if (!runtime?.attachmentTextCache || typeof runtime?.limitAttachmentWork !== "function") {
+    return { ...(await runExtraction()), fromCache: false };
+  }
+
+  if (runtime.attachmentTextCache.has(url)) {
+    runtime.timings?.mark("attachment-cache-hit", {
+      attachmentName: cleanText(attachment?.name || "")
+    });
+    return { ...(await runtime.attachmentTextCache.get(url)), fromCache: true };
+  }
+
+  const task = runtime.limitAttachmentWork(runExtraction).catch((error) => {
+    runtime.attachmentTextCache.delete(url);
+    throw error;
+  });
+  runtime.attachmentTextCache.set(url, task);
+  return { ...(await task), fromCache: false };
+}
+
 export async function analyzePageSnapshot(snapshot, tabId, onProgress = null) {
   const baseUrl = deriveBaseUrl(snapshot?.pageUrl);
   setRuntimeContext(baseUrl, tabId);
-  await acquireOcrBridge(tabId).catch(() => false);
+  const timings = createTimingRecorder();
+  timings.mark("analysis-start", {
+    hasPageUrl: !!snapshot?.pageUrl,
+    tabId: Number.isInteger(tabId) ? tabId : null
+  });
+  const analysisRuntime = createAnalysisRuntime(timings);
+  await timings.time("ocr-bridge-acquire", () => acquireOcrBridge(tabId).catch(() => false), {
+    tabId: Number.isInteger(tabId) ? tabId : null
+  });
 
   try {
 
   reportProgress(onProgress, "payment-root", "正在读取付款单", "准备读取当前付款单详情和结构化字段");
 
   const rootRef = parseProcessRef(snapshot?.pageUrl || "", "payment");
-  const rootDetail = rootRef?.mode === "flowable" ? await fetchFlowableDetail(rootRef, baseUrl) : null;
+  const rootDetail = rootRef?.mode === "flowable"
+    ? await timings.time("payment-flowable-api", () => fetchFlowableDetail(rootRef, baseUrl), {
+        detailId: rootRef.detailId || ""
+      })
+    : null;
   const rootFacts = rootDetail ? extractFlowableFacts(rootDetail) : {};
-  const inlineDomesticPrRefs = await resolveInlineDomesticPrRefs(snapshot, baseUrl, onProgress, rootRef?.detailId || "");
+  const inlineDomesticPrRefs = await timings.time(
+    "resolve-inline-domestic-pr",
+    () => resolveInlineDomesticPrRefs(snapshot, baseUrl, onProgress, rootRef?.detailId || ""),
+    { detailId: rootRef?.detailId || "" }
+  );
   const snapshotWithResolvedPr = inlineDomesticPrRefs.length > 0
     ? {
         ...snapshot,
         relatedLinks: enrichRelatedLinks(snapshot?.relatedLinks || [], inlineDomesticPrRefs)
       }
     : snapshot;
-  const inlineContractRefs = await resolveInlineContractRefs(snapshotWithResolvedPr, baseUrl, onProgress, rootRef?.detailId || "");
+  const inlineContractRefs = await timings.time(
+    "resolve-inline-contract",
+    () => resolveInlineContractRefs(snapshotWithResolvedPr, baseUrl, onProgress, rootRef?.detailId || ""),
+    { detailId: rootRef?.detailId || "" }
+  );
   const snapshotWithResolvedRefs = inlineContractRefs.length > 0
     ? {
         ...snapshotWithResolvedPr,
@@ -106,7 +278,11 @@ export async function analyzePageSnapshot(snapshot, tabId, onProgress = null) {
   const target = mergePaymentTarget(snapshotWithResolvedRefs?.paymentTarget || {}, rootFacts, snapshotWithResolvedRefs);
   const flowType = detectPaymentFlowType(snapshotWithResolvedRefs, target);
   const structuredInvoiceSources = rootDetail
-    ? await buildFlowableInvoiceEvidenceList(rootDetail, baseUrl).catch(() => [])
+    ? await timings.time(
+        "payment-invoice-evidence",
+        () => buildFlowableInvoiceEvidenceList(rootDetail, baseUrl).catch(() => []),
+        { detailId: rootRef?.detailId || "" }
+      )
     : [];
   const enrichedSnapshot = rootDetail
     ? {
@@ -154,19 +330,23 @@ export async function analyzePageSnapshot(snapshot, tabId, onProgress = null) {
     attachments: normalizedAttachments,
     structuredInvoices: structuredInvoiceSources
   });
-  const pageAttachmentAnalysisTask = analyzeAttachmentList(
-    [
-      ...inventories.invoiceAttachments,
-      ...inventories.bankChangeAttachments,
-      ...inventories.contractAttachments,
-      ...inventories.acceptanceAttachments,
-      ...inventories.otherAttachments
-    ],
-    target,
-    "付款页附件",
-    onProgress,
-    "page-attachments",
-    { knownMatches: structuredInvoiceMatches }
+  const pageAttachmentAnalysisTask = timings.time(
+    "page-attachment-analysis",
+    () => analyzeAttachmentList(
+      [
+        ...inventories.invoiceAttachments,
+        ...inventories.bankChangeAttachments,
+        ...inventories.contractAttachments,
+        ...inventories.acceptanceAttachments,
+        ...inventories.otherAttachments
+      ],
+      target,
+      "付款页附件",
+      onProgress,
+      "page-attachments",
+      { knownMatches: structuredInvoiceMatches, runtime: analysisRuntime }
+    ),
+    { attachmentCount: normalizedAttachments.length }
   );
 
   reportProgress(
@@ -175,7 +355,11 @@ export async function analyzePageSnapshot(snapshot, tabId, onProgress = null) {
     "正在进入合同",
     inventories.contractLinks.length > 0 ? `已发现 ${inventories.contractLinks.length} 个合同入口` : "暂未发现明确的合同入口"
   );
-  const contractResultTask = analyzeContractLinks(enrichedSnapshot?.relatedLinks || [], target, baseUrl, onProgress);
+  const contractResultTask = timings.time(
+    "contract-analysis",
+    () => analyzeContractLinks(enrichedSnapshot?.relatedLinks || [], target, baseUrl, onProgress, analysisRuntime),
+    { linkCount: inventories.contractLinks.length }
+  );
   const [pageAttachmentAnalysis, contractResult] = await Promise.all([pageAttachmentAnalysisTask, contractResultTask]);
   const invoiceStatusSignal =
     flowType === "pr_payment"
@@ -228,12 +412,16 @@ export async function analyzePageSnapshot(snapshot, tabId, onProgress = null) {
     "正在核对附件",
     inventories.acceptanceLinks.length > 0 ? `已发现 ${inventories.acceptanceLinks.length} 个验收入口` : "尚未发现明确验收入口"
   );
-  const acceptanceDocsTask = analyzeAcceptanceMailLinksMulti(
-    enrichedSnapshot?.relatedLinks || [],
-    target,
-    baseUrl,
-    onProgress,
-    { missingDocument: missingAcceptanceDoc }
+  const acceptanceDocsTask = timings.time(
+    "acceptance-docs-analysis",
+    () => analyzeAcceptanceMailLinksMulti(
+      enrichedSnapshot?.relatedLinks || [],
+      target,
+      baseUrl,
+      onProgress,
+      { missingDocument: missingAcceptanceDoc }
+    ),
+    { linkCount: inventories.acceptanceLinks.length }
   );
 
   reportProgress(
@@ -242,15 +430,19 @@ export async function analyzePageSnapshot(snapshot, tabId, onProgress = null) {
     "正在读取国内PR",
     inventories.domesticPrLinks.length > 0 ? `已发现 ${inventories.domesticPrLinks.length} 个国内PR入口` : "暂未发现明确的国内PR入口"
   );
-  const domesticPrDocsTask = analyzeDomesticPrLinksMulti(
-    enrichedSnapshot?.relatedLinks || [],
-    target,
-    baseUrl,
-    onProgress,
-    {
-      snapshot: enrichedSnapshot,
-      missingDocument: missingDomesticPrDoc
-    }
+  const domesticPrDocsTask = timings.time(
+    "domestic-pr-docs-analysis",
+    () => analyzeDomesticPrLinksMulti(
+      enrichedSnapshot?.relatedLinks || [],
+      target,
+      baseUrl,
+      onProgress,
+      {
+        snapshot: enrichedSnapshot,
+        missingDocument: missingDomesticPrDoc
+      }
+    ),
+    { linkCount: inventories.domesticPrLinks.length }
   );
 
   reportProgress(
@@ -259,12 +451,16 @@ export async function analyzePageSnapshot(snapshot, tabId, onProgress = null) {
     "正在读取采购订单",
     inventories.purchaseOrderLinks.length > 0 ? `已发现 ${inventories.purchaseOrderLinks.length} 个采购订单入口` : "暂未发现明确的采购订单入口"
   );
-  const purchaseOrderResultTask = analyzePurchaseOrderLinks(
-    enrichedSnapshot?.relatedLinks || [],
-    target,
-    baseUrl,
-    onProgress,
-    { missingDocument: missingPurchaseOrderDoc }
+  const purchaseOrderResultTask = timings.time(
+    "purchase-order-analysis",
+    () => analyzePurchaseOrderLinks(
+      enrichedSnapshot?.relatedLinks || [],
+      target,
+      baseUrl,
+      onProgress,
+      { missingDocument: missingPurchaseOrderDoc }
+    ),
+    { linkCount: inventories.purchaseOrderLinks.length }
   );
   const [acceptanceDocs, domesticPrDocs, purchaseOrderResult] = await Promise.all([
     acceptanceDocsTask,
@@ -286,6 +482,7 @@ export async function analyzePageSnapshot(snapshot, tabId, onProgress = null) {
   );
 
   reportProgress(onProgress, "summary", "正在汇总核对结果", "验收入口、核对结果和合同参考信息");
+  timings.mark("summary-start");
 
   const verificationItems = [
     buildAmountVerification(target, inventories, matches.amount, invoiceTypeCheck),
@@ -359,6 +556,7 @@ export async function analyzePageSnapshot(snapshot, tabId, onProgress = null) {
       : "pass";
 
   reportProgress(onProgress, "done", "分析完成", "已生成主核对、关联摘要和合同参考信息");
+  timings.mark("analysis-done", { overallStatus });
 
   return {
     buildTag: BUILD_TAG,
@@ -413,11 +611,14 @@ export async function analyzePageSnapshot(snapshot, tabId, onProgress = null) {
       purchaseOrderResult,
       contractResult,
       attachmentOnlyContract,
-      acceptanceResult: acceptanceDocs
+      acceptanceResult: acceptanceDocs,
+      timings: timings.snapshot()
     }
   };
   } finally {
-    await releaseOcrBridge(tabId).catch(() => false);
+    await timings.time("ocr-bridge-release", () => releaseOcrBridge(tabId).catch(() => false), {
+      tabId: Number.isInteger(tabId) ? tabId : null
+    });
   }
 }
 
@@ -2975,7 +3176,7 @@ async function analyzeAcceptanceMailLinksMulti(relatedLinks, target, baseUrl, on
   return docs;
 }
 
-async function analyzeContractLinks(relatedLinks, target, baseUrl, onProgress) {
+async function analyzeContractLinks(relatedLinks, target, baseUrl, onProgress, runtime = null) {
   const contractLink = (relatedLinks || []).find((item) => item.relation === "contract");
   if (!contractLink) {
     return {
@@ -3002,65 +3203,64 @@ async function analyzeContractLinks(relatedLinks, target, baseUrl, onProgress) {
 
   try {
     if (ref.mode === "flowable") {
-      const detail = await fetchFlowableDetail(ref, baseUrl);
-      const flowablePageSnapshot = await collectPageSnapshotFromUrl(ref.detailUrl).catch(() => null);
-      const pagePairs = Array.isArray(flowablePageSnapshot?.fieldPairs) ? flowablePageSnapshot.fieldPairs : [];
-      const baseFacts = {
-        processCode: firstNonEmpty(
-          detail.processCode,
-          detail.flowFormData?.EXTARGETNODEID,
-          findFieldValueFromPairs(pagePairs, "合同流程编号", "合同编号", "流程编号")
-        ),
-        processTitle: firstNonEmpty(
-          detail.flowFormData?.processTitleInput,
-          detail.flowFormData?.NCBILLCODE,
-          findFieldValueFromPairs(pagePairs, "合同用章申请", "合同名称", "合同标题", "流程标题")
-        ),
-        counterpartyCompany: firstNonEmpty(
-          detail.flowFormData?.HT010,
-          findFieldValueFromPairs(pagePairs, "合同相对方", "供应商名称", "乙方", "对方公司")
-        ),
-        contractAccountNo: firstLikelyBankAccount(
-          detail.flowFormData?.HT013,
-          detail.flowFormData?.HT014,
-          detail.flowFormData?.ACCOUNT,
-          detail.flowFormData?.bankAccount,
-          findFieldValueFromPairs(pagePairs, "收款账号", "银行账号", "开户账号", "收款账户", "银行账户", "账户号")
-        ),
-        effectiveStart: firstNonEmptyDate(
-          detail.flowFormData?.HT032,
-          findFieldValueFromPairs(pagePairs, "合同开始日期", "合同开始日", "开始日", "生效日期", "生效日")
-        ),
-        effectiveEnd: firstNonEmptyDate(
-          detail.flowFormData?.HT033,
-          findFieldValueFromPairs(pagePairs, "合同结束日期", "合同结束日", "结束日期", "截止日期", "终止日期")
-        ),
-        paymentTerms: firstMeaningfulText(
-          detail.flowFormData?.HT030,
-          detail.flowFormData?.HT031,
-          detail.flowFormData?.HT034,
-          detail.flowFormData?.HT035,
-          findFieldValueFromPairs(pagePairs, "付款条件", "付款方式", "结算方式", "付款条款", "验收标准")
-        ),
-        sourceName: normalizeRelatedSourceName(
-          flowablePageSnapshot,
-          contractLink.title,
-          ref,
-          detail.flowFormData?.processTitleInput,
-          findFieldValueFromPairs(pagePairs, "合同用章申请", "合同名称", "合同标题", "流程标题"),
-          detail.processCode
-        ),
-        sourceUrl: ref.detailUrl
-      };
+      const detail = runtime?.timings
+        ? await runtime.timings.time("contract-flowable-api", () => fetchFlowableDetail(ref, baseUrl), {
+            detailId: ref.detailId || ""
+          })
+        : await fetchFlowableDetail(ref, baseUrl);
+      const apiAttachments = buildFlowableAttachmentList(detail);
+      const apiBaseFacts = buildFlowableContractBaseFacts(detail, ref, contractLink);
+      const apiSufficient = isFlowableContractApiSufficient(apiBaseFacts, apiAttachments, target);
+      runtime?.timings?.mark("contract-flowable-api-sufficiency", {
+        detailId: ref.detailId || "",
+        apiSufficient,
+        apiAttachmentCount: apiAttachments.length,
+        hasCounterpartyCompany: !!apiBaseFacts.counterpartyCompany,
+        hasContractAccountNo: !!apiBaseFacts.contractAccountNo,
+        hasEffectiveStart: !!apiBaseFacts.effectiveStart,
+        hasEffectiveEnd: !!apiBaseFacts.effectiveEnd,
+        hasPaymentTerms: !!apiBaseFacts.paymentTerms
+      });
+      const flowablePageSnapshot = apiSufficient
+        ? null
+        : runtime?.timings
+          ? await runtime.timings.time("contract-flowable-tab-snapshot", () => collectPageSnapshotFromUrl(ref.detailUrl).catch(() => null), {
+              detailId: ref.detailId || "",
+              sourceInstIdPreserved: !!ref.sourceInstId
+            })
+          : await collectPageSnapshotFromUrl(ref.detailUrl).catch(() => null);
+      const baseFacts = flowablePageSnapshot
+        ? buildFlowableContractBaseFacts(detail, ref, contractLink, flowablePageSnapshot)
+        : apiBaseFacts;
       const flowableAttachments = mergeAttachmentCandidates(
-        buildFlowableAttachmentList(detail),
+        apiAttachments,
         Array.isArray(flowablePageSnapshot?.attachments) ? flowablePageSnapshot.attachments : []
       );
-      return analyzeContractDetail(ref, flowableAttachments, baseFacts, target, "合同页", onProgress, flowablePageSnapshot);
+      return runtime?.timings
+        ? await runtime.timings.time(
+            "contract-detail-analysis",
+            () => analyzeContractDetail(ref, flowableAttachments, baseFacts, target, "合同页", onProgress, flowablePageSnapshot, { runtime }),
+            {
+              detailId: ref.detailId || "",
+              mode: "flowable",
+              attachmentCount: flowableAttachments.length,
+              pageSnapshotUsed: !!flowablePageSnapshot
+            }
+          )
+        : analyzeContractDetail(ref, flowableAttachments, baseFacts, target, "合同页", onProgress, flowablePageSnapshot, { runtime });
     }
 
-      const detail = await fetchHistoryDetail(ref, baseUrl);
-      const historyPageSnapshot = await collectPageSnapshotFromUrl(ref.detailUrl).catch(() => null);
+      const detail = runtime?.timings
+        ? await runtime.timings.time("contract-history-api", () => fetchHistoryDetail(ref, baseUrl), {
+            detailId: ref.detailId || ""
+          })
+        : await fetchHistoryDetail(ref, baseUrl);
+      const historyPageSnapshot = runtime?.timings
+        ? await runtime.timings.time("contract-history-tab-snapshot", () => collectPageSnapshotFromUrl(ref.detailUrl).catch(() => null), {
+            detailId: ref.detailId || "",
+            sourceInstIdPreserved: !!ref.sourceInstId
+          })
+        : await collectPageSnapshotFromUrl(ref.detailUrl).catch(() => null);
       const mainForm = detail?.formData?.mainForm || {};
       const baseFacts = {
         processCode: firstNonEmpty(findHistoryField(mainForm, "合同编号", "采购合同编号")),
@@ -3097,7 +3297,18 @@ async function analyzeContractLinks(relatedLinks, target, baseUrl, onProgress) {
         buildHistoryAttachmentList(detail),
         Array.isArray(historyPageSnapshot?.attachments) ? historyPageSnapshot.attachments : []
       );
-      return analyzeContractDetail(ref, historyAttachments, baseFacts, target, "合同页", onProgress, historyPageSnapshot);
+      return runtime?.timings
+        ? await runtime.timings.time(
+            "contract-detail-analysis",
+            () => analyzeContractDetail(ref, historyAttachments, baseFacts, target, "合同页", onProgress, historyPageSnapshot, { runtime }),
+            {
+              detailId: ref.detailId || "",
+              mode: "history",
+              attachmentCount: historyAttachments.length,
+              pageSnapshotUsed: !!historyPageSnapshot
+            }
+          )
+        : analyzeContractDetail(ref, historyAttachments, baseFacts, target, "合同页", onProgress, historyPageSnapshot, { runtime });
   } catch (error) {
     return {
       ref,
@@ -3118,7 +3329,71 @@ async function analyzeContractLinks(relatedLinks, target, baseUrl, onProgress) {
   }
 }
 
-async function analyzeContractDetail(ref, attachments, baseFacts, target, sourceLabelPrefix, onProgress, pageSnapshot = null) {
+function buildFlowableContractBaseFacts(detail, ref, contractLink, flowablePageSnapshot = null) {
+  const pagePairs = Array.isArray(flowablePageSnapshot?.fieldPairs) ? flowablePageSnapshot.fieldPairs : [];
+  return {
+    processCode: firstNonEmpty(
+      detail.processCode,
+      detail.flowFormData?.EXTARGETNODEID,
+      findFieldValueFromPairs(pagePairs, "合同流程编号", "合同编号", "流程编号")
+    ),
+    processTitle: firstNonEmpty(
+      detail.flowFormData?.processTitleInput,
+      detail.flowFormData?.NCBILLCODE,
+      findFieldValueFromPairs(pagePairs, "合同用章申请", "合同名称", "合同标题", "流程标题")
+    ),
+    counterpartyCompany: firstNonEmpty(
+      detail.flowFormData?.HT010,
+      findFieldValueFromPairs(pagePairs, "合同相对方", "供应商名称", "乙方", "对方公司")
+    ),
+    contractAccountNo: firstLikelyBankAccount(
+      detail.flowFormData?.HT013,
+      detail.flowFormData?.HT014,
+      detail.flowFormData?.ACCOUNT,
+      detail.flowFormData?.bankAccount,
+      findFieldValueFromPairs(pagePairs, "收款账号", "银行账号", "开户账号", "收款账户", "银行账户", "账户号")
+    ),
+    effectiveStart: firstNonEmptyDate(
+      detail.flowFormData?.HT032,
+      findFieldValueFromPairs(pagePairs, "合同开始日期", "合同开始日", "开始日", "生效日期", "生效日")
+    ),
+    effectiveEnd: firstNonEmptyDate(
+      detail.flowFormData?.HT033,
+      findFieldValueFromPairs(pagePairs, "合同结束日期", "合同结束日", "结束日期", "截止日期", "终止日期")
+    ),
+    paymentTerms: firstMeaningfulText(
+      detail.flowFormData?.HT030,
+      detail.flowFormData?.HT031,
+      detail.flowFormData?.HT034,
+      detail.flowFormData?.HT035,
+      findFieldValueFromPairs(pagePairs, "付款条件", "付款方式", "结算方式", "付款条款", "验收标准")
+    ),
+    sourceName: normalizeRelatedSourceName(
+      flowablePageSnapshot,
+      contractLink.title,
+      ref,
+      detail.flowFormData?.processTitleInput,
+      findFieldValueFromPairs(pagePairs, "合同用章申请", "合同名称", "合同标题", "流程标题"),
+      detail.processCode
+    ),
+    sourceUrl: ref.detailUrl
+  };
+}
+
+function isFlowableContractApiSufficient(baseFacts, attachments, target) {
+  const needsCompany = !!cleanText(target?.payeeCompany || "");
+  const needsAccount = !!cleanText(target?.payeeAccount || "");
+  return !!(
+    (!needsCompany || baseFacts?.counterpartyCompany) &&
+    (!needsAccount || baseFacts?.contractAccountNo) &&
+    (baseFacts?.effectiveStart || baseFacts?.effectiveEnd) &&
+    baseFacts?.paymentTerms &&
+    Array.isArray(attachments) &&
+    attachments.length > 0
+  );
+}
+
+async function analyzeContractDetail(ref, attachments, baseFacts, target, sourceLabelPrefix, onProgress, pageSnapshot = null, options = {}) {
   const normalizedContractAttachments = normalizeAttachmentCandidates(attachments || []);
   const contractAttachmentDisplay = summarizeAttachmentDisplay(normalizedContractAttachments);
   attachments = normalizedContractAttachments;
@@ -3140,7 +3415,7 @@ async function analyzeContractDetail(ref, attachments, baseFacts, target, source
         : null
   };
 
-  const attachmentAnalysis = await analyzeAttachmentList(attachments || [], target, `${sourceLabelPrefix}附件`, onProgress, "contract-attachments");
+  const attachmentAnalysis = await analyzeAttachmentList(attachments || [], target, `${sourceLabelPrefix}附件`, onProgress, "contract-attachments", { runtime: options?.runtime });
 
   if (!facts.effectiveStart) facts.effectiveStart = pageSnapshotFallback.facts.effectiveStart || "";
   if (!facts.effectiveEnd) facts.effectiveEnd = pageSnapshotFallback.facts.effectiveEnd || "";
@@ -3309,6 +3584,7 @@ async function analyzeAttachmentList(attachments, target, sourceLabelPrefix, onP
     downloadedCount: 0,
     parsedCount: 0,
     extractedEntryCount: 0,
+    cacheHitCount: 0,
     errorCount: 0
   };
 
@@ -3319,29 +3595,59 @@ async function analyzeAttachmentList(attachments, target, sourceLabelPrefix, onP
 
   reportProgress(onProgress, progressPhase, `正在查看${sourceLabelPrefix}`, `准备扫描 ${items.length} 个附件`);
 
-  for (let index = 0; index < items.length; index += 1) {
-    const attachment = items[index];
-    stats.scannedCount += 1;
-    reportProgress(
-      onProgress,
-      progressPhase,
-      `正在查看${sourceLabelPrefix}`,
-      `正在扫描 ${index + 1}/${items.length}: ${attachment?.name || "未命名附件"}`
-    );
+  const batchSize = Math.min(3, Math.max(1, Number(options?.batchSize) || 3));
+  for (let index = 0; index < items.length;) {
+    const batch = items.slice(index, index + batchSize);
+    const runBatch = () => Promise.all(
+      batch.map(async (attachment, offset) => {
+        const displayIndex = index + offset + 1;
+        stats.scannedCount += 1;
+        reportProgress(
+          onProgress,
+          progressPhase,
+          `正在查看${sourceLabelPrefix}`,
+          `正在扫描 ${displayIndex}/${items.length}: ${attachment?.name || "未命名附件"}`
+        );
 
-    try {
-      const binary = await fetchBinary(attachment.url);
-      const bytes = binary?.bytes || null;
-      if (!bytes || bytes.byteLength < 64) {
+        try {
+          const result = await getAttachmentReferenceEntries(attachment, options?.runtime, target);
+          if (result.downloaded) {
+            stats.downloadedCount += 1;
+          }
+          if (result.fromCache) {
+            stats.cacheHitCount += 1;
+          }
+          const entries = Array.isArray(result.entries) ? result.entries : [];
+          if (entries.length > 0) {
+            stats.parsedCount += 1;
+            stats.extractedEntryCount += entries.length;
+          }
+          return { attachment, entries };
+        } catch (error) {
+          stats.errorCount += 1;
+          errors.push({
+            attachmentName: attachment?.name || "",
+            attachmentUrl: attachment?.url || "",
+            error: normalizeError(error)
+          });
+          return null;
+        }
+      })
+    );
+    const batchResults = options?.runtime?.timings
+      ? await options.runtime.timings.time("attachment-batch", runBatch, {
+          sourceLabelPrefix,
+          batchStart: index + 1,
+          batchSize: batch.length,
+          totalCount: items.length
+        })
+      : await runBatch();
+
+    for (const result of batchResults) {
+      if (!result) {
         continue;
       }
-      stats.downloadedCount += 1;
-
-      const entries = await extractReferenceTextsFromAttachment(attachment, bytes, binary.contentType || "");
-      if (entries.length > 0) {
-        stats.parsedCount += 1;
-        stats.extractedEntryCount += entries.length;
-      }
+      const { attachment, entries } = result;
       for (const entry of entries) {
         const text = cleanText(entry.text);
         if (!text) {
@@ -3417,14 +3723,8 @@ async function analyzeAttachmentList(attachments, target, sourceLabelPrefix, onP
           );
         }
       }
-    } catch (error) {
-      stats.errorCount += 1;
-      errors.push({
-        attachmentName: attachment?.name || "",
-        attachmentUrl: attachment?.url || "",
-        error: normalizeError(error)
-      });
     }
+    index += batch.length;
 
     const hasAmountEvidence = matches.amount || options?.knownMatches?.amount;
     const hasCompanyEvidence = matches.company || options?.knownMatches?.company;
