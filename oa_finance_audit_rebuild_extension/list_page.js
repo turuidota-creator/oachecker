@@ -427,6 +427,11 @@
   }
 
   function buildDetailUrl(row) {
+    const directDetailUrl = appendDetailCacheHint(cleanText(row?.detailUrl || ""), cleanText(row?.processCode || ""));
+    if (directDetailUrl && DETAIL_PAGE_RE.test(directDetailUrl)) {
+      return directDetailUrl;
+    }
+
     const procInsId = cleanText(row?.procInsId);
     if (!procInsId) {
       return "";
@@ -759,6 +764,79 @@
     return "";
   }
 
+  function readCellTextByHeader(rowEl, headerTexts, labels) {
+    const cells = Array.from(rowEl?.querySelectorAll("td .cell") || []);
+    for (const label of labels || []) {
+      const index = (headerTexts || []).findIndex((item) => cleanText(item).includes(label));
+      if (index >= 0) {
+        const text = cleanText(cells[index]?.textContent || "");
+        if (text) {
+          return text;
+        }
+      }
+    }
+    return "";
+  }
+
+  function findDetailUrlFromRow(rowEl, processCode) {
+    for (const linkEl of Array.from(rowEl?.querySelectorAll("a[href]") || [])) {
+      const href = cleanText(linkEl.getAttribute("href"));
+      if (!href) {
+        continue;
+      }
+      const detailUrl = appendDetailCacheHint(href, processCode);
+      if (detailUrl && DETAIL_PAGE_RE.test(detailUrl)) {
+        return detailUrl;
+      }
+    }
+    return "";
+  }
+
+  function buildRowInfoFromDom(rowEl, headerTexts) {
+    const processCode = readProcessCodeFromRow(rowEl);
+    const detailUrl = findDetailUrlFromRow(rowEl, processCode);
+    const processTitle = readCellTextByHeader(rowEl, headerTexts, ["流程标题", "标题"]);
+    return {
+      rowEl,
+      processCode,
+      detailUrl,
+      rowMeta: {
+        processCode,
+        processTitle,
+        taskName: readCellTextByHeader(rowEl, headerTexts, ["任务节点"]),
+        detailUrl,
+        source: "list-dom"
+      }
+    };
+  }
+
+  function rememberRowInfo(rowInfo) {
+    const processCode = cleanText(rowInfo?.processCode || "").toUpperCase();
+    if (!processCode) {
+      return;
+    }
+
+    const current = ensureRowState(processCode);
+    const rowMeta = {
+      ...(current.rowMeta || {}),
+      ...(rowInfo.rowMeta || {})
+    };
+    const detailUrl = firstNonEmpty(rowInfo.detailUrl, rowMeta.detailUrl, current.detailUrl);
+    if (detailUrl) {
+      rowMeta.detailUrl = detailUrl;
+    }
+
+    state.rowStates.set(processCode, {
+      ...current,
+      detailUrl,
+      rowMeta
+    });
+
+    if (detailUrl || cleanText(rowMeta.procInsId)) {
+      state.rowMetaCache.set(processCode, rowMeta);
+    }
+  }
+
   function locateTargetTableContext() {
     const tableCandidates = Array.from(document.querySelectorAll(".el-table")).filter(isVisible);
     for (const tableEl of tableCandidates) {
@@ -768,10 +846,7 @@
       }
       const bodyRows = Array.from(tableEl.querySelectorAll(".el-table__body-wrapper tbody tr"));
       const rowInfos = bodyRows
-        .map((rowEl) => ({
-          rowEl,
-          processCode: readProcessCodeFromRow(rowEl)
-        }))
+        .map((rowEl) => buildRowInfoFromDom(rowEl, headerTexts))
         .filter((item) => PAYMENT_CODE_RE.test(item.processCode));
       if (rowInfos.length === 0) {
         continue;
@@ -1490,25 +1565,39 @@
     });
 
     try {
-      const rowMeta = await fetchTodoRowByProcessCode(processCode);
-      if (!rowMeta) {
-        patchRowState(processCode, {
-          status: "unsupported",
-          errorText: "没有在待办列表里反查到这张付款单。",
-          requestId: ""
-        });
-        return;
+      const existingRowState = ensureRowState(processCode);
+      let rowMeta = existingRowState.rowMeta || null;
+      let lookupError = null;
+      if (!rowMeta || !buildDetailUrl(rowMeta)) {
+        try {
+          rowMeta = await fetchTodoRowByProcessCode(processCode);
+        } catch (error) {
+          lookupError = error;
+          rowMeta = null;
+        }
       }
-      const detailUrl = buildDetailUrl(rowMeta);
+
+      let detailUrl = rowMeta ? buildDetailUrl(rowMeta) : "";
+      if (!detailUrl) {
+        detailUrl = cleanText(ensureRowState(processCode).detailUrl || "");
+      }
+
       if (!detailUrl) {
         patchRowState(processCode, {
-          status: "error",
-          errorText: "无法拼出付款单详情链接。",
-          rowMeta,
+          status: "unsupported",
+          errorText: lookupError
+            ? `当前列表行没有详情链接，且待办接口反查失败：${translateTechnicalErrorMessage(lookupError?.message || String(lookupError), "待办列表查询失败")}`
+            : "当前列表行没有详情链接，且没有在待办接口里反查到这张付款单。",
           requestId: ""
         });
         return;
       }
+
+      rowMeta = {
+        ...(rowMeta || {}),
+        processCode,
+        detailUrl
+      };
 
       patchRowState(processCode, {
         status: "reading",
@@ -1640,6 +1729,7 @@
     ensureToolbar(context);
     ensureHeaderCell(context.headerTable);
     context.rowInfos.forEach((item) => {
+      rememberRowInfo(item);
       decorateNativeDetailLinks(item.rowEl, item.processCode);
       ensureBodyCell(item.rowEl, item.processCode, context.bodyTable);
     });
