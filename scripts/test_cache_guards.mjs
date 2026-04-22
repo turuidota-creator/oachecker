@@ -20,7 +20,7 @@ assert.ok(
   "missing buildTag cache entries must not be treated as fresh"
 );
 assert.ok(
-  analyzerSource.includes('export const BUILD_TAG = "rebuild-phase5-payee-account-history-sourceinst-2026-04-21";'),
+  analyzerSource.includes('export const BUILD_TAG = "rebuild-phase5-payee-account-field-aliases-2026-04-22";'),
   "BUILD_TAG should be bumped when cache freshness semantics change"
 );
 

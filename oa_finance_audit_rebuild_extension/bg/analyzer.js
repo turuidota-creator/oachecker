@@ -52,7 +52,7 @@ import { buildContractSummaryProviderMeta, generateContractSummary } from "./con
 import { extractMailEvidenceFromAttachment, extractReferenceTextsFromAttachment } from "./extract.js";
 import { acquireOcrBridge, releaseOcrBridge } from "./ocr_bridge.js";
 
-export const BUILD_TAG = "rebuild-phase5-payee-account-history-sourceinst-2026-04-21";
+export const BUILD_TAG = "rebuild-phase5-payee-account-field-aliases-2026-04-22";
 
 const GENERIC_PROCESS_CODE_RE = /\b[A-Z]{2,10}-\d{8,}\b/i;
 const DOMESTIC_PR_CODE_RE = /\bGNPR-\d{8,}\b/i;
@@ -60,6 +60,30 @@ const CONTRACT_PROCESS_CODE_RE = /\b(?:CYHT|CYNCHT|HT)-\d{8,}\b/i;
 const PURCHASE_ORDER_CODE_RE = /\bCYNCDD-\d{8,}\b/i;
 const PR_PAYMENT_CODE_RE = /^GNTYYFK-\d{8,}$/i;
 const PURCHASE_PAYMENT_CODE_RE = /^DDFK-\d{8,}$/i;
+const PAYEE_ACCOUNT_FIELD_LABELS = [
+  "收款账号",
+  "收款帐号",
+  "收款账户",
+  "收款银行账号",
+  "收款银行帐号",
+  "收款方账号",
+  "收款方帐号",
+  "收款方账户",
+  "银行账号",
+  "银行帐号",
+  "开户账号",
+  "开户帐号",
+  "开户银行账号",
+  "开户银行帐号",
+  "银行账户",
+  "账户号",
+  "对方账号",
+  "对方帐号",
+  "对方账户",
+  "供应商账号",
+  "供应商帐号",
+  "供应商账户"
+];
 
 function reportProgress(onProgress, phase, text, detail = "") {
   if (typeof onProgress !== "function") {
@@ -708,13 +732,7 @@ function buildPaymentTargetSnapshotFallback(snapshot) {
     payeeAccount: firstLikelyBankAccount(
       ...findFieldValuesFromPairs(
         entries,
-        "收款账号",
-        "银行账号",
-        "开户账号",
-        "收款账户",
-        "银行账户",
-        "账户号",
-        "供应商账号"
+        ...PAYEE_ACCOUNT_FIELD_LABELS
       )
     ),
     payeeBank: findFieldValueFromPairs(entries, "银行开户行", "开户行", "开户银行", "收款银行", "银行名称")

@@ -10,9 +10,48 @@
   const DOMESTIC_PR_CODE_RE = /\bGNPR-\d{8,}\b/i;
   const PURCHASE_PAYMENT_CODE_RE = /^DDFK-\d{8,}$/i;
   const PR_PAYMENT_CODE_RE = /^GNTYYFK-\d{8,}$/i;
+  const PAYEE_ACCOUNT_FIELD_LABELS = [
+    "收款账号",
+    "收款帐号",
+    "收款账户",
+    "收款银行账号",
+    "收款银行帐号",
+    "收款方账号",
+    "收款方帐号",
+    "收款方账户",
+    "银行账号",
+    "银行帐号",
+    "开户账号",
+    "开户帐号",
+    "开户银行账号",
+    "开户银行帐号",
+    "银行账户",
+    "账户号",
+    "对方账号",
+    "对方帐号",
+    "对方账户",
+    "供应商账号",
+    "供应商帐号",
+    "供应商账户"
+  ];
+  const PAYEE_ACCOUNT_EXCLUDE_LABELS = ["付款方", "付款人", "申请人", "员工", "登录", "用户"];
 
   function cleanText(value) {
     return String(value || "").replace(/\s+/g, " ").trim();
+  }
+
+  function normalizeAccountDigits(value) {
+    return cleanText(value || "")
+      .replace(/[０-９]/g, (char) => String.fromCharCode(char.charCodeAt(0) - 0xff10 + 0x30))
+      .replace(/[^\d]/g, "");
+  }
+
+  function isLikelyAccountValue(value) {
+    const text = cleanText(value || "");
+    if (!text || text.includes("@")) {
+      return false;
+    }
+    return normalizeAccountDigits(text).length >= 6;
   }
 
   function decodeMaybeUriComponent(value) {
@@ -501,6 +540,16 @@
     return "";
   }
 
+  function findAccountFieldValue(pairs) {
+    const candidates = findFieldEntries(pairs, PAYEE_ACCOUNT_FIELD_LABELS, PAYEE_ACCOUNT_EXCLUDE_LABELS);
+    for (const candidate of candidates) {
+      if (isLikelyAccountValue(candidate?.value)) {
+        return cleanText(candidate.value);
+      }
+    }
+    return "";
+  }
+
   function findFieldEntries(pairs, includeLabels, excludeLabels = []) {
     return (pairs || []).filter((pair) => {
       const label = cleanText(pair?.label || "");
@@ -700,7 +749,7 @@
       processTitle,
       paymentAmount: inferPaymentAmount(pairs, flowType),
       payeeCompany: findFieldValue(pairs, ["收款公司", "收款单位", "供应商名称", "供应商", "对方公司"]),
-      payeeAccount: findFieldValue(pairs, ["收款账号", "银行账号", "开户账号", "银行账户", "账户号"]),
+      payeeAccount: findAccountFieldValue(pairs),
       payeeBank: findFieldValue(pairs, ["开户行", "银行名称"]),
       paymentDate:
         findFieldValue(pairs, ["付款日期", "申请日期", "创建日期", "日期"]) || extractDateFromProcessCode(processCode)
