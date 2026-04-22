@@ -16,6 +16,14 @@ assert.ok(
   "batch list should extract the native detail URL from the visible row"
 );
 assert.ok(
+  listPageSource.includes("function getElementTableData"),
+  "batch list should read Element UI table data when rows navigate via Vue events instead of href links"
+);
+assert.ok(
+  listPageSource.includes("source: rowData ? \"list-vue-table\" : \"list-dom\""),
+  "visible row metadata should record whether it came from Element table data or DOM fallback"
+);
+assert.ok(
   listPageSource.includes("function rememberRowInfo"),
   "batch list should remember visible row metadata before running analysis"
 );

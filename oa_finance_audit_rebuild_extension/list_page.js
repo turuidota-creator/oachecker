@@ -764,6 +764,33 @@
     return "";
   }
 
+  function getElementTableData(tableEl) {
+    const candidates = [
+      tableEl?.__vue__?._props?.data,
+      tableEl?.__vue__?.$props?.data,
+      tableEl?.__vue__?.data,
+      tableEl?.querySelector?.(".el-table__body")?.__vue__?.$parent?._props?.data,
+      tableEl?.querySelector?.(".el-table__body")?.__vue__?.$parent?.$props?.data
+    ];
+    for (const candidate of candidates) {
+      if (Array.isArray(candidate)) {
+        return candidate;
+      }
+    }
+    return [];
+  }
+
+  function findVueRowData(tableData, rowIndex, processCode) {
+    const normalized = cleanText(processCode || "").toUpperCase();
+    if (normalized) {
+      const matched = (tableData || []).find((item) => cleanText(item?.processCode || "").toUpperCase() === normalized);
+      if (matched) {
+        return matched;
+      }
+    }
+    return tableData?.[rowIndex] || null;
+  }
+
   function readCellTextByHeader(rowEl, headerTexts, labels) {
     const cells = Array.from(rowEl?.querySelectorAll("td .cell") || []);
     for (const label of labels || []) {
@@ -792,20 +819,21 @@
     return "";
   }
 
-  function buildRowInfoFromDom(rowEl, headerTexts) {
-    const processCode = readProcessCodeFromRow(rowEl);
+  function buildRowInfoFromDom(rowEl, headerTexts, rowData = null) {
+    const processCode = cleanText(rowData?.processCode || readProcessCodeFromRow(rowEl)).toUpperCase();
     const detailUrl = findDetailUrlFromRow(rowEl, processCode);
-    const processTitle = readCellTextByHeader(rowEl, headerTexts, ["流程标题", "标题"]);
+    const processTitle = firstNonEmpty(rowData?.processTitle, readCellTextByHeader(rowEl, headerTexts, ["流程标题", "标题"]));
     return {
       rowEl,
       processCode,
-      detailUrl,
+      detailUrl: firstNonEmpty(detailUrl, buildDetailUrl({ ...rowData, processCode })),
       rowMeta: {
+        ...(rowData || {}),
         processCode,
         processTitle,
-        taskName: readCellTextByHeader(rowEl, headerTexts, ["任务节点"]),
-        detailUrl,
-        source: "list-dom"
+        taskName: firstNonEmpty(rowData?.taskName, readCellTextByHeader(rowEl, headerTexts, ["任务节点"])),
+        detailUrl: firstNonEmpty(detailUrl, buildDetailUrl({ ...rowData, processCode })),
+        source: rowData ? "list-vue-table" : "list-dom"
       }
     };
   }
@@ -845,8 +873,12 @@
         continue;
       }
       const bodyRows = Array.from(tableEl.querySelectorAll(".el-table__body-wrapper tbody tr"));
+      const tableData = getElementTableData(tableEl);
       const rowInfos = bodyRows
-        .map((rowEl) => buildRowInfoFromDom(rowEl, headerTexts))
+        .map((rowEl, rowIndex) => {
+          const processCode = readProcessCodeFromRow(rowEl);
+          return buildRowInfoFromDom(rowEl, headerTexts, findVueRowData(tableData, rowIndex, processCode));
+        })
         .filter((item) => PAYMENT_CODE_RE.test(item.processCode));
       if (rowInfos.length === 0) {
         continue;
