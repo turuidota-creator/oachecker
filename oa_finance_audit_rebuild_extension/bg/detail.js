@@ -268,15 +268,21 @@ export function extractFlowableFacts(detail) {
     flow.accountNo,
     flow.bankAccount,
     flow.bankNo,
+    flow.payeecode,
+    flow.payeeCode,
+    flow.payeeAccount,
+    flow.payeeAccountNo,
     flow.BANKACCOUNT,
     flow.BANK_ACCOUNT,
     flow.COLLECTIONACCOUNT,
     flow.PAYEEACCOUNT,
+    flow.PAYEECODE,
+    flow.PAYEE_CODE,
     findFlowFieldValue(
       flow,
       [
-        /(?:^|_)(?:account|bankAccount|bankNo|accountNo)(?:$|_)/i,
-        /收款账号|银行账号|开户账号|银行账户|收款账户|账户号|供应商账号/
+        /(?:^|_)(?:account|bankAccount|bankNo|accountNo|payeeCode|payeeAccount|payeeAccountNo)(?:$|_)/i,
+        /收款账号|收款帐号|银行账号|银行帐号|开户账号|开户帐号|银行账户|收款账户|账户号|供应商账号|供应商帐号/
       ],
       isFlowBankAccountValue
     )

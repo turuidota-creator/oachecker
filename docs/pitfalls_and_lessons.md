@@ -67,6 +67,12 @@
 
 ## 近期关键修复
 
+### 2026-04-22 PR Flowable API 的 `payeecode` 是收款账号
+
+- 现象：国内 PR 付款列表批量审核可以打开详情并识别收款公司，但仍提示“未从付款单页识别收款账号”；单独打开页面看得到业务字段，页面 DOM 快照却可能只有标签没有值。
+- 原则：PR 付款目标账号不要只看 DOM 字段或 `bankAccount/accountNo`，Flowable `flowFormData.payeecode/payeeCode/payeeAccount` 也可能是正式收款账号来源。
+- 动作：`extractFlowableFacts` 纳入 `payeecode/payeeCode/payeeAccount/payeeAccountNo` 并增加回归测试，同时 bump `BUILD_TAG` 清掉旧批量缓存口径。
+
 ### 2026-04-22 列表批量审核不要只依赖待办接口反查
 
 - 现象：用户在列表里手动点流程标题能进入详情页，但批量自动审核显示“找不到/不支持”，因为 `todoList?processCode=...` 反查可能返回空，且 OA 的 Element 表格行通常没有 `<a href>`，详情跳转来自 Vue 行数据和点击事件。
